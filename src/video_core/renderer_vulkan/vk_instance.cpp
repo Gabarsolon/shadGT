@@ -14,6 +14,9 @@
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
+#ifdef RYTY_GPU
+#include "ryty_gpu/ryty_dlss.h"
+#endif
 
 #include <vk_mem_alloc.h>
 
@@ -230,11 +233,16 @@ bool Instance::CreateDevice() {
         return false;
     }
 
-    boost::container::static_vector<const char*, 32> enabled_extensions;
+    boost::container::static_vector<const char*, 48> enabled_extensions;
     const auto add_extension = [&](std::string_view extension) -> bool {
         const auto result =
             std::find_if(available_extensions.begin(), available_extensions.end(),
                          [&](const std::string& name) { return name == extension; });
+        // Already enabled (the DLSS plugin may ask for one the renderer uses).
+        if (std::ranges::any_of(enabled_extensions,
+                                [&](const char* name) { return extension == name; })) {
+            return true;
+        }
 
         if (result != available_extensions.end()) {
             LOG_INFO(Render_Vulkan, "Enabling extension: {}", extension);
@@ -363,6 +371,11 @@ bool Instance::CreateDevice() {
     }
     const bool calibrated_timestamps =
         TRACY_GPU_ENABLED ? add_extension(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) : false;
+#ifdef RYTY_GPU
+    // ryGT: the device extensions NVIDIA DLSS needs, when the DLSS plugin is used.
+    RytyDlss::AddDeviceExtensions(*instance, physical_device,
+                                  [&](std::string_view name) { return add_extension(name); });
+#endif
 
     const auto family_properties = physical_device.getQueueFamilyProperties();
     if (family_properties.empty()) {

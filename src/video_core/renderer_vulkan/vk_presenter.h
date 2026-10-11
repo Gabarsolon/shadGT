@@ -14,6 +14,9 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
 #include "video_core/texture_cache/texture_cache.h"
+#ifdef RYTY_GPU
+#include "ryty_gpu/ryty_dlss.h"
+#endif
 
 namespace Frontend {
 class WindowSDL;
@@ -117,6 +120,9 @@ private:
     Frontend::WindowSDL& window;
     Instance instance;
     HostPasses::FsrPass fsr_pass;
+#ifdef RYTY_GPU
+    RytyDlss::Pass dlss_pass; // ryGT: NVIDIA DLSS through the optional plugin, before FSR
+#endif
     HostPasses::FsrPass::Settings fsr_settings{};
     HostPasses::PostProcessingPass::Settings pp_settings{};
     HostPasses::PostProcessingPass pp_pass;

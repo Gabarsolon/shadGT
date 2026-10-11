@@ -22,6 +22,9 @@
 #include "core/emulator_settings.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
+#ifdef RYTY_GPU
+#include "ryty_gpu/ryty_dlss.h"
+#endif
 
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
@@ -203,6 +206,10 @@ std::vector<const char*> GetInstanceExtensions(Frontend::WindowSystemType window
     if (enable_debug_utils) {
         extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
     }
+#ifdef RYTY_GPU
+    // ryGT: the instance extensions NVIDIA DLSS needs, when the DLSS plugin is used.
+    RytyDlss::AddInstanceExtensions(extensions, properties);
+#endif
 
     // Sanitize extension list
     std::erase_if(extensions, [&](const char* extension) -> bool {

@@ -504,6 +504,11 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
         static_cast<float>(EmulatorSettings.GetRcasAttenuation() / 1000.f);
 
     fsr_pass.Create(device, instance.GetAllocator(), num_images);
+#ifdef RYTY_GPU
+    if (RytyDlss::Init(instance.GetInstance(), instance.GetPhysicalDevice(), device)) {
+        dlss_pass.Create(device, instance.GetAllocator(), num_images);
+    }
+#endif
     pp_pass.Create(device, swapchain.GetSurfaceFormat().format);
 
     ImGui::Layer::AddLayer(Common::Singleton<Core::Devtools::Layer>::Instance());
@@ -524,6 +529,9 @@ Presenter::~Presenter() {
     Check(draw_scheduler.DirectCommandBuffer().reset());
     Check(present_scheduler.DirectCommandBuffer().reset());
     Check(flip_scheduler.DirectCommandBuffer().reset());
+#ifdef RYTY_GPU
+    RytyDlss::Shutdown();
+#endif
 
     const vk::Device device = instance.GetDevice();
     for (auto& frame : present_frames) {
@@ -757,8 +765,21 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
 
     // PERF-084: the host passes record into the command buffer directly.
     const vk::CommandBuffer pass_cmdbuf = draw_scheduler.DirectCommandBuffer();
-    image_view = fsr_pass.Render(pass_cmdbuf, image_view, image_size,
-                                 {frame->width, frame->height}, fsr_settings, frame->is_hdr);
+    bool scaled = false;
+#ifdef RYTY_GPU
+    // ryGT: DLSS (when its plugin is on and can scale to the window size) replaces FSR.
+    if (const auto dlss_view =
+            dlss_pass.Render(pass_cmdbuf, image.GetImage(), image_view, view_info.format,
+                             image_size, {frame->width, frame->height});
+        dlss_view != image_view) {
+        image_view = dlss_view;
+        scaled = true;
+    }
+#endif
+    if (!scaled) {
+        image_view = fsr_pass.Render(pass_cmdbuf, image_view, image_size,
+                                     {frame->width, frame->height}, fsr_settings, frame->is_hdr);
+    }
 
     // Vulkan has no sRGB variant of the 10-bit format, so an A2R10G10B10Srgb buffer reaches
     // the post process pass still sRGB encoded and has to be decoded there instead.
