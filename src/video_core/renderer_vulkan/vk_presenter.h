@@ -34,6 +34,7 @@ struct Frame {
     vk::Fence present_done;
     vk::Semaphore ready_semaphore;
     u64 ready_tick;
+    Scheduler* ready_scheduler{}; // PERF-084: submits the work signaling ready_tick
     bool is_hdr{false};
     u8 id{};
 

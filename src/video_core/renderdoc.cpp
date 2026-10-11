@@ -170,7 +170,13 @@ std::vector<std::filesystem::path> TakeRequestedScreenshotPaths(const u32 max_co
 }
 
 u32 ConsumeGameOnlyScreenshotRequests() {
-    return screenshot_game_only_count.exchange(0, std::memory_order_acq_rel);
+    // One per frame: several requests at once (the test script's "burstN") capture that many
+    // consecutive frames.
+    u32 count = screenshot_game_only_count.load(std::memory_order_acquire);
+    while (count != 0 && !screenshot_game_only_count.compare_exchange_weak(
+                             count, count - 1, std::memory_order_acq_rel)) {
+    }
+    return count != 0 ? 1 : 0;
 }
 
 u32 ConsumeWithOverlaysScreenshotRequests() {

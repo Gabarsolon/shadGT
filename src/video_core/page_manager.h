@@ -52,6 +52,10 @@ public:
     void Unguard(VAddr address, u64 size);
     bool IsGuarded(VAddr page) const;
     void DropGuards(VAddr page);
+#ifdef RYTY_GPU
+    /// Ryty: puts back the protections of tracked pages after the game changed the range's.
+    void ReapplyProtection(VAddr address, u64 size);
+#endif
 
     /// PERF-063: whether a CPU write to the page goes unnoticed (no write or read watcher, so
     /// the page is neither write- nor read-protected). Any thread; a racy but word-sized read.

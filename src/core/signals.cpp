@@ -408,7 +408,13 @@ void SignalHandler(int sig, siginfo_t* info, void* raw_context) {
 #endif
 
 SignalDispatch::SignalDispatch() {
-#if defined(_WIN32)
+#if defined(_WIN32) && defined(RYTY_GPU)
+    // Under Ryty, Ryty's libc owns exception handling: it passes guest write faults to the
+    // renderer (RytyGpuHandleWriteFault) and reports real crashes. This handler would treat every
+    // first-chance exception it does not know, such as a C++ exception thrown and caught inside
+    // Ryty's libraries, as fatal and end the process.
+    handle = nullptr;
+#elif defined(_WIN32)
     ASSERT_MSG(handle = AddVectoredExceptionHandler(0, SignalHandler),
                "Failed to register exception handler.");
 #else
@@ -430,6 +436,9 @@ void SignalDispatch::RemoveHandlers() {
     // asserting here would get into an infinite loop until too
     // many nested exceptions makes the OS kill the process
 #if defined(_WIN32)
+    if (handle == nullptr) {
+        return; // Never registered (the Ryty build).
+    }
     if (!(RemoveVectoredExceptionHandler(handle))) {
         LOG_CRITICAL(Core, "Failed to remove exception handler.");
         std::quick_exit(1);

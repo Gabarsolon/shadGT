@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <mutex>
 #include <optional>
 #include <source_location>
@@ -57,6 +58,50 @@ constexpr ImageFlagBits ImageFlagsAfterBufferUpload(ImageFlagBits flags,
     flags &= ~ImageFlagBits::Dirty;
     return preserve_buffer_coherence ? flags : flags & ~ImageFlagBits::BufferCoherent;
 }
+
+/// PERF-086: counts changes of any image's GpuModified, Dirty or BufferCoherent bits, which decide
+/// whether a buffer bound over images needs an image exported into it.
+inline std::atomic<u64> g_image_export_state{1};
+
+/// PERF-086: Image::flags, counting changes of the export bits in g_image_export_state.
+class ImageFlags {
+public:
+    constexpr explicit ImageFlags(ImageFlagBits value_) noexcept : value{value_} {}
+    constexpr ImageFlags(const ImageFlags&) noexcept = default;
+
+    constexpr operator ImageFlagBits() const noexcept {
+        return value;
+    }
+
+    ImageFlags& operator=(const ImageFlags& other) noexcept {
+        Set(other.value);
+        return *this;
+    }
+    ImageFlags& operator=(ImageFlagBits new_value) noexcept {
+        Set(new_value);
+        return *this;
+    }
+    ImageFlags& operator|=(ImageFlagBits bits) noexcept {
+        Set(value | bits);
+        return *this;
+    }
+    ImageFlags& operator&=(ImageFlagBits bits) noexcept {
+        Set(value & bits);
+        return *this;
+    }
+
+private:
+    void Set(ImageFlagBits new_value) noexcept {
+        constexpr ImageFlagBits ExportBits =
+            ImageFlagBits::GpuModified | ImageFlagBits::Dirty | ImageFlagBits::BufferCoherent;
+        if ((value ^ new_value) & ExportBits) {
+            g_image_export_state.fetch_add(1, std::memory_order_relaxed);
+        }
+        value = new_value;
+    }
+
+    ImageFlagBits value;
+};
 
 constexpr bool CanInvalidateImageFromGPU(ImageFlagBits flags, bool base_matches) {
     const bool safe_to_download =
@@ -170,6 +215,9 @@ struct Image : public Common::LRUNode<> {
     void MarkGpuModified(ImageFlagBits modified = ImageFlagBits::GpuModified,
                          std::source_location loc = std::source_location::current()) {
         MarkModified(loc);
+        gpu_write_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           std::chrono::steady_clock::now().time_since_epoch())
+                           .count(); // FIX-065
         flags = ImageFlagsAfterGpuWrite(flags, modified);
     }
 
@@ -197,7 +245,7 @@ public:
     ImageInfo info;
     vk::ImageAspectFlags aspect_mask = vk::ImageAspectFlagBits::eColor;
     vk::SampleCountFlags supported_samples = vk::SampleCountFlagBits::e1;
-    ImageFlagBits flags = ImageFlagBits::Dirty;
+    ImageFlags flags{ImageFlagBits::Dirty};
     VAddr track_addr = 0;
     VAddr track_addr_end = 0;
     ImageId depth_id{};
@@ -221,6 +269,7 @@ public:
     u64 lru_id{};
     u64 tick_accessed_last{};
     u64 hash{};
+    s64 gpu_write_ns{}; // FIX-065: when the GPU last drew into it (steady clock)
 
     struct {
         u32 texture : 1;

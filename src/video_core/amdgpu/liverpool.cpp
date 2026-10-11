@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdlib>
@@ -83,8 +84,13 @@ static s64 NowNs() {
                std::chrono::steady_clock::now().time_since_epoch())
         .count();
 }
-static void NoteEop() {
+static void CheckIbAtDecode(const u32* data, u32 dwords, u64 decoding); // DIAG-062
+static std::atomic<u64> g_eop_submit{0}; // DIAG-066: submission of the last EOP signaled
+static std::atomic<u64> g_eop_count{0};
+static void NoteEop(u64 submit = 0) {
     g_last_eop_ns.store(NowNs());
+    g_eop_submit.store(submit);
+    ++g_eop_count;
     Common::Nvtx::Mark("EOP interrupt"); // DIAG-056
 }
 
@@ -368,6 +374,7 @@ void Liverpool::Record(Common::UniqueFunction<void>&& work, const char* reason) 
         UnsafeWindow(reason);
     }
     if (draw_pipe) {
+        DrawPipe::SetPushTag(reason ? reason : "record"); // DIAG-069
         draw_pipe->Push(std::move(work));
     } else {
         work();
@@ -377,6 +384,30 @@ void Liverpool::Record(Common::UniqueFunction<void>&& work, const char* reason) 
 void Liverpool::RecordDma(Common::UniqueFunction<void>&& work, VAddr src, u64 src_bytes,
                           VAddr dst, u64 dst_bytes) {
     const bool writes_memory = dst != 0 && dst_bytes != 0;
+    // PERF-083: with the buffer stage, a copy does not stop it either (PERF-082): a planned
+    // buffer the copy writes into is obtained again by the recorder. -DisablePerf 96 keeps
+    // copies as barriers.
+    static const bool dmas_neutral = Common::PerfFeatureEnabled(96);
+    if (!early_fences_mode && draw_pipe && draw_pipe->HasStage() && dmas_neutral) {
+        u64 seq = 0;
+        if (writes_memory) {
+            seq = labels_pushed.load(std::memory_order_relaxed) + 1;
+            auto& record = label_ring[seq % label_ring.size()];
+            record.address = dst;
+            record.size = dst_bytes;
+            record.seq.store(seq, std::memory_order_release);
+            labels_pushed.store(seq, std::memory_order_release);
+        }
+        draw_pipe->Push(
+            [this, seq, work = std::move(work)]() mutable {
+                work();
+                if (seq != 0) {
+                    labels_done.store(seq, std::memory_order_release);
+                }
+            },
+            DrawPipe::JobKind::Neutral);
+        return;
+    }
     if (!early_fences_mode || !draw_pipe || !rasterizer) {
         Record(std::move(work), "dma");
         return;
@@ -395,6 +426,7 @@ void Liverpool::RecordDma(Common::UniqueFunction<void>&& work, VAddr src, u64 sr
         return;
     }
     // Covered by the window's capture, but a barrier for the buffer stage (it changes buffers).
+    DrawPipe::SetPushTag("captured dma"); // DIAG-069
     draw_pipe->Push([this, work = std::move(work), capture = window_capture]() mutable {
         rasterizer->SetReadCapture(capture.get());
         work();
@@ -725,6 +757,11 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
     // A draw whose buffers the stage does not obtain is obtained by the recorder: the stage
     // must not run past it.
     const auto kind = staged ? DrawPipe::JobKind::Neutral : DrawPipe::JobKind::Barrier;
+    if (!staged) {
+        // DIAG-069
+        DrawPipe::SetPushTag(compute ? (direct_draw ? "dispatch not selected" : "indirect dispatch")
+                                     : (direct_draw ? "draw not selected" : "indirect draw"));
+    }
     draw_pipe->Push([this, delta = std::move(delta), cs, cb_extent = last_cb_extent,
                      db_extent = last_db_extent, expected = std::move(expected),
                      selected = std::move(selected), draw = std::move(draw),
@@ -843,12 +880,30 @@ void Liverpool::RecordLabelWrite(VAddr address, std::vector<u8> value,
     if (waited_label != 0 && address <= waited_label && waited_label < address + value.size()) {
         ++labels_written_while_waiting; // DIAG-047
     }
+    const u64 label_size = value.size();
     {
         std::scoped_lock lk{pending_labels_mutex};
         pending_labels[address] = PendingLabel{std::move(value), job};
     }
-    draw_pipe->Push([this, address, job, work = std::move(work)] {
+    // PERF-082: with the buffer stage, a label write does not stop it: the recorder redoes a
+    // planned buffer the label lands in. -DisablePerf 95 keeps label writes as barriers.
+    static const bool labels_neutral = Common::PerfFeatureEnabled(95);
+    const bool neutral = labels_neutral && draw_pipe->HasStage();
+    u64 label_seq = 0;
+    if (neutral) {
+        label_seq = labels_pushed.load(std::memory_order_relaxed) + 1;
+        auto& record = label_ring[label_seq % label_ring.size()];
+        record.address = address;
+        record.size = label_size;
+        record.seq.store(label_seq, std::memory_order_release);
+        labels_pushed.store(label_seq, std::memory_order_release);
+    }
+    DrawPipe::SetPushTag("label write"); // DIAG-069
+    draw_pipe->Push([this, address, job, label_seq, work = std::move(work)] {
         work();
+        if (label_seq != 0) {
+            labels_done.store(label_seq, std::memory_order_release);
+        }
         if (early_fences_mode) {
             fences_delivered.fetch_add(1, std::memory_order_release);
         }
@@ -857,7 +912,26 @@ void Liverpool::RecordLabelWrite(VAddr address, std::vector<u8> value,
             it != pending_labels.end() && it->second.job == job) {
             pending_labels.erase(it);
         }
-    });
+    }, neutral ? DrawPipe::JobKind::Neutral : DrawPipe::JobKind::Barrier);
+}
+
+bool Liverpool::LabelWrittenOver(u64 done, u64 pushed, VAddr address, u64 size) const {
+    if (pushed <= done) {
+        return false;
+    }
+    if (pushed - done >= label_ring.size()) {
+        return true; // Too many to look at: assume one did.
+    }
+    for (u64 seq = done + 1; seq <= pushed; ++seq) {
+        const auto& record = label_ring[seq % label_ring.size()];
+        if (record.seq.load(std::memory_order_acquire) != seq) {
+            return true; // Overwritten meanwhile.
+        }
+        if (record.address < address + size && address < record.address + record.size) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool Liverpool::PendingLabelSatisfies(const PM4CmdWaitRegMem& wait) {
@@ -938,9 +1012,10 @@ void Liverpool::ReportDrawPipe() {
     sync_reasons.clear();
     std::string read_ahead;
     if (read_ahead_states) {
-        read_ahead = fmt::format("; read-ahead: {} draw states queued, {} reads ahead ({:.1f} ms)",
+        read_ahead = fmt::format("; read-ahead: {} draw states queued, {} reads ahead ({:.1f} ms), "
+                                 "{} stopped at unpublished REWINDs",
                                  read_ahead_states->TakeOffered(), pipe_read_ahead_stats.scans,
-                                 pipe_read_ahead_stats.ms);
+                                 pipe_read_ahead_stats.ms, pipe_read_ahead_stats.rewinds);
         pipe_read_ahead_stats = {};
     }
     if (commands_recorded != 0) {
@@ -1298,6 +1373,7 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
                 YIELD_CE();
                 RESUME_CE(task);
             }
+            task.handle.destroy(); // FIX-054
             break;
         }
         default:
@@ -1316,6 +1392,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     FIBER_ENTER(dcb_task_name);
     if (!original_dcb.empty()) {
         RecordCmdBuffer(original_dcb.data(), original_dcb.size_bytes(), false);
+        decoding_submit.fetch_add(1, std::memory_order_relaxed); // DIAG-061
     }
 
     cblock.Reset();
@@ -1918,6 +1995,23 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         pixel_counter += OcclusionCounterStep;
                         // PERF-031: written in order with the draws before it.
                         const auto write_results = [results, counter, pairs = num_counter_pairs] {
+#ifdef RYTY_GPU
+                            // FIX-072: GT Sport races crashed on the recorder writing these
+                            // results to addresses that were not (or no longer) mapped
+                            // (0x13ac1008, 0x17f60c0). Such a write is dropped.
+                            if (!Core::RytyMemory::IsWritableTarget(
+                                    reinterpret_cast<VAddr>(results),
+                                    u64(pairs) * 2 * sizeof(u64))) {
+                                static std::atomic<u32> dropped{};
+                                if (dropped.fetch_add(1) < 20) {
+                                    LOG_WARNING(Render,
+                                                "FIX-072: occlusion results at {:#x} not written: "
+                                                "not writable memory",
+                                                reinterpret_cast<VAddr>(results));
+                                }
+                                return;
+                            }
+#endif
                             u64* result = results;
                             for (s32 i = 0; i < s32(pairs); ++i, result += 2) {
                                 *result = counter | OcclusionCounterValidMask;
@@ -1991,14 +2085,15 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::EventWriteEop: {
                 const auto event = *reinterpret_cast<const PM4CmdEventWriteEop*>(header);
+                const u64 eop_submit = decoding_submit.load(std::memory_order_relaxed);
                 if (draw_pipe && rasterizer && (EarlyFencesActive() || EarlyFenceAllowed())) {
                     // EXP-063: signaled now; the recorder only submits at this point.
                     event.SignalFence(
                         [](void* address, u64 data, u32 num_bytes) {
                             Core::Memory::Instance()->TryWriteBacking(address, &data, num_bytes);
                         },
-                        [] {
-                            NoteEop();
+                        [eop_submit] {
+                            NoteEop(eop_submit);
                             Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop);
                         });
                     ++g_fences_early;
@@ -2013,19 +2108,19 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 RecordLabelWrite(
                     reinterpret_cast<VAddr>(event.Address<u32>()),
                     FenceValueBytes(event.data_sel.Value(), event.DataDWord(), event.DataQWord()),
-                    [this, event] {
+                    [this, event, eop_submit] {
                         const auto* event_eop = &event;
                         const bool deferred =
                             rasterizer &&
                             rasterizer->DeferFenceSignal(
                                 reinterpret_cast<VAddr>(event_eop->Address<u32>()),
-                                [event] {
+                                [event, eop_submit] {
                                     event.SignalFence(
                                         [](void* address, u64 data, u32 num_bytes) {
                                             WriteDeferredFence(address, &data, num_bytes);
                                         },
-                                        [] {
-                                            NoteEop();
+                                        [eop_submit] {
+                                            NoteEop(eop_submit);
                                             ++g_eops_deferred;
                                             Platform::IrqC::Instance()->Signal(
                                                 Platform::InterruptId::GfxEop);
@@ -2043,8 +2138,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                     auto* memory = Core::Memory::Instance();
                                     ASSERT(memory->TryWriteBacking(address, &data, num_bytes));
                                 },
-                                [] {
-                                    NoteEop();
+                                [eop_submit] {
+                                    NoteEop(eop_submit);
                                     ++g_eops_immediate;
                                     Platform::IrqC::Instance()->Signal(
                                         Platform::InterruptId::GfxEop);
@@ -2347,7 +2442,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
                 RecordCmdBuffer(indirect_buffer->Address<const u32>(),
                                 u64(indirect_buffer->ib_size) * sizeof(u32), true);
+                CheckIbAtDecode(indirect_buffer->Address<const u32>(), indirect_buffer->ib_size,
+                                decoding_submit.load(std::memory_order_relaxed));
                 lookahead_outer.push_back(lookahead_dcb);
+                const auto outer_ib = CurrentDecodeIb(); // DIAG-063
+                SetCurrentDecodeIb(indirect_buffer->Address<const u32>(), indirect_buffer->ib_size);
                 auto task = ProcessGraphics(
                     {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, {});
                 RESUME_GFX(task);
@@ -2356,6 +2455,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     YIELD_GFX();
                     RESUME_GFX(task);
                 }
+                SetCurrentDecodeIb(outer_ib.first, outer_ib.second);
+                // FIX-054: a finished coroutine's frame stays allocated until destroyed. GT Sport
+                // calls thousands of indirect buffers a second, and their 3 KB frames filled the
+                // heap (over 20 GB in a race, then "out of memory").
+                task.handle.destroy();
                 lookahead_outer.pop_back();
                 break;
             }
@@ -2530,6 +2634,33 @@ bool Liverpool::ScanPackets(std::span<const u32> dcb,
                 !Common::PerfFeatureEnabled(22) || scanned_packets.insert(ib).second;
             if (new_ib && depth < 4 && ib && ib_size > 0 && ib_size < (1u << 22)) {
                 ScanPackets({ib, ib_size}, on_draw, depth + 1, draws_left, builds_left, nullptr);
+                if (scan_blocked) {
+                    // FIX-061: read it again once its commands are published.
+                    scanned_packets.erase(ib);
+                    return true;
+                }
+            }
+            break;
+        }
+        case PM4ItOpcode::Rewind: {
+            // FIX-061: the game writes the commands after a REWIND once it has submitted the
+            // command buffer, and publishes them by setting the packet's valid bit; the decoder
+            // waits for it. Until then they are an earlier frame's commands. GT Sport's race
+            // summary submits each frame this way, and the read-ahead read the previous use of
+            // the buffer: draws whose constants had been reused for other data, and hundreds of
+            // pipelines nothing needed, which kept the driver figure's real pipelines waiting
+            // (the figure flickered and glowed green while its draws were skipped).
+            static const bool stop_at_rewind = Common::PerfFeatureEnabled(85);
+            if (stop_at_rewind && count >= 1 &&
+                (std::atomic_ref<const u32>(dcb[1]).load(std::memory_order_acquire) &
+                 0x80000000u) == 0) {
+                scan_blocked = true;
+                ++pipe_read_ahead_stats.rewinds;
+                if (stopped_at) {
+                    *stopped_at = dcb.data(); // checked again by the next read-ahead
+                    return false;
+                }
+                return true;
             }
             break;
         }
@@ -2580,9 +2711,11 @@ bool Liverpool::ScanAheadForPipelines(const std::function<bool(const Regs&)>& on
     u32 draws_left = max_draws;
     u32 builds_left = max_builds;
     const u32* stopped_at = nullptr;
+    scan_blocked = false;
     scan_finished = ScanPackets(start, on_draw, 0, draws_left, builds_left, &stopped_at);
     // The command buffers this one was called from continue after it.
-    for (auto it = lookahead_outer.rbegin(); scan_finished && it != lookahead_outer.rend(); ++it) {
+    for (auto it = lookahead_outer.rbegin();
+         scan_finished && !scan_blocked && it != lookahead_outer.rend(); ++it) {
         if (!it->empty()) {
             ScanPackets(*it, on_draw, 0, draws_left, builds_left, nullptr);
         }
@@ -2665,6 +2798,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 YIELD_ASC(vqid);
                 RESUME_ASC(task, vqid);
             }
+            task.handle.destroy(); // FIX-054
             break;
         }
         case PM4ItOpcode::DmaData: {
@@ -3055,9 +3189,307 @@ Liverpool::CmdBuffer Liverpool::CopyCmdBuffers(std::span<const u32> dcb, std::sp
     return std::make_pair(dcb, ccb);
 }
 
+// DIAG-061: GT Sport's race summary sometimes finds its tessellation constants replaced by float
+// data when the draw is decoded (FIX-058). This records each draw's constants as the game left them
+// at submission, so a decoded draw can tell whether they were overwritten afterwards.
+namespace {
+std::mutex tess_submit_mutex;
+std::unordered_map<VAddr, Liverpool::TessSubmitRecord> tess_submits;
+u64 tess_submit_sane{};
+u64 tess_submit_garbage{};
+s64 tess_submit_last_log{};
+struct {
+    u64 packets, sh_sets, hs_touches, rejected, ibs, ibs_refused, bailed;
+    u32 rejected_vsharp[4];
+} tess_scan{};
+
+// DIAG-062: indirect buffers as they were at submission, to tell whether the game still writes
+// them after submitting.
+struct IbAtSubmit {
+    u64 hash{};
+    u32 dwords{};
+    u64 submit{};
+    s64 time_ns{};
+    std::vector<u32> words; // small buffers only
+};
+std::mutex ib_submit_mutex;
+std::unordered_map<VAddr, IbAtSubmit> ib_at_submit;
+std::atomic<bool> current_ib_changed{};
+u64 ibs_unchanged{};
+u64 ibs_changed{};
+u64 ibs_unseen{};
+
+bool TessSubmitCheckEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("SHADGT_TESS_SUBMIT_CHECK");
+        return env && *env && *env != '0';
+    }();
+    return enabled;
+}
+
+constexpr u32 HsUserDataFirst = 0x2D0C; // SPI_SHADER_USER_DATA_HS_0
+constexpr u32 TessConstsDword = 7;      // where GT Sport's hull shaders read the V# from
+
+void CheckTessConstantsAtSubmit(const std::array<u32, 16>& hs, u64 submit, s64 now,
+                                std::span<const u32> cmd) {
+    const u32* v = &hs[TessConstsDword];
+    ++tess_scan.hs_touches;
+    if (((v[1] >> 16) & 0x3fff) != 16 || v[2] != 3) {
+        ++tess_scan.rejected;
+        std::memcpy(tess_scan.rejected_vsharp, v, sizeof(tess_scan.rejected_vsharp));
+        return;
+    }
+    const VAddr base = (VAddr(v[1] & 0xffff) << 32) | v[0];
+    std::array<u32, 7> c{};
+#ifdef RYTY_GPU
+    if (!Core::RytyMemory::IsGuestReadable(base, sizeof(c))) {
+        return;
+    }
+#endif
+    Common::CopyGuest(c.data(), reinterpret_cast<const void*>(base), sizeof(c));
+    constexpr u32 Lds = 64_KB;
+    const bool sane = c[2] != 0 && std::ranges::all_of(c, [](u32 x) { return x <= Lds; });
+    const VAddr cmd_begin = reinterpret_cast<VAddr>(cmd.data());
+    const bool in_cmd = base >= cmd_begin && base < cmd_begin + cmd.size_bytes();
+    std::scoped_lock lk{tess_submit_mutex};
+    if (tess_submits.size() > 1'000'000) {
+        tess_submits.clear();
+    }
+    tess_submits[base] = {submit, now, c[0], sane, in_cmd};
+    ++(sane ? tess_submit_sane : tess_submit_garbage);
+    if (!sane && tess_submit_garbage <= 40) {
+        LOG_WARNING(Render, "DIAG-061: submission {} carries garbage tessellation constants at "
+                            "{:#x} already (ls stride {:#x})",
+                    submit, base, c[0]);
+    }
+    if (now - tess_submit_last_log >= 5'000'000'000) {
+        tess_submit_last_log = now;
+        LOG_WARNING(Render, "DIAG-061: tessellation constants at submission: {} sane, {} garbage",
+                    tess_submit_sane, tess_submit_garbage);
+    }
+}
+
+void ScanTessConstants(std::span<const u32> cmd, std::array<u32, 16>& hs, u64 submit, s64 now,
+                       u32 depth) {
+    auto apply = [&](u32 first, std::span<const u32> values) {
+        bool touched = false;
+        for (u32 i = 0; i < values.size(); ++i) {
+            const u32 reg = first + i;
+            if (reg >= HsUserDataFirst && reg < HsUserDataFirst + 16) {
+                hs[reg - HsUserDataFirst] = values[i];
+                touched |= reg - HsUserDataFirst >= TessConstsDword &&
+                           reg - HsUserDataFirst < TessConstsDword + 4;
+            }
+        }
+        if (touched) {
+            CheckTessConstantsAtSubmit(hs, submit, now, cmd);
+        }
+    };
+    std::span<const u32> rest = cmd;
+    while (!rest.empty()) {
+        const u32 raw = rest.front();
+        const u32 type = raw >> 30;
+        if (type == 2) {
+            rest = rest.subspan(1);
+            continue;
+        }
+        if (type == 0) {
+            const auto write = DecodeType0RegisterWrite(rest, Regs::NumRegs);
+            if (!write) {
+                ++tess_scan.bailed;
+                return;
+            }
+            apply(write->first_register, write->values);
+            rest = rest.subspan(write->values.size() + 1);
+            continue;
+        }
+        if (type != 3) {
+            ++tess_scan.bailed;
+            return;
+        }
+        const auto* header = reinterpret_cast<const PM4Type3Header*>(rest.data());
+        const u32 count = header->NumWords();
+        if (count + 1 > rest.size()) {
+            ++tess_scan.bailed;
+            return;
+        }
+        ++tess_scan.packets;
+        if (header->opcode == PM4ItOpcode::SetShReg && count >= 1) {
+            ++tess_scan.sh_sets;
+            const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
+            apply(Regs::ShRegWordOffset + set_data->reg_offset, rest.subspan(2, count - 1));
+        } else if (header->opcode == PM4ItOpcode::IndirectBuffer && depth < 4) {
+            const auto* ib = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
+            const auto* data = ib->Address<const u32>();
+            const u64 size = u64(ib->ib_size) * sizeof(u32);
+#ifdef RYTY_GPU
+            if (data && Core::RytyMemory::IsGuestReadable(reinterpret_cast<VAddr>(data), size))
+#else
+            if (data)
+#endif
+            {
+                ++tess_scan.ibs;
+                {
+                    const u64 hash = XXH3_64bits(data, size);
+                    std::scoped_lock lk{ib_submit_mutex};
+                    if (ib_at_submit.size() > 200'000) {
+                        ib_at_submit.clear();
+                    }
+                    auto& entry = ib_at_submit[reinterpret_cast<VAddr>(data)];
+                    entry = {hash, ib->ib_size, submit, now, {}};
+                    if (ib->ib_size <= 64) {
+                        entry.words.assign(data, data + ib->ib_size);
+                    }
+                }
+                ScanTessConstants({data, ib->ib_size}, hs, submit, now, depth + 1);
+            } else {
+                ++tess_scan.ibs_refused;
+            }
+        }
+        rest = rest.subspan(count + 1);
+    }
+}
+} // namespace
+
+namespace {
+std::atomic<const u32*> current_decode_ib{};
+std::atomic<u32> current_decode_ib_dwords{};
+} // namespace
+
+std::pair<const u32*, u32> Liverpool::CurrentDecodeIb() {
+    return {current_decode_ib.load(std::memory_order_relaxed),
+            current_decode_ib_dwords.load(std::memory_order_relaxed)};
+}
+
+void Liverpool::SetCurrentDecodeIb(const u32* data, u32 dwords) {
+    current_decode_ib.store(data, std::memory_order_relaxed);
+    current_decode_ib_dwords.store(dwords, std::memory_order_relaxed);
+}
+
+std::string Liverpool::DescribeEops() {
+    const s64 last = g_last_eop_ns.load();
+    return fmt::format("{} EOPs signaled, the last one of submission {} {:.2f} ms ago",
+                       g_eop_count.load(), g_eop_submit.load(),
+                       last ? (NowNs() - last) / 1e6 : -1.0);
+}
+
+bool Liverpool::CurrentIbChangedSinceSubmit() {
+    return current_ib_changed.load(std::memory_order_relaxed);
+}
+
+// DIAG-062: compares an indirect buffer being decoded with its contents at submission.
+static void CheckIbAtDecode(const u32* data, u32 dwords, u64 decoding) {
+    if (!TessSubmitCheckEnabled()) {
+        return;
+    }
+    const u64 hash = XXH3_64bits(data, u64(dwords) * sizeof(u32));
+    std::scoped_lock lk{ib_submit_mutex};
+    const auto it = ib_at_submit.find(reinterpret_cast<VAddr>(data));
+    bool changed = false;
+    if (it == ib_at_submit.end() || it->second.dwords != dwords) {
+        ++ibs_unseen;
+    } else if (it->second.hash == hash) {
+        ++ibs_unchanged;
+    } else {
+        changed = true;
+        if (++ibs_changed <= 6 && !it->second.words.empty()) {
+            LOG_WARNING(Render, "DIAG-062: indirect buffer {:#x} at submission: {:08x}",
+                        reinterpret_cast<VAddr>(data), fmt::join(it->second.words, " "));
+            LOG_WARNING(Render, "DIAG-062: indirect buffer {:#x} at decoding:   {:08x}",
+                        reinterpret_cast<VAddr>(data),
+                        fmt::join(std::span<const u32>{data, dwords}, " "));
+        }
+        if (ibs_changed <= 40) {
+            LOG_WARNING(Render,
+                        "DIAG-062: indirect buffer {:#x} ({} dwords) of submission {} changed "
+                        "between submission and decoding ({:.2f} ms later, decoding submission "
+                        "{})",
+                        reinterpret_cast<VAddr>(data), dwords, it->second.submit,
+                        (NowNs() - it->second.time_ns) / 1e6, decoding);
+        }
+    }
+    current_ib_changed.store(changed, std::memory_order_relaxed);
+    static s64 last_log = 0;
+    if (const s64 now = NowNs(); now - last_log >= 5'000'000'000) {
+        last_log = now;
+        LOG_WARNING(Render,
+                    "DIAG-062: indirect buffers at decoding: {} as submitted, {} changed since "
+                    "submission, {} not seen at submission",
+                    ibs_unchanged, ibs_changed, ibs_unseen);
+    }
+}
+
+std::optional<Liverpool::TessSubmitRecord> Liverpool::FindTessSubmit(VAddr base) {
+    std::scoped_lock lk{tess_submit_mutex};
+    if (const auto it = tess_submits.find(base); it != tess_submits.end()) {
+        return it->second;
+    }
+    return std::nullopt;
+}
+
 void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     auto& queue = mapped_queues[GfxQueueId];
     const auto original_dcb = dcb;
+    if (!dcb.empty()) {
+        const u64 submit = submitted_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (TessSubmitCheckEnabled()) {
+            static std::array<u32, 16> hs{}; // only this thread submits graphics work
+            const s64 now = NowNs();
+            if (submit % 2000 == 0 || submit % 2000 == 1) {
+                // DIAG-062: what a submission consists of.
+                std::string packets;
+                u32 listed = 0;
+                for (auto rest = dcb; !rest.empty() && listed < 80; ++listed) {
+                    const u32 raw = rest.front();
+                    const u32 type = raw >> 30;
+                    size_t words = 1;
+                    if (type == 3) {
+                        const auto* h = reinterpret_cast<const PM4Type3Header*>(rest.data());
+                        words = h->NumWords() + 1;
+                        packets += fmt::format(" {:02x}/{}", u32(h->opcode.Value()), words);
+                        if (h->opcode == PM4ItOpcode::IndirectBuffer) {
+                            const auto* ib = reinterpret_cast<const PM4CmdIndirectBuffer*>(h);
+                            packets += fmt::format("->{:#x}+{}", ib->Address<const u32>()
+                                                                  ? reinterpret_cast<VAddr>(
+                                                                        ib->Address<const u32>())
+                                                                  : 0,
+                                                   u32(ib->ib_size));
+                        } else if (h->opcode == PM4ItOpcode::WaitRegMem) {
+                            const auto* w = reinterpret_cast<const PM4CmdWaitRegMem*>(h);
+                            packets += fmt::format("(addr {:#x} ref {:#x} mask {:#x} fn {})",
+                                                   reinterpret_cast<VAddr>(w->Address<u32*>()),
+                                                   u32(w->ref), u32(w->mask),
+                                                   u32(w->function.Value()));
+                        }
+                    } else if (type == 0) {
+                        words = ((raw >> 16) & 0x3fff) + 2;
+                        packets += fmt::format(" t0:{:#x}/{}", raw & 0xffff, words);
+                    } else {
+                        packets += " t2";
+                    }
+                    if (words > rest.size()) {
+                        break;
+                    }
+                    rest = rest.subspan(words);
+                }
+                LOG_WARNING(Render, "DIAG-062: submission {} at {:#x}, {} dwords:{}", submit,
+                            reinterpret_cast<VAddr>(dcb.data()), dcb.size(), packets);
+            }
+            ScanTessConstants(dcb, hs, submit, now, 0);
+            static s64 last_scan_log = 0;
+            if (now - last_scan_log >= 5'000'000'000) {
+                last_scan_log = now;
+                const auto& t = tess_scan;
+                LOG_WARNING(Render,
+                            "DIAG-061: scanned {} packets, {} SET_SH_REG, {} HS V# writes ({} not "
+                            "tessellation V#s, last {:08x} {:08x} {:08x} {:08x}), {} IBs ({} "
+                            "unreadable), {} scans stopped early",
+                            t.packets, t.sh_sets, t.hs_touches, t.rejected, t.rejected_vsharp[0],
+                            t.rejected_vsharp[1], t.rejected_vsharp[2], t.rejected_vsharp[3],
+                            t.ibs, t.ibs_refused, t.bailed);
+            }
+        }
+    }
 
     if (EmulatorSettings.IsCopyGpuBuffers()) {
         std::tie(dcb, ccb) = CopyCmdBuffers(dcb, ccb);

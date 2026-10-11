@@ -5,6 +5,7 @@
 
 #include <bitset>
 
+#include "common/perf_monitor.h"
 #include "common/types.h"
 #include "shader_recompiler/backend/bindings.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
@@ -110,6 +111,23 @@ struct StageSpecialization {
                                                     : (step_rate == InstanceIdType::OverStepRate1
                                                            ? runtime_info.sw.vs.step_rate_1
                                                            : 1);
+                             }
+                             // FIX-060: a V# of a gigabyte or more is garbage. GT Sport's race
+                             // summary quads read float vertex data as their V#s, different
+                             // every frame; specializing on them made a new variant and pipeline
+                             // nearly every frame, and those draws were skipped while each built
+                             // (the flickering driver figure). Such an attribute counts as plain
+                             // floats. -DisablePerf 83 specializes on it.
+                             static const bool plain_garbage = Common::PerfFeatureEnabled(83);
+                             if (plain_garbage && sharp.GetSize() >= (u64{1} << 30)) {
+                                 spec.num_class = AmdGpu::NumberClass::Float;
+                                 spec.dst_select = AmdGpu::CompMapping{
+                                     .r = AmdGpu::CompSwizzle::Red,
+                                     .g = AmdGpu::CompSwizzle::Green,
+                                     .b = AmdGpu::CompSwizzle::Blue,
+                                     .a = AmdGpu::CompSwizzle::Alpha,
+                                 };
+                                 return;
                              }
                              spec.num_class = AmdGpu::GetNumberClass(sharp.GetNumberFmt());
                              spec.dst_select = sharp.DstSelect();

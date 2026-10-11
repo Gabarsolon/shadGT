@@ -16,6 +16,7 @@
 #include <xxhash.h>
 
 #include "common/types.h"
+#include "core/guest_hash.h"
 
 namespace VideoCore {
 
@@ -161,7 +162,7 @@ private:
                     if (!valid(page)) {
                         continue;
                     }
-                    work.hashes[i].store(XXH3_64bits(reinterpret_cast<const void*>(page), page_size),
+                    work.hashes[i].store(Core::HashGuestBytes(page, page_size),
                                          std::memory_order_relaxed);
                     work.ready[i].store(true, std::memory_order_release);
                 }

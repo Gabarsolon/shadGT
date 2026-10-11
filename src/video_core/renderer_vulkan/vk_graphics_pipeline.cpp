@@ -1,12 +1,16 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <functional>
 #include <mutex>
+#include <optional>
+#include <semaphore>
+#include <string>
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
@@ -25,7 +29,144 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
+#ifdef _WIN32
+#include <windows.h>
+#include <psapi.h>
+#endif
+
 namespace Vulkan {
+
+namespace {
+
+// DIAG-049: graphics pipeline creations the driver takes long on, logged every 2 s while they
+// run with the memory the process has committed. On GT Sport's race summary the driver's
+// compiler used up all memory ("LLVM ERROR: out of memory").
+class BuildWatch {
+public:
+    BuildWatch(std::string name_, const char* what_) : name{std::move(name_)}, what{what_} {
+        auto& state = State();
+        std::scoped_lock lk{state.mutex};
+        id = ++state.next_id;
+        state.running.emplace(id, Entry{name, what, std::chrono::steady_clock::now(), false, 0});
+        if (!state.watcher_started) {
+            state.watcher_started = true;
+            std::thread{Watch}.detach();
+        }
+    }
+    ~BuildWatch() {
+        auto& state = State();
+        std::scoped_lock lk{state.mutex};
+        const auto it = state.running.find(id);
+        if (it->second.reported) {
+            LOG_WARNING(Render_Vulkan, "DIAG-049: {} of {} done after {:.1f} s; {} MB committed",
+                        what, name, Seconds(it->second.start), CommittedMb());
+        }
+        state.running.erase(it);
+    }
+
+private:
+    struct Entry {
+        std::string name;
+        const char* what;
+        std::chrono::steady_clock::time_point start;
+        bool reported;
+        double last_report = 0;
+    };
+    struct Shared {
+        std::mutex mutex;
+        std::unordered_map<u64, Entry> running;
+        u64 next_id = 0;
+        bool watcher_started = false;
+    };
+    static Shared& State() {
+        static Shared state;
+        return state;
+    }
+    static double Seconds(std::chrono::steady_clock::time_point start) {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    }
+    static u64 CommittedMb() {
+#ifdef _WIN32
+        PROCESS_MEMORY_COUNTERS_EX counters{};
+        if (K32GetProcessMemoryInfo(GetCurrentProcess(),
+                                    reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),
+                                    sizeof(counters))) {
+            return counters.PrivateUsage >> 20;
+        }
+#endif
+        return 0;
+    }
+    static void Watch() {
+        Common::SetCurrentThreadName("shadGT:BuildWatch");
+        while (true) {
+            std::this_thread::sleep_for(std::chrono::seconds{2});
+            auto& state = State();
+            std::scoped_lock lk{state.mutex};
+            u32 long_running = 0;
+            for (auto& [id, entry] : state.running) {
+                const double seconds = Seconds(entry.start);
+                long_running += seconds >= 3.0;
+                if (seconds >= 3.0 && (!entry.reported || seconds - entry.last_report >= 10.0)) {
+                    entry.reported = true;
+                    entry.last_report = seconds;
+                    LOG_WARNING(Render_Vulkan,
+                                "DIAG-049: {} of {} running for {:.1f} s; {} MB committed",
+                                entry.what, entry.name, Seconds(entry.start), CommittedMb());
+                }
+            }
+            if (long_running != 0) {
+                LOG_WARNING(Render_Vulkan, "DIAG-049: {} pipeline creations of {} running for 3 s "
+                            "or more; {} MB committed", long_running, state.running.size(),
+                            CommittedMb());
+            }
+        }
+    }
+
+    std::string name;
+    const char* what;
+    u64 id{};
+};
+
+// FIX-057: the driver compiles a tessellated pipeline with a lot of memory, and GT Sport's race
+// summary (the driver figure) needs hundreds of new ones at once. With every build worker on one,
+// the process went from 11 GB to 100 GB in seconds and the driver's compiler ran out of memory.
+// At most two of them are created at the same time; -DisablePerf 79 lets them all run.
+class HeavyBuildGate {
+public:
+    explicit HeavyBuildGate(bool heavy) {
+        static const bool enabled = Common::PerfFeatureEnabled(79);
+        if (!heavy || !enabled) {
+            return;
+        }
+        const auto start = std::chrono::steady_clock::now();
+        Semaphore().acquire();
+        held = true;
+        const auto waited = std::chrono::steady_clock::now() - start;
+        if (waited >= std::chrono::seconds{1}) {
+            static std::atomic<u32> logged{};
+            if (const u32 n = ++logged; n <= 20 || n % 100 == 0) {
+                LOG_WARNING(Render_Vulkan,
+                            "FIX-057: a tessellated pipeline waited {:.1f} s for its turn ({} "
+                            "times)",
+                            std::chrono::duration<double>(waited).count(), n);
+            }
+        }
+    }
+    ~HeavyBuildGate() {
+        if (held) {
+            Semaphore().release();
+        }
+    }
+
+private:
+    static std::counting_semaphore<64>& Semaphore() {
+        static std::counting_semaphore<64> semaphore{2};
+        return semaphore;
+    }
+    bool held = false;
+};
+
+} // namespace
 
 using Shader::Backend::SPIRV::AuxShaderType;
 
@@ -164,6 +305,9 @@ GraphicsPipeline::GraphicsPipeline(
     // with each stage's specialization, so the pipeline is the one a draw would build.
     BuildDescSetLayout(preloading);
     const auto debug_str = GetDebugString();
+    BuildWatch watch{debug_str, preloading ? "stored pipeline build" : "pipeline build"};
+    const bool tessellated = stages[u32(Shader::SwStage::TessellationControl)] != nullptr;
+    HeavyBuildGate gate{tessellated};
 
     const vk::PushConstantRange push_constants = {
         .stageFlags = AllGraphicsStageBits,
@@ -535,8 +679,14 @@ GraphicsPipeline::GraphicsPipeline(
     // In practice, we use dynamic state for all of it.
     constexpr vk::PipelineDepthStencilStateCreateInfo depth_stencil_info = {};
 
+    // FIX-057: the driver's optimizer is what ran out of memory on GT Sport's tessellated
+    // pipelines (also whole, two at a time); they are compiled without optimization.
+    // -DisablePerf 81 optimizes them.
+    static const bool plain_tessellated = Common::PerfFeatureEnabled(81);
     const vk::GraphicsPipelineCreateInfo pipeline_info = {
         .pNext = &pipeline_rendering_ci,
+        .flags = tessellated && plain_tessellated ? vk::PipelineCreateFlagBits::eDisableOptimization
+                                                  : vk::PipelineCreateFlags{},
         .stageCount = static_cast<u32>(shader_stages.size()),
         .pStages = shader_stages.data(),
         .pVertexInputState = !instance.IsVertexInputDynamicState() ? &vertex_input_info : nullptr,
@@ -555,7 +705,18 @@ GraphicsPipeline::GraphicsPipeline(
     const auto create_start = std::chrono::steady_clock::now();
     // PERF-038: a background build compiles the whole pipeline at once (no libraries to link
     // and optimize again later).
-    if (!preloading && instance.IsGraphicsPipelineLibrarySupported()) {
+    // FIX-057: tessellated pipelines are compiled whole, not from libraries: on GT Sport's race
+    // summary their library compiles (with link-time optimization info kept) took the process
+    // from 11 GB to over 50 GB with only two running. -DisablePerf 80 builds them from libraries.
+    static const bool whole_tessellated = Common::PerfFeatureEnabled(80);
+    // DIAG-058 (SHADGT_NO_LIBRARIES=1): every pipeline is compiled whole, never fast-linked from
+    // libraries (does the summary's driver figure render differently from fast-linked ones?).
+    static const bool no_libraries = [] {
+        const char* env = std::getenv("SHADGT_NO_LIBRARIES");
+        return env && env[0] == '1';
+    }();
+    if (!preloading && !no_libraries && instance.IsGraphicsPipelineLibrarySupported() &&
+        !(tessellated && whole_tessellated)) {
         // PERF-017: a pipeline first needed during play is built from four separately compiled
         // libraries and linked without cross-stage optimization, which the driver does in a
         // fraction of a full compile. A worker then links the same libraries with link-time
@@ -601,6 +762,9 @@ GraphicsPipeline::GraphicsPipeline(
             }
         }
         const auto create_library = [&](size_t i) {
+            BuildWatch part_watch{debug_str, i == 1 ? "pre-raster library"
+                                             : i == 2 ? "fragment library"
+                                                      : "interface library"};
             auto [library_result, library] =
                 device.createGraphicsPipeline(pipeline_cache, part_infos[i]);
             ASSERT_MSG(library_result == vk::Result::eSuccess,
@@ -716,7 +880,7 @@ GraphicsPipeline::GraphicsPipeline(
         library_link->optimized = promise->get_future();
         const auto layout = *pipeline_layout;
         PipelineLinkWorkers::Instance().Push([this, device, layout, library_handles, promise,
-                                              cache = pipeline_cache] {
+                                              cache = pipeline_cache, debug_str, tessellated] {
             // PERF-021: the fast-linked pipeline renders the same, so the optimized one can
             // wait until new pipelines stop appearing (the worker only sleeps meanwhile).
             if (Common::PerfFeatureEnabled(21)) {
@@ -733,6 +897,8 @@ GraphicsPipeline::GraphicsPipeline(
                 .flags = vk::PipelineCreateFlagBits::eLinkTimeOptimizationEXT,
                 .layout = layout,
             };
+            BuildWatch watch{debug_str, "optimized link"};
+            HeavyBuildGate gate{tessellated};
             auto [result, optimized] = device.createGraphicsPipeline(cache, optimized_info);
             if (result == vk::Result::eSuccess) {
                 optimized_pipeline.store(optimized, std::memory_order_release);
@@ -742,8 +908,13 @@ GraphicsPipeline::GraphicsPipeline(
         return;
     }
 
+    std::optional<BuildWatch> whole_watch;
+    if (!preloading) {
+        whole_watch.emplace(debug_str, "whole pipeline compile");
+    }
     auto [pipeline_result, pipe] =
         device.createGraphicsPipelineUnique(pipeline_cache, pipeline_info);
+    whole_watch.reset();
     // PERF-DIAG-013: driver compile time of graphics pipelines created at runtime.
     if (!preloading) {
         LOG_WARNING(Render_Vulkan, "Graphics pipeline {}: driver create {:.1f} ms", debug_str,
@@ -780,10 +951,24 @@ void GraphicsPipeline::GetVertexInputs(
         const auto& attrib = fetch_shader.attributes[semantic];
         const auto step_rate = attrib.GetStepRate();
         const auto buffer = attrib.GetSharp(vs_info);
+        auto format = LiverpoolToVK::TrySurfaceFormat(buffer.GetDataFmt(), buffer.GetNumberFmt());
+        if (format == vk::Format::eUndefined) {
+            // FIX-052: a garbage V# (data format 13 with number format 1 in a GT Sport race)
+            // asserted and stopped the game. Its attribute reads four floats instead; the draw's
+            // data is garbage either way.
+            static std::atomic<u32> logged{};
+            if (logged++ < 10) {
+                LOG_WARNING(Render_Vulkan,
+                            "FIX-052: vertex attribute {} has no format (data {}, number {})",
+                            semantic, static_cast<u32>(buffer.GetDataFmt()),
+                            static_cast<u32>(buffer.GetNumberFmt()));
+            }
+            format = vk::Format::eR32G32B32A32Sfloat;
+        }
         attributes.push_back(Attribute{
             .location = semantic,
             .binding = semantic,
-            .format = LiverpoolToVK::SurfaceFormat(buffer.GetDataFmt(), buffer.GetNumberFmt()),
+            .format = format,
             .offset = 0,
         });
         bindings.push_back(Binding{

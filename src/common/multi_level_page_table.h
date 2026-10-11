@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <mutex>
 #include <vector>
 #include "common/object_pool.h"
 #include "common/spin_lock.h"
@@ -48,8 +49,13 @@ public:
         const size_t start_l1_page = start_page >> L2_BITS;
         const size_t end_l1_page = end_page >> L2_BITS;
         for (size_t l1_page = start_l1_page; l1_page <= end_l1_page; ++l1_page) {
+            // Threads tracking pages reserve concurrently; two creating the same L1 page would
+            // let one replace the other's, wiping its page states (watcher counts) mid-use.
             if (!top_level[l1_page]) {
-                top_level[l1_page] = page_alloc.Create();
+                std::scoped_lock lock{top_lock};
+                if (!top_level[l1_page]) {
+                    top_level[l1_page] = page_alloc.Create();
+                }
             }
         }
     }

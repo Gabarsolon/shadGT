@@ -1,0 +1,2249 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 0172a7a..d22072d 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -4,7 +4,23 @@ project(Ryty CXX)
+ set(RTY_TEST_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
+ 
+ function(add_test_executable target)
+-    add_executable(${target} ${ARGN})
++    # The runtime library test sources are not published; keep their targets (other CMake code links
++    # and configures them) but build them from a stub, outside the default build, when sources are missing.
++    set(sources "")
++    foreach(source ${ARGN})
++        if(EXISTS "${source}" OR EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${source}")
++            list(APPEND sources "${source}")
++        endif()
++    endforeach()
++    if(sources)
++        add_executable(${target} ${sources})
++    else()
++        set(stub "${CMAKE_BINARY_DIR}/missing_test_stub.cpp")
++        if(NOT EXISTS "${stub}")
++            file(WRITE "${stub}" "int main() { return 0; }\n")
++        endif()
++        add_executable(${target} EXCLUDE_FROM_ALL "${stub}")
++    endif()
+     set_target_properties(${target} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "$<1:${RTY_TEST_OUTPUT_DIRECTORY}>" INTERPROCEDURAL_OPTIMIZATION FALSE)
+ endfunction()
+ 
+@@ -16,6 +32,10 @@ endif()
+ option(RTY_ENABLE_SPIRV_TOOLS "Enable SPIRV-Tools validation and optimization" OFF)
+ option(RTY_ENABLE_TIMING_LOG "Enable frame timing logging" OFF)
+ option(RTY_BUILD_GUI "Build the Qt6 GUI when Qt6 is available" ON)
++option(RTY_PS4_MEMORY "Report the base PS4 memory sizes to titles instead of the PS5 ones" OFF)
++if(RTY_PS4_MEMORY)
++    add_compile_definitions(RTY_PS4_MEMORY)
++endif()
+ add_compile_definitions(RTY_ENABLE_TIMING_LOG=$<BOOL:${RTY_ENABLE_TIMING_LOG}>)
+ 
+ set(CMAKE_CXX_STANDARD 20)
+@@ -35,9 +55,12 @@ if(NOT WIN32 AND NOT APPLE)
+     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static -static-libgcc -static-libstdc++")
+ endif()
+ 
++option(RTY_ENABLE_LTO "Enable link-time optimization when supported" ON)
+ include(CheckIPOSupported)
+ check_ipo_supported(RESULT rtyIpoSupported OUTPUT rtyIpoOutput)
+-if(rtyIpoSupported)
++if(NOT RTY_ENABLE_LTO)
++    message(STATUS "Link-time optimization disabled (RTY_ENABLE_LTO=OFF)")
++elseif(rtyIpoSupported)
+     set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
+     message(STATUS "Link-time optimization enabled")
+ else()
+diff --git a/core/libs/CMakeLists.txt b/core/libs/CMakeLists.txt
+index 679eab5..a4696e8 100644
+--- a/core/libs/CMakeLists.txt
++++ b/core/libs/CMakeLists.txt
+@@ -19,7 +19,12 @@ target_compile_features(nid_patcher PRIVATE cxx_std_20)
+ 
+ if(MINGW)
+     target_link_options(nid_patcher PRIVATE -static -static-libgcc -static-libstdc++)
+-    add_compile_options(-fno-asynchronous-unwind-tables)
++    # MSYS2's SEH-configured GCC turns -fno-asynchronous-unwind-tables into SJLJ exception handling,
++    # whose runtime it does not ship, so host libraries keep the default SEH unwind tables there.
++    option(RTY_MINGW_NO_ASYNC_UNWIND "Compile runtime libraries with -fno-asynchronous-unwind-tables" OFF)
++    if(RTY_MINGW_NO_ASYNC_UNWIND)
++        add_compile_options(-fno-asynchronous-unwind-tables)
++    endif()
+ endif()
+ 
+ function(configure_windows_unwind target)
+diff --git a/core/libs/prx/libSceAgcDriver/PostCompile.cmake b/core/libs/prx/libSceAgcDriver/PostCompile.cmake
+index 3cabf5c..6e9b598 100644
+--- a/core/libs/prx/libSceAgcDriver/PostCompile.cmake
++++ b/core/libs/prx/libSceAgcDriver/PostCompile.cmake
+@@ -28,7 +28,9 @@ foreach(agcTarget IN ITEMS libSceAgcDriver agc_driver_visual_test agc_driver_gra
+     endif()
+ endforeach()
+ 
+-target_sources(agc_driver_bda_device_tests PRIVATE tests/ColorTransferTests.cpp Graphics/src/ColorTargetLayout.cpp Execution/src/GuestMemory.cpp)
++if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/ColorTransferTests.cpp")
++    target_sources(agc_driver_bda_device_tests PRIVATE tests/ColorTransferTests.cpp Graphics/src/ColorTargetLayout.cpp Execution/src/GuestMemory.cpp)
++endif()
+ target_include_directories(agc_driver_bda_device_tests PRIVATE ${agcTextureDetileGeneratedRoot})
+ 
+ if(TARGET agc_driver_visual_test)
+diff --git a/core/libs/prx/libSceAppContent/Export.cpp b/core/libs/prx/libSceAppContent/Export.cpp
+index 3e38e5a..d626976 100644
+--- a/core/libs/prx/libSceAppContent/Export.cpp
++++ b/core/libs/prx/libSceAppContent/Export.cpp
+@@ -4,6 +4,7 @@
+ #include "prx/libc/include/General.hpp"
+ #include "prx/libkernel/AppMetadata/include/AppMetadata.hpp"
+ #include <algorithm>
++#include <cstdio>
+ #include <cstring>
+ #include <filesystem>
+ #include <stdexcept>
+@@ -42,6 +43,16 @@ int APS5_VABI sceAppContentAddcontUnmount(const AppContentMountPoint* mount_poin
+  return 0;
+ }
+ 
++// No add-on content is installed, so the list is always empty.
++int APS5_VABI sceAppContentGetAddcontInfoList(uint32_t service_label, void* list, uint32_t list_num, uint32_t* hit_num) {
++    (void)service_label;
++    (void)list;
++    (void)list_num;
++    if (!hit_num) return SCE_APP_CONTENT_ERROR_PARAMETER;
++    *hit_num = 0;
++    return 0;
++}
++
+ int APS5_VABI sceAppContentAppParamGetInt(uint32_t param_id, int32_t* value) {
+     if (!value) return SCE_APP_CONTENT_ERROR_PARAMETER;
+     switch (param_id) {
+@@ -57,6 +68,11 @@ int APS5_VABI sceAppContentAppParamGetInt(uint32_t param_id, int32_t* value) {
+ }
+ 
+ int APS5_VABI sceAppContentDownloadDataGetAvailableSpaceKb(const AppContentMountPoint* mount_point, size_t* available_space_kb) {
++    static bool traced = false;
++    if (!traced) {
++        traced = true;
++        std::fprintf(stderr, "[APPCONTENT] download data space: mount point %s\n", mount_point ? mount_point->data : "(null)");
++    }
+     if (!available_space_kb) return SCE_APP_CONTENT_ERROR_PARAMETER;
+     if (!mount_point || std::strncmp(mount_point->data, DOWNLOAD_MOUNT_POINT, sizeof(mount_point->data)) != 0) APS5_INVALID_ARG_EX;
+     const std::uint64_t quotaKb = GetAppDownloadDataSizeMiB_nid_postfix() * 1024u;
+@@ -69,6 +85,7 @@ int APS5_VABI sceAppContentDownloadDataGetAvailableSpaceKb(const AppContentMount
+     }
+     const std::uint64_t hostKb = std::filesystem::space(directory).available / 1024u;
+     *available_space_kb = static_cast<size_t>(std::min(quotaKb - std::min(quotaKb, usedKb), hostKb));
++    std::fprintf(stderr, "[APPCONTENT] download data space: %zu KiB free of %llu KiB\n", *available_space_kb, static_cast<unsigned long long>(quotaKb));
+     return 0;
+ }
+ 
+@@ -76,6 +93,11 @@ int APS5_VABI sceAppContentInitialize(const AppContentInitParam* init_param, App
+     (void)init_param;
+     if (!boot_param) return SCE_APP_CONTENT_ERROR_PARAMETER;
+     std::memset(boot_param, 0, sizeof(*boot_param));
++    // On a PS4, /download0 is mounted before the title starts whenever it declares download data,
++    // and titles open files there without asking about it first.
++    if (GetAppDownloadDataSizeMiB_nid_postfix() != 0) {
++        std::filesystem::create_directories(ResolvePath_nid_no_patch(DOWNLOAD_MOUNT_POINT));
++    }
+     return 0;
+ }
+ 
+@@ -87,6 +109,7 @@ int APS5_VABI sceAppContentTemporaryDataFormat(const AppContentMountPoint* mount
+ int APS5_VABI sceAppContentTemporaryDataGetAvailableSpaceKb(const AppContentMountPoint* mount_point, size_t* available_space_kb) {
+     if (!available_space_kb) return SCE_APP_CONTENT_ERROR_PARAMETER;
+     *available_space_kb = static_cast<size_t>(std::filesystem::space(TemporaryDirectory(mount_point)).available / 1024);
++    std::fprintf(stderr, "[APPCONTENT] temporary data space: %zu KiB free\n", *available_space_kb);
+     return 0;
+ }
+ 
+diff --git a/core/libs/prx/libSceAudioOut/src/AudioOut.cpp b/core/libs/prx/libSceAudioOut/src/AudioOut.cpp
+index 04a0fc8..b902ce5 100644
+--- a/core/libs/prx/libSceAudioOut/src/AudioOut.cpp
++++ b/core/libs/prx/libSceAudioOut/src/AudioOut.cpp
+@@ -89,6 +89,8 @@ struct Port {
+     std::uint64_t lastOutputTime = 0;
+     SDL_AudioDeviceID device = 0;
+     SDL_AudioSpec spec = {};
++    float tracePeak = 0.0f;   // APS5_TRACE_AUDIOOUT: loudest sample since the last report
++    std::uint32_t traceBlocks = 0;
+ };
+ 
+ static std::mutex g_mutex;
+@@ -186,6 +188,27 @@ static const void* prepareBuffer(const Port& port, const void* data, std::vector
+     return buf.data();
+ }
+ 
++// APS5_TRACE_AUDIOOUT: how loud each port is, to tell silence from sound without listening.
++static void traceLevel(Port& port, const void* data) {
++    static const bool trace = std::getenv("APS5_TRACE_AUDIOOUT") != nullptr;
++    if (!trace || data == nullptr) {
++        return;
++    }
++    const std::size_t samples = static_cast<std::size_t>(port.samplesNum) * port.channels;
++    const bool isFloat = port.format == Format::F32Mono || port.format == Format::F32Stereo ||
++                         port.format == Format::F32_8Ch || port.format == Format::F32_8ChStd;
++    for (std::size_t i = 0; i < samples; ++i) {
++        const float value = isFloat ? static_cast<const float*>(data)[i]
++                                    : static_cast<const std::int16_t*>(data)[i] / 32768.0f;
++        port.tracePeak = std::max(port.tracePeak, value < 0 ? -value : value);
++    }
++    if (++port.traceBlocks % 200 == 0) {
++        std::fprintf(stderr, "[audioout] port %d (type %d): peak %.4f over the last 200 blocks\n",
++                     static_cast<int>(&port - g_ports) + 1, port.type, port.tracePeak);
++        port.tracePeak = 0.0f;
++    }
++}
++
+ static void queueAudio(Port& port, const void* data) {
+     // Without an SDL device there is nothing to queue: the callers already sleep for the block's
+     // duration so the game's timing holds. A null pointer is the documented way to wait until the
+@@ -368,6 +391,7 @@ int APS5_VABI sceAudioOutOutput(int handle, const void* ptr) {
+         nanosleep(&req, nullptr);
+     }
+ 
++    traceLevel(*port, ptr);
+     queueAudio(*port, ptr);
+     port->lastOutputTime = sceKernelGetProcessTime();
+     return static_cast<int>(port->samplesNum);
+@@ -416,7 +440,10 @@ int APS5_VABI sceAudioOutOutputs(AudioOutOutputParam* param, std::uint32_t num)
+     }
+ 
+     for (std::uint32_t i = 0; i < num; i++) {
+-        if (auto* port = getPort(param[i].handle)) queueAudio(*port, param[i].ptr);
++        if (auto* port = getPort(param[i].handle)) {
++            traceLevel(*port, param[i].ptr);
++            queueAudio(*port, param[i].ptr);
++        }
+     }
+ 
+     const std::uint64_t done = sceKernelGetProcessTime();
+diff --git a/core/libs/prx/libSceJson2/Export.cpp b/core/libs/prx/libSceJson2/Export.cpp
+index d120897..98a8405 100644
+--- a/core/libs/prx/libSceJson2/Export.cpp
++++ b/core/libs/prx/libSceJson2/Export.cpp
+@@ -473,6 +473,20 @@ int APS5_VABI _ZN3sce4Json11Initializer10initializeEPKNS0_13InitParameterE(void*
+     return 0;
+ }
+ 
++// The RTTI-enabled initialization parameter (allocator, its user data, file buffer size). This
++// library allocates with the host heap, so the fields are only recorded.
++struct InitParameterRtti {
++    void* allocator;
++    void* user_data;
++    std::size_t file_buffer_size;
++};
++
++void APS5_VABI _ZN3sce4Json17InitParameterRttiC1EPNS0_14AllocParamRttiEPvm(InitParameterRtti* self, void* allocator, void* user_data, std::size_t file_buffer_size) {
++    self->allocator = allocator;
++    self->user_data = user_data;
++    self->file_buffer_size = file_buffer_size;
++}
++
+ int APS5_VABI _ZN3sce4Json11Initializer9terminateEv(void* self) {
+     (void)self;
+     auto& state = State();
+@@ -675,6 +689,9 @@ const Value* APS5_VABI _ZNK3sce4Json5ValueixEPKc(const Value* self, const char*
+             if (*pair.key.text == key) return &pair.value;
+     return &NullAccess(TypeNull, self);
+ }
++const Value* APS5_VABI _ZNK3sce4Json5Value8getValueERKNS0_6StringE(const Value* self, const String* key) {
++    return _ZNK3sce4Json5ValueixEPKc(self, key != nullptr ? key->text->c_str() : nullptr);
++}
+ const Value* APS5_VABI _ZNK3sce4Json5ValueixEm(const Value* self, std::size_t index) {
+     const Node& n = NodeOf(*self);
+     if (n.type == TypeArray && index < n.array.items->size()) {
+diff --git a/core/libs/prx/libSceNetCtl/Export.cpp b/core/libs/prx/libSceNetCtl/Export.cpp
+index 4bae507..db0a381 100644
+--- a/core/libs/prx/libSceNetCtl/Export.cpp
++++ b/core/libs/prx/libSceNetCtl/Export.cpp
+@@ -12,6 +12,7 @@
+ #include <cstddef>
+ #include "SceTypes.hpp"
+ #include "prx/libc/include/General.hpp"
++#include <cstdlib>
+ #include <mutex>
+ #ifdef _WIN32
+ #include <vector>
+@@ -78,6 +79,14 @@ static bool HostHasAddress(int family) {
+ #endif
+ }
+ 
++// sceNetCtlGetInfo has no host equivalent and always reports NOT_CONNECTED, so a connected state
++// contradicts it; titles then take online paths that fail halfway (GT Sport's boot script reads a
++// nil network value). The console reports itself offline unless RYTY_NETWORK_CONNECTED is set.
++static bool ReportConnected(int family) {
++    static const bool enabled = std::getenv("RYTY_NETWORK_CONNECTED") != nullptr;
++    return enabled && HostHasAddress(family);
++}
++
+ extern "C" {
+ 
+ int APS5_VABI sceNetCtlCheckCallback(void) {
+@@ -104,13 +113,13 @@ int APS5_VABI sceNetCtlGetResult(int event_type, int* error_code) {
+ 
+ int APS5_VABI sceNetCtlGetState(int* state) {
+     if (!state) return SCE_NET_CTL_ERROR_INVALID_ADDR;
+-    *state = HostHasAddress(AF_UNSPEC) ? NET_CTL_STATE_IPOBTAINED : NET_CTL_STATE_DISCONNECTED;
++    *state = ReportConnected(AF_UNSPEC) ? NET_CTL_STATE_IPOBTAINED : NET_CTL_STATE_DISCONNECTED;
+     return 0;
+ }
+ 
+ int APS5_VABI sceNetCtlGetStateV6(int* state) {
+     if (!state) return SCE_NET_CTL_ERROR_INVALID_ADDR;
+-    *state = HostHasAddress(AF_INET6) ? NET_CTL_STATE_IPOBTAINED : NET_CTL_STATE_DISCONNECTED;
++    *state = ReportConnected(AF_INET6) ? NET_CTL_STATE_IPOBTAINED : NET_CTL_STATE_DISCONNECTED;
+     return 0;
+ }
+ 
+diff --git a/core/libs/prx/libSceSaveData/Export.cpp b/core/libs/prx/libSceSaveData/Export.cpp
+index 0d44da8..a0928c8 100644
+--- a/core/libs/prx/libSceSaveData/Export.cpp
++++ b/core/libs/prx/libSceSaveData/Export.cpp
+@@ -1,10 +1,19 @@
+ #include <atomic>
++#include <cstdlib>
++#ifdef _WIN32
++#include <windows.h>
++#endif
+ #include <cstdint>
+ #include <cstdio>
+ #include <cstddef>
+ #include "SceTypes.hpp"
+ #include "prx/libSceSaveData/SaveDataCore.hpp"
+ #include "prx/libc/include/General.hpp"
++#include "prx/libkernel/AppMetadata/include/AppMetadata.hpp"
++#include <algorithm>
++#include <cstring>
++#include <iterator>
++#include <mutex>
+ 
+ // Savedata imports bind by NID either to libSceSaveData.native or (via the relinker alias table,
+ // by name) to this library. Every entry point used to return SoftFailNp (0x800242e2), which is the
+@@ -69,6 +78,12 @@ int APS5_VABI sceSaveDataSetSaveDataMemory2(const SaveDataMemorySet2* set_param)
+ }
+ int APS5_VABI sceSaveDataSetupSaveDataMemory2(const SaveDataMemorySetup2* setup_param,
+                                               SaveDataMemorySetupResult* result) {
++    if (setup_param != nullptr) {
++        SAVEDATA_TRACE("setup2 option=0x%x user=%d size=0x%zx icon=0x%zx param=%p slot=%u",
++                 static_cast<unsigned>(setup_param->option), static_cast<int>(setup_param->user_id),
++                 setup_param->memory_size, setup_param->icon_memory_size,
++                 static_cast<const void*>(setup_param->init_param), static_cast<unsigned>(setup_param->slot_id));
++    }
+     const int rc = savedata::setup_memory_internal(setup_param, result, nullptr);
+     SAVEDATA_TRACE("setup2 -> 0x%08x existed=0x%zx", static_cast<unsigned>(rc),
+              result != nullptr ? result->existed_memory_size : static_cast<std::size_t>(0));
+@@ -91,4 +106,108 @@ int APS5_VABI sceSaveDataTransferringMount(const SaveDataTransferringMount* moun
+     SAVEDATA_TRACE("sceSaveDataTransferringMount -> 0x%08x", static_cast<unsigned>(rc));
+     return rc;
+ }
++
++// GT Sport's boot script assumes loading outlasts the boot screen's setup: the boot screen starts
++// listening for "loading done" and only then initializes the flag that handler reads. From fast
++// storage the save data loads first, the handler sees the flag unset and the script fails
++// (ProductBootScreen.ad:99). For those titles the first mount waits until the renderer has drawn
++// the boot screen; the shadGT renderer signals this named event on its first frame with draws.
++static void WaitForBootScreen() {
++    static std::once_flag once;
++    std::call_once(once, [] {
++        static const char* const titles[] = {"CUSA03220", "CUSA02168"};
++        const AppTitleId title = GetAppTitleId_nid_postfix();
++        if (std::none_of(std::begin(titles), std::end(titles), [&](const char* id) { return std::strcmp(title.value, id) == 0; })) return;
++#ifdef _WIN32
++        char name[64];
++        std::snprintf(name, sizeof(name), "Local\\RytyFirstDraw-%lu", GetCurrentProcessId());
++        if (HANDLE event = CreateEventA(nullptr, TRUE, FALSE, name)) {
++            const DWORD result = WaitForSingleObject(event, 20000);
++            SAVEDATA_TRACE("waited for the boot screen before the first mount: %s", result == WAIT_OBJECT_0 ? "drawn" : "timed out");
++            CloseHandle(event);
++        }
++#endif
++    });
++}
++
++// The PS4 mount API. Mount3 (PS5) adds system blocks and a transaction resource to this layout.
++struct SaveDataMount2 {
++    std::int32_t user_id;
++    std::int32_t pad;
++    const SceSaveDataDirName* dir_name;
++    std::uint64_t blocks;
++    std::uint32_t mount_mode;
++    std::uint8_t reserved[32];
++    std::int32_t pad2;
++};
++static_assert(sizeof(SaveDataMount2) == 64, "SceSaveDataMount2 is 64 bytes");
++
++int APS5_VABI sceSaveDataMount2(const SaveDataMount2* mount, SaveDataMountResult* mount_result) {
++    if (mount == nullptr) {
++        return savedata::SD_ERROR_PARAMETER;
++    }
++    WaitForBootScreen();
++    const int rc = savedata::mount_internal(mount->dir_name, mount->mount_mode, mount->blocks,
++                                            mount->user_id, mount_result, "sceSaveDataMount2");
++    SAVEDATA_TRACE("sceSaveDataMount2 dir=%s mode=0x%x blocks=%llu -> 0x%08x point=%s",
++                   mount->dir_name != nullptr ? mount->dir_name->data : "(null)", mount->mount_mode,
++                   static_cast<unsigned long long>(mount->blocks), static_cast<unsigned>(rc),
++                   rc == 0 && mount_result != nullptr ? mount_result->mount_point.data : "");
++    return rc;
++}
++int APS5_VABI sceSaveDataUmount(const SaveDataMountPoint* mount_point) {
++    const int rc = savedata::umount_internal(0, mount_point, "sceSaveDataUmount");
++    SAVEDATA_TRACE("sceSaveDataUmount -> 0x%08x", static_cast<unsigned>(rc));
++    return rc;
++}
++// No backups are kept, so unmounting with a backup is a plain unmount.
++int APS5_VABI sceSaveDataUmountWithBackup(const SaveDataMountPoint* mount_point) {
++    const int rc = savedata::umount_internal(0, mount_point, "sceSaveDataUmountWithBackup");
++    SAVEDATA_TRACE("sceSaveDataUmountWithBackup -> 0x%08x", static_cast<unsigned>(rc));
++    return rc;
++}
++int APS5_VABI sceSaveDataCheckBackupData(const void* check) {
++    (void)check;
++    SAVEDATA_TRACE("sceSaveDataCheckBackupData -> not found");
++    return savedata::SD_ERROR_NOT_FOUND;
++}
++int APS5_VABI sceSaveDataRestoreBackupData(const void* restore) {
++    (void)restore;
++    SAVEDATA_TRACE("sceSaveDataRestoreBackupData -> not found");
++    return savedata::SD_ERROR_NOT_FOUND;
++}
++int APS5_VABI sceSaveDataDirNameSearch(const SaveDataDirNameSearchCond* cond,
++                                       SaveDataDirNameSearchResult* result) {
++    const int rc = savedata::dir_name_search_internal(cond, result);
++    SAVEDATA_TRACE("sceSaveDataDirNameSearch pattern=%s hits=%u -> 0x%08x",
++                   cond != nullptr && cond->dir_name != nullptr ? cond->dir_name->data : "(all)",
++                   result != nullptr ? result->hit_num : 0u, static_cast<unsigned>(rc));
++    return rc;
++}
++int APS5_VABI sceSaveDataGetParam(const SaveDataMountPoint* mount_point, std::uint32_t param_type,
++                                  void* param_buf, std::size_t param_buf_size, std::size_t* got_size) {
++    const int rc = savedata::get_param_internal(mount_point, param_type, param_buf, param_buf_size, got_size);
++    SAVEDATA_TRACE("sceSaveDataGetParam type=%u -> 0x%08x", param_type, static_cast<unsigned>(rc));
++    return rc;
++}
++int APS5_VABI sceSaveDataSetParam(const SaveDataMountPoint* mount_point, std::uint32_t param_type,
++                                  const void* param_buf, std::size_t param_buf_size) {
++    const int rc = savedata::set_param_internal(mount_point, param_type, param_buf, param_buf_size);
++    SAVEDATA_TRACE("sceSaveDataSetParam type=%u -> 0x%08x", param_type, static_cast<unsigned>(rc));
++    return rc;
++}
++int APS5_VABI sceSaveDataSaveIcon(const SaveDataMountPoint* mount_point, const SaveDataIcon* icon) {
++    const int rc = savedata::save_icon_internal(mount_point, icon);
++    SAVEDATA_TRACE("sceSaveDataSaveIcon -> 0x%08x", static_cast<unsigned>(rc));
++    return rc;
++}
++int APS5_VABI sceSaveDataDelete(const SaveDataDelete* del) {
++    if (del == nullptr) {
++        return savedata::SD_ERROR_PARAMETER;
++    }
++    const int rc = savedata::delete_internal(del->user_id, del->dir_name, del->title_id);
++    SAVEDATA_TRACE("sceSaveDataDelete dir=%s -> 0x%08x",
++                   del->dir_name != nullptr ? del->dir_name->data : "(null)", static_cast<unsigned>(rc));
++    return rc;
++}
+ }
+diff --git a/core/libs/prx/libSceSaveData/SaveDataCore.hpp b/core/libs/prx/libSceSaveData/SaveDataCore.hpp
+index e72aa4c..6f1bb19 100644
+--- a/core/libs/prx/libSceSaveData/SaveDataCore.hpp
++++ b/core/libs/prx/libSceSaveData/SaveDataCore.hpp
+@@ -84,6 +84,8 @@ constexpr std::uint32_t SD_MEMORY_MAX_MOUNTED = 4;
+ constexpr std::size_t SD_MEMORY_MAX_SIZE = 32u * 1024u * 1024u;
+ constexpr std::uint32_t SD_MEMORY_SET_PARAM = 1u;
+ constexpr std::uint32_t SD_MEMORY_DOUBLE_BUFFER = 2u;
++// PS4 titles also pass UNLOCK_LIMITATIONS (GT Sport sets it with a 32 MiB slot); it needs no handling here.
++constexpr std::uint32_t SD_MEMORY_UNLOCK_LIMITATIONS = 4u;
+ constexpr std::uint32_t SD_MEMORY_MAX_DATA_NUM = 5;
+ 
+ constexpr std::uint32_t SD_PARAM_WHOLE = 0;
+@@ -649,8 +651,11 @@ bool dir_name_matches(const char* str, const char* pattern) {
+ int dir_name_search_internal(const SaveDataDirNameSearchCond* cond,
+                              SaveDataDirNameSearchResult* result) {
+     State& st = state();
++    // dir_names, dir_names_num, params and infos are the caller's buffers; only the counts are
++    // outputs.
+     if (result != nullptr) {
+-        std::memset(result, 0, sizeof(*result));
++        result->hit_num = 0;
++        result->set_num = 0;
+     }
+     if (!is_ready()) {
+         return SD_ERROR_NOT_INITIALIZED;
+@@ -706,10 +711,26 @@ int dir_name_search_internal(const SaveDataDirNameSearchCond* cond,
+             load_save_param(save_directory(save_alias_locked(st, found[i])), &result->params[i]);
+         }
+         if (result->infos != nullptr) {
+-            std::memset(&result->infos[i], 0, sizeof(result->infos[i]));
+-            std::uint64_t blocks = 0;
+-            if (read_u64(save_blocks_path(save_directory(save_alias_locked(st, found[i]))), &blocks) == SD_OK) {
+-                std::memcpy(&result->infos[i], &blocks, sizeof(blocks));
++            // SceSaveDataSearchInfo on the PS4: blocks, free blocks, 32 reserved bytes.
++            struct SearchInfo {
++                std::uint64_t blocks;
++                std::uint64_t free_blocks;
++                std::uint8_t reserved[32];
++            };
++            auto* info = reinterpret_cast<SearchInfo*>(result->infos) + i;
++            std::memset(info, 0, sizeof(*info));
++            const auto directory = save_directory(save_alias_locked(st, found[i]));
++            if (read_u64(save_blocks_path(directory), &info->blocks) == SD_OK) {
++                constexpr std::uint64_t block_size = 32768;
++                std::uint64_t used = 0;
++                std::error_code walk_error;
++                for (const auto& entry : std::filesystem::recursive_directory_iterator(directory, walk_error)) {
++                    std::error_code size_error;
++                    if (entry.is_regular_file(size_error) && !size_error) {
++                        used += (entry.file_size(size_error) + block_size - 1) / block_size;
++                    }
++                }
++                info->free_blocks = info->blocks > used ? info->blocks - used : 0;
+             }
+         }
+     }
+@@ -904,7 +925,7 @@ int setup_memory_internal(const SaveDataMemorySetup2* setup, SaveDataMemorySetup
+                           KernelEventFlag flag) {
+     State& st = state();
+     if (setup == nullptr || setup->slot_id >= SD_MEMORY_SLOTS || setup->memory_size == 0 ||
+-        setup->memory_size > SD_MEMORY_MAX_SIZE || (setup->option & ~(SD_MEMORY_SET_PARAM | SD_MEMORY_DOUBLE_BUFFER)) != 0 ||
++        setup->memory_size > SD_MEMORY_MAX_SIZE || (setup->option & ~(SD_MEMORY_SET_PARAM | SD_MEMORY_DOUBLE_BUFFER | SD_MEMORY_UNLOCK_LIMITATIONS)) != 0 ||
+         (setup->init_param != nullptr && setup->option != 0 && (setup->option & SD_MEMORY_SET_PARAM) == 0)) {
+         return SD_ERROR_PARAMETER;
+     }
+@@ -1331,6 +1352,25 @@ int delete_local_storage_app_status_internal(const SceSaveDataDirName* dir_name,
+     return error ? SD_ERROR_INTERNAL : SD_OK;
+ }
+ 
++int save_icon_internal(const SaveDataMountPoint* mount_point, const SaveDataIcon* icon) {
++    State& st = state();
++    if (!is_ready()) {
++        return SD_ERROR_NOT_INITIALIZED;
++    }
++    if (mount_point == nullptr || icon == nullptr || icon->buf == nullptr ||
++        !bounded_string_ok(mount_point->data, sizeof(mount_point->data))) {
++        return SD_ERROR_PARAMETER;
++    }
++    std::lock_guard<std::mutex> lock(st.mutex);
++    const int index = slot_of_mount_point_locked(st, mount_point->data);
++    if (index == -1) {
++        return SD_ERROR_NOT_MOUNTED;
++    }
++    const std::size_t size = icon->data_size != 0 ? icon->data_size : icon->buf_size;
++    const auto path = save_metadata_directory(st.slots[static_cast<std::size_t>(index)].directory) / "icon0.png";
++    return write_blob(path, icon->buf, size) ? SD_OK : SD_ERROR_INTERNAL;
++}
++
+ int check_internal() {
+     if (!is_ready()) {
+         return SD_ERROR_NOT_INITIALIZED;
+diff --git a/core/libs/prx/libc/include/GuestAllocations.hpp b/core/libs/prx/libc/include/GuestAllocations.hpp
+index a292f5d..81c711b 100644
+--- a/core/libs/prx/libc/include/GuestAllocations.hpp
++++ b/core/libs/prx/libc/include/GuestAllocations.hpp
+@@ -30,6 +30,7 @@ void GuestAllocationsAdd_nid_postfix(void* mutation, void* pointer, std::size_t
+ void GuestAllocationsRequireUnpinned_nid_postfix(void* mutation, const void* pointer, std::size_t bytes);
+ void GuestAllocationsRequireAvailable_nid_postfix(void* mutation, const void* pointer, std::size_t bytes);
+ bool GuestAllocationsCovers_nid_postfix(void* mutation, const void* pointer, std::size_t bytes);
++bool GuestAllocationsOverlaps_nid_postfix(void* mutation, const void* pointer, std::size_t bytes);
+ Range GuestAllocationsFind_nid_postfix(void* mutation, const void* pointer);
+ void GuestAllocationsRemove_nid_postfix(void* mutation, const void* pointer);
+ void GuestAllocationsProtect_nid_postfix(void* mutation, const void* pointer, std::size_t bytes, bool readable, bool writable, const std::function<void()>& apply);
+@@ -60,6 +61,7 @@ public:
+     void RequireUnpinned(const void* pointer, std::size_t bytes) const { GuestAllocationsRequireUnpinned_nid_postfix(handle, pointer, bytes); }
+     void RequireAvailable(const void* pointer, std::size_t bytes) const { GuestAllocationsRequireAvailable_nid_postfix(handle, pointer, bytes); }
+     bool Covers(const void* pointer, std::size_t bytes) const { return GuestAllocationsCovers_nid_postfix(handle, pointer, bytes); }
++    bool Overlaps(const void* pointer, std::size_t bytes) const { return GuestAllocationsOverlaps_nid_postfix(handle, pointer, bytes); }
+     Range Find(const void* pointer) const { return GuestAllocationsFind_nid_postfix(handle, pointer); }
+     void Remove(const void* pointer) { GuestAllocationsRemove_nid_postfix(handle, pointer); }
+     void Unmap(const void* pointer, std::size_t bytes, const std::function<void(const void*, std::size_t, const void*, bool)>& apply) { GuestAllocationsUnmap_nid_postfix(handle, pointer, bytes, apply); }
+diff --git a/core/libs/prx/libc/src/General.cpp b/core/libs/prx/libc/src/General.cpp
+index 7d9d8d1..b49f669 100644
+--- a/core/libs/prx/libc/src/General.cpp
++++ b/core/libs/prx/libc/src/General.cpp
+@@ -6,7 +6,10 @@
+ #include <filesystem>
+ #include <optional>
+ #include <cerrno>
++#include <cstdio>
++#include <cstdlib>
+ #include <cstring>
++#include <set>
+ #include "prx/libc/include/General.hpp"
+ #include "prx/libc/include/GuestHeap.hpp"
+ 
+@@ -153,5 +156,15 @@ extern "C" char* APS5_VABI getcwd_nid_postfix(char* buffer, std::size_t size) {
+ }
+ 
+ extern "C" void NotImplemented_nid_no_patch(const char* funcName) {
+-    throw std::runtime_error(std::string(funcName) + " not implemented");
++    // RTY_LENIENT_UNIMPLEMENTED=1 logs each missing function once and lets the caller return its
++    // default (usually 0), so titles that only probe optional services can keep running.
++    static const bool lenient = [] {
++        const char* value = std::getenv("RTY_LENIENT_UNIMPLEMENTED");
++        return value != nullptr && *value != '\0' && std::strcmp(value, "0") != 0;
++    }();
++    if (!lenient) throw std::runtime_error(std::string(funcName) + " not implemented");
++    static std::mutex lock;
++    static std::set<std::string> reported;
++    std::lock_guard guard(lock);
++    if (reported.insert(funcName).second) std::fprintf(stderr, "[unimplemented] %s\n", funcName);
+ }
+diff --git a/core/libs/prx/libc/src/GuestAllocations.cpp b/core/libs/prx/libc/src/GuestAllocations.cpp
+index 64c246c..755e57f 100644
+--- a/core/libs/prx/libc/src/GuestAllocations.cpp
++++ b/core/libs/prx/libc/src/GuestAllocations.cpp
+@@ -244,6 +244,15 @@ void GuestAllocationsRequireUnpinned_nid_postfix(void* mutation, const void* poi
+     }
+ }
+ 
++bool GuestAllocationsOverlaps_nid_postfix(void*, const void* pointer, std::size_t bytes) {
++    const auto address = reinterpret_cast<std::uintptr_t>(pointer);
++    for (const auto& [base, range] : registry().ranges) {
++        if (base >= address + bytes) break;
++        if (base + range->bytes > address) return true;
++    }
++    return false;
++}
++
+ void GuestAllocationsRequireAvailable_nid_postfix(void*, const void* pointer, std::size_t bytes) {
+     const auto address = reinterpret_cast<std::uintptr_t>(pointer);
+     require(address != 0 && bytes != 0 && bytes <= std::numeric_limits<std::uint64_t>::max() - address, "invalid fixed guest mapping");
+diff --git a/core/libs/prx/libc/src/GuestArena.cpp b/core/libs/prx/libc/src/GuestArena.cpp
+index dc87e28..b311007 100644
+--- a/core/libs/prx/libc/src/GuestArena.cpp
++++ b/core/libs/prx/libc/src/GuestArena.cpp
+@@ -19,9 +19,11 @@ namespace {
+ constexpr std::uintptr_t PreferredBase = 0x0000000200000000ull;
+ constexpr std::uintptr_t SystemReservedStart = 0x00000007FFFFC000ull;
+ constexpr std::uintptr_t SystemReservedEnd = 0x0000001000000000ull;
+-constexpr std::size_t MaximumSize = 0x0000007000000000ull;
+-constexpr std::size_t MinimumSize = 0x0000001000000000ull;
+ constexpr std::uintptr_t MapAreaEnd = 0x000000FC00000000ull;
++// PS4 titles place fixed mappings anywhere below MapAreaEnd (GT Sport maps at 0xf3ffe00000), so try to
++// cover the whole guest map area first; the loop below falls back to smaller reservations.
++constexpr std::size_t MaximumSize = MapAreaEnd - PreferredBase;
++constexpr std::size_t MinimumSize = 0x0000001000000000ull;
+ 
+ std::uintptr_t alignUp(std::uintptr_t value, std::size_t alignment) {
+     return (value + alignment - 1) & ~(static_cast<std::uintptr_t>(alignment) - 1);
+@@ -174,12 +176,24 @@ void GuestArenaReset_nid_postfix(void* pointer, std::size_t bytes) {
+ }
+ 
+ void GuestArenaMap_nid_postfix(void* pointer, std::size_t bytes, void* section, std::uint64_t offset, std::uint32_t protection) {
+-    if (!Arena::Get().Contains(pointer, bytes)) throw std::invalid_argument("shared mapping outside the guest arena");
++    if (!Arena::Get().Contains(pointer, bytes)) {
++        char message[160];
++        std::snprintf(message, sizeof(message), "shared mapping outside the guest arena: 0x%llx+0x%llx (arena 0x%llx+0x%llx)",
++            static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(pointer)), static_cast<unsigned long long>(bytes),
++            static_cast<unsigned long long>(Arena::Get().Base()), static_cast<unsigned long long>(Arena::Get().Size()));
++        throw std::invalid_argument(message);
++    }
+     WindowsMappings::Get().Map(pointer, bytes, section, offset, protection);
+ }
+ 
++// Called from other runtimes (the MSVC-built renderer), so no C++ exception may leave it: a
++// range that cannot be aliased returns null.
+ void* GuestArenaMapAlias_nid_postfix(std::uintptr_t address, std::size_t bytes) {
+-    return WindowsMappings::Get().MapAlias(address, bytes);
++    try {
++        return WindowsMappings::Get().MapAlias(address, bytes);
++    } catch (const std::exception&) {
++        return nullptr;
++    }
+ }
+ 
+ void GuestArenaUnmapAlias_nid_postfix(void* alias) {
+diff --git a/core/libs/prx/libc/src/Strings.cpp b/core/libs/prx/libc/src/Strings.cpp
+index a7b7a14..6213748 100644
+--- a/core/libs/prx/libc/src/Strings.cpp
++++ b/core/libs/prx/libc/src/Strings.cpp
+@@ -3,6 +3,7 @@
+ #include <cstring>
+ #include <cstdlib>
+ #include <cctype>
++#include <cmath>
+ #include <cwchar>
+ #include <cstdio>
+ #include <limits>
+@@ -102,6 +103,12 @@ double APS5_VABI strtod_nid_postfix(const char* str, char** endptr) {
+     return std::strtod(str, endptr);
+ }
+ 
++// Dinkumware's _Stod (libSceLibcInternal): strtod scaled by 10^pw; the firmware's libSceNgs2 imports it.
++double APS5_VABI _Stod_nid_postfix(const char* str, char** endptr, long pw) {
++    const double value = std::strtod(str, endptr);
++    return pw == 0 ? value : value * std::pow(10.0, static_cast<double>(pw));
++}
++
+ double APS5_VABI atof_nid_postfix(const char* str) { return std::atof(str); }
+ float APS5_VABI strtof_nid_postfix(const char* str, char** endptr) { return std::strtof(str, endptr); }
+ long double APS5_VABI strtold_nid_postfix(const char* str, char** endptr) {
+diff --git a/core/libs/prx/libc/src/exception/Exports.cpp b/core/libs/prx/libc/src/exception/Exports.cpp
+index 462c2c4..2eab64a 100644
+--- a/core/libs/prx/libc/src/exception/Exports.cpp
++++ b/core/libs/prx/libc/src/exception/Exports.cpp
+@@ -40,7 +40,9 @@ GCC_GLOBAL_ALIAS(_Unwind_RaiseException, _Unwind_RaiseException_nid_postfix);
+ GCC_GLOBAL_ALIAS(_Unwind_Resume_or_Rethrow, _Unwind_Resume_or_Rethrow_nid_postfix);
+ GCC_GLOBAL_ALIAS(_Unwind_DeleteException, _Unwind_DeleteException_nid_postfix);
+ 
+-#ifdef _WIN32
++// Host libraries normally use this runtime too, which unwinds through DWARF .eh_frame data. A
++// toolchain that emits SEH unwind data instead (MSYS2 GCC) keeps libstdc++'s runtime for host code.
++#if defined(_WIN32) && !defined(__SEH__)
+ extern "C" {
+ void* NativeAllocateException(std::size_t size) asm("__cxa_allocate_exception");
+ void* NativeAllocateException(std::size_t size) {
+diff --git a/core/libs/prx/libc/src/specifics/windows/CrashReport.cpp b/core/libs/prx/libc/src/specifics/windows/CrashReport.cpp
+index a4f388e..02899ef 100644
+--- a/core/libs/prx/libc/src/specifics/windows/CrashReport.cpp
++++ b/core/libs/prx/libc/src/specifics/windows/CrashReport.cpp
+@@ -1,7 +1,11 @@
+ #ifdef _WIN32
+ #include <windows.h>
+ #include "prx/libc/include/GuestArena.hpp"
++#include <algorithm>
+ #include <atomic>
++#include <exception>
++#include <typeinfo>
++#include <cstring>
+ #include <chrono>
+ #include <csignal>
+ #include <cstdint>
+@@ -138,6 +142,193 @@ bool HandleWatch(EXCEPTION_POINTERS* info) {
+     return true;
+ }
+ 
++// Debug aid: APS5_BREAK_DUMP=<guest ELF vaddr> reports the registers, and the memory they and the
++// first words of rbx's object point at, each time that instruction runs (first APS5_BREAK_LIMIT
++// times, default 4). With APS5_BREAK_MATCH set, only hits whose text at [rbx+0x28] contains it are
++// reported; APS5_BREAK_FILE=<bytes> also writes that much memory from rsi to break_<n>.bin.
++std::uintptr_t g_breakAddress = 0;
++std::uint8_t g_breakOriginal = 0;
++std::atomic<int> g_breakCount{0};
++int g_breakLimit = 4;
++thread_local bool t_breakStepping = false;
++std::mutex g_captureMutex;
++std::uint64_t g_returnAddress = 0;
++std::uint8_t g_returnOriginal = 0;
++DWORD g_returnThread = 0;
++thread_local std::uint64_t t_captureDestination = 0;
++thread_local std::uint64_t t_captureSize = 0;
++
++void WriteCodeByte(std::uintptr_t address, std::uint8_t value) {
++    DWORD old;
++    VirtualProtect(reinterpret_cast<void*>(address), 1, PAGE_EXECUTE_READWRITE, &old);
++    *reinterpret_cast<volatile std::uint8_t*>(address) = value;
++    VirtualProtect(reinterpret_cast<void*>(address), 1, old, &old);
++    FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(address), 1);
++}
++
++void ReportWords(const char* name, std::uint64_t value, int count) {
++    if (value < 0x10000 || !IsReadable(value) || !IsReadable(value + count * 8 - 1)) return;
++    const auto* words = reinterpret_cast<const std::uint64_t*>(value);
++    for (int i = 0; i < count; i += 4) {
++        Report("[break]   %s+0x%02x: %016llx %016llx %016llx %016llx\n", name, i * 8, words[i], words[i + 1], words[i + 2], words[i + 3]);
++    }
++}
++
++bool HandleBreak(EXCEPTION_POINTERS* info) {
++    if (g_breakAddress == 0) return false;
++    const auto* record = info->ExceptionRecord;
++    auto* context = info->ContextRecord;
++    if (record->ExceptionCode == EXCEPTION_SINGLE_STEP && t_breakStepping) {
++        t_breakStepping = false;
++        if (g_breakCount.load() < g_breakLimit) WriteCodeByte(g_breakAddress, 0xCC);
++        return true;
++    }
++    if (record->ExceptionCode == EXCEPTION_BREAKPOINT && g_returnAddress != 0 && reinterpret_cast<std::uintptr_t>(record->ExceptionAddress) == g_returnAddress) {
++        std::lock_guard lock(g_captureMutex);
++        if (GetCurrentThreadId() == g_returnThread && t_captureSize != 0 && IsReadable(t_captureDestination) && IsReadable(t_captureDestination + t_captureSize - 1)) {
++            if (FILE* out = std::fopen("capture.bin", "ab")) {
++                std::fwrite(reinterpret_cast<const void*>(t_captureDestination), 1, t_captureSize, out);
++                std::fclose(out);
++            }
++        }
++        WriteCodeByte(g_returnAddress, g_returnOriginal);
++        context->Rip = g_returnAddress;
++        g_returnAddress = 0;
++        return true;
++    }
++    if (record->ExceptionCode != EXCEPTION_BREAKPOINT || reinterpret_cast<std::uintptr_t>(record->ExceptionAddress) != g_breakAddress) return false;
++    // APS5_BREAK_CAPTURE=<text>: the breakpoint is a read(stream, destination, size) function whose
++    // stream names its file at [stream+0x28]; for streams whose name contains the text, every read
++    // is appended to capture.bin once the call returns.
++    if (const char* capture = std::getenv("APS5_BREAK_CAPTURE")) {
++        const auto name = context->Rdi >= 0x10000 && IsReadable(context->Rdi + 0x28) ? *reinterpret_cast<const std::uint64_t*>(context->Rdi + 0x28) : 0;
++        const bool named = name >= 0x10000 && IsReadable(name) && IsReadable(name + 0x7f);
++        if (named && std::strstr(reinterpret_cast<const char*>(name), capture) != nullptr && IsReadable(context->Rsp)) {
++            std::lock_guard lock(g_captureMutex);
++            if (g_returnAddress == 0) {
++                t_captureDestination = context->Rsi;
++                t_captureSize = context->Rdx & 0xffffffff;
++                g_returnAddress = *reinterpret_cast<const std::uint64_t*>(context->Rsp);
++                g_returnOriginal = *reinterpret_cast<const std::uint8_t*>(g_returnAddress);
++                g_returnThread = GetCurrentThreadId();
++                WriteCodeByte(g_returnAddress, 0xCC);
++            }
++        }
++        WriteCodeByte(g_breakAddress, g_breakOriginal);
++        context->Rip = g_breakAddress;
++        context->EFlags |= 0x100;
++        t_breakStepping = true;
++        return true;
++    }
++    // APS5_BREAK_LOG: the breakpoint is a printf-style logging function taking the source file in
++    // r8, the line in r9 and the format as its first stack argument; print those.
++    if (std::getenv("APS5_BREAK_LOG") != nullptr) {
++        g_breakCount.fetch_add(1);
++        const auto format = IsReadable(context->Rsp + 8) ? *reinterpret_cast<const std::uint64_t*>(context->Rsp + 8) : 0;
++        const auto source = context->R8;
++        // Expand the integer and string conversions from the stack arguments that follow the format.
++        char text[1024];
++        std::size_t used = 0;
++        if (format >= 0x10000 && IsReadable(format) && IsReadable(format + 0xff)) {
++            const char* f = reinterpret_cast<const char*>(format);
++            std::uint64_t slot = context->Rsp + 16;
++            for (; *f != 0 && used + 1 < sizeof(text); ++f) {
++                if (*f != '%' || f[1] == 0) { text[used++] = *f; continue; }
++                const char* spec = f + 1;
++                while (*spec != 0 && std::strchr("-+ #0123456789.lhzjt", *spec) != nullptr) ++spec;
++                if (*spec == '%') { text[used++] = '%'; f = spec; continue; }
++                const auto value = IsReadable(slot) ? *reinterpret_cast<const std::uint64_t*>(slot) : 0;
++                if (*spec != 'f' && *spec != 'g' && *spec != 'e') slot += 8;
++                int wrote = 0;
++                if (*spec == 's') {
++                    const bool ok = value >= 0x10000 && IsReadable(value) && IsReadable(value + 0x3f);
++                    wrote = std::snprintf(text + used, sizeof(text) - used, "%.120s", ok ? reinterpret_cast<const char*>(value) : "(?)");
++                } else if (*spec == 'f' || *spec == 'g' || *spec == 'e') {
++                    wrote = std::snprintf(text + used, sizeof(text) - used, "<float>");
++                } else {
++                    wrote = std::snprintf(text + used, sizeof(text) - used, "%llx", static_cast<unsigned long long>(value));
++                }
++                if (wrote > 0) used = std::min(sizeof(text) - 1, used + static_cast<std::size_t>(wrote));
++                f = spec;
++            }
++        }
++        text[used] = 0;
++        static const ULONGLONG start = GetTickCount64();
++        Report("[log %llu] %d %.80s:%d %s\n", static_cast<unsigned long long>(GetTickCount64() - start), static_cast<int>(context->Rsi & 0xff),
++               source >= 0x10000 && IsReadable(source) && IsReadable(source + 0x7f) ? reinterpret_cast<const char*>(source) : "?",
++               static_cast<int>(context->R9 & 0xffffffff), text);
++        WriteCodeByte(g_breakAddress, g_breakOriginal);
++        context->Rip = g_breakAddress;
++        context->EFlags |= 0x100;
++        t_breakStepping = true;
++        return true;
++    }
++    const char* match = std::getenv("APS5_BREAK_MATCH");
++    const auto label = context->Rbx >= 0x10000 && IsReadable(context->Rbx + 0x28) ? *reinterpret_cast<const std::uint64_t*>(context->Rbx + 0x28) : 0;
++    const bool labelled = label >= 0x10000 && IsReadable(label) && IsReadable(label + 0xff);
++    if (match != nullptr && !(labelled && std::strstr(reinterpret_cast<const char*>(label), match) != nullptr)) {
++        WriteCodeByte(g_breakAddress, g_breakOriginal);
++        context->Rip = g_breakAddress;
++        context->EFlags |= 0x100;
++        t_breakStepping = true;
++        return true;
++    }
++    const int hit = g_breakCount.fetch_add(1);
++    if (std::getenv("APS5_BREAK_QUIET") != nullptr) {
++        Report("[break] hit %d rbx %llx rsi %llx label %.120s\n", hit, context->Rbx, context->Rsi, labelled ? reinterpret_cast<const char*>(label) : "?");
++        WriteCodeByte(g_breakAddress, g_breakOriginal);
++        context->Rip = g_breakAddress;
++        context->EFlags |= 0x100;
++        t_breakStepping = true;
++        return true;
++    }
++    Report("[break] hit %d on thread %lu: rax %llx rbx %llx rcx %llx rdx %llx rsi %llx rdi %llx r12 %llx r13 %llx r14 %llx r15 %llx rbp %llx rsp %llx\n", hit, GetCurrentThreadId(), context->Rax, context->Rbx, context->Rcx, context->Rdx, context->Rsi, context->Rdi, context->R12, context->R13, context->R14, context->R15, context->Rbp, context->Rsp);
++    const std::pair<const char*, std::uint64_t> registers[] = {{"rax", context->Rax}, {"rbx", context->Rbx}, {"rcx", context->Rcx}, {"rdx", context->Rdx}, {"rsi", context->Rsi}, {"rdi", context->Rdi}, {"r12", context->R12}, {"r14", context->R14}, {"r15", context->R15}};
++    for (const auto& [name, value] : registers) ReportWords(name, value, 16);
++    ReportWords("rbx-object", context->Rbx, 64);
++    if (context->Rbx >= 0x10000 && IsReadable(context->Rbx) && IsReadable(context->Rbx + 0x1ff)) {
++        const auto* words = reinterpret_cast<const std::uint64_t*>(context->Rbx);
++        for (int i = 0; i < 64; ++i) {
++            char name[32];
++            std::snprintf(name, sizeof(name), "[rbx+0x%02x]", i * 8);
++            ReportWords(name, words[i], 8);
++        }
++        // APS5_BREAK_FILE=<bytes>: write that many bytes from rsi (fewer if memory ends) to
++        // break_<n>.bin, but only when the text at [rbx+0x28] contains APS5_BREAK_MATCH.
++        if (const char* file = std::getenv("APS5_BREAK_FILE")) {
++            const auto name = label;
++            const bool named = labelled;
++            {
++                std::uint64_t size = 0;
++                const auto limit = std::strtoull(file, nullptr, 0);
++                while (size < limit && IsReadable(context->Rsi + size)) size += 0x100;
++                char path[64];
++                std::snprintf(path, sizeof(path), "break_%d.bin", hit);
++                if (FILE* out = std::fopen(path, "wb")) {
++                    std::fwrite(reinterpret_cast<const void*>(context->Rsi), 1, size, out);
++                    std::fclose(out);
++                    Report("[break]   wrote %llu bytes to %s (%s)\n", static_cast<unsigned long long>(size), path, named ? reinterpret_cast<const char*>(name) : "?");
++                }
++            }
++        }
++    }
++    WriteCodeByte(g_breakAddress, g_breakOriginal);
++    context->Rip = g_breakAddress;
++    context->EFlags |= 0x100;
++    t_breakStepping = true;
++    return true;
++}
++
++void InstallBreak() {
++    const char* value = std::getenv("APS5_BREAK_DUMP");
++    if (!value) return;
++    if (const char* limit = std::getenv("APS5_BREAK_LIMIT")) g_breakLimit = std::atoi(limit);
++    g_breakAddress = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr)) + 0x10000 + std::strtoull(value, nullptr, 0);
++    g_breakOriginal = *reinterpret_cast<const std::uint8_t*>(g_breakAddress);
++    WriteCodeByte(g_breakAddress, 0xCC);
++    Report("[break] breakpoint at 0x%llx\n", static_cast<unsigned long long>(g_breakAddress));
++}
++
+ void InstallWatch() {
+     // APS5_WATCH_ADDR=<absolute hex address> watches guest data that is mapped later: the page is
+     // protected once it has been committed.
+@@ -234,10 +425,90 @@ bool HandleSse4a(EXCEPTION_POINTERS* info) {
+     return true;
+ }
+ 
++// A renderer that write-protects guest pages it caches on the GPU (the shadGT-based
++// libSceVideoOut.prx) gets each access fault first: it owns those pages, drops its copy and
++// unprotects them. Ryty's own shared-memory write handling would otherwise unprotect them unseen.
++// 1: handled, retry; 2: an expected fault in one of the renderer's guarded reads, which its own
++// structured handler takes; 0: not the renderer's.
++int RendererHandlesFault(EXCEPTION_POINTERS* info) {
++    using FaultFunction = int (*)(void*);
++    static FaultFunction handler = nullptr;
++    if (handler == nullptr) {
++        if (HMODULE renderer = GetModuleHandleA("libSceVideoOut.prx")) {
++            handler = reinterpret_cast<FaultFunction>(reinterpret_cast<void*>(GetProcAddress(renderer, "RytyGpuHandleWriteFault")));
++        }
++    }
++    return handler != nullptr ? handler(info) : 0;
++}
++
++// APS5_TRACE_THROW=1 reports each C++ exception thrown by Ryty's (GCC-built) libraries as it is
++// raised: its type, its message when it is a standard exception, and the code addresses on the
++// stack. An exception that escapes into guest frames cannot be unwound (STATUS_BAD_FUNCTION_TABLE),
++// so this is the only trace of it.
++void TraceThrow(EXCEPTION_POINTERS* info) {
++    constexpr DWORD GccThrow = 0x20474343;
++    static const bool enabled = std::getenv("APS5_TRACE_THROW") != nullptr;
++    const auto* record = info->ExceptionRecord;
++    if (!enabled || record->ExceptionCode != GccThrow || record->NumberParameters < 1) return;
++    // libgcc raises it with the _Unwind_Exception (64 bytes under SEH) that directly precedes the
++    // thrown object; the object's vtable is preceded by its type_info.
++    const auto unwind = static_cast<std::uintptr_t>(record->ExceptionInformation[0]);
++    const auto object = unwind + 64;
++    char type[160] = "?";
++    char what[256] = "";
++    if (IsReadable(object) && IsReadable(object + 7)) {
++        const auto vtable = *reinterpret_cast<const std::uintptr_t*>(object);
++        if (vtable >= 0x10000 && IsReadable(vtable - 8) && IsReadable(vtable + 23)) {
++            const auto* typeInfo = *reinterpret_cast<const std::type_info* const*>(vtable - 8);
++            if (typeInfo != nullptr && IsReadable(reinterpret_cast<std::uintptr_t>(typeInfo) + 15)) {
++                std::snprintf(type, sizeof(type), "%s", typeInfo->name());
++                if (std::strstr(type, "St") == type || std::strstr(type, "error") != nullptr || std::strstr(type, "exception") != nullptr) {
++                    std::snprintf(what, sizeof(what), "%s", reinterpret_cast<const std::exception*>(object)->what());
++                }
++            }
++        }
++    }
++    Report("[throw] thread %lu %s: %s\n", GetCurrentThreadId(), type, what);
++    const auto* context = info->ContextRecord;
++    char line[MAX_PATH + 64];
++    int printed = 0;
++    for (std::uint64_t slot = context->Rsp; printed < 10 && slot < context->Rsp + 0x1000; slot += 8) {
++        if (!IsReadable(slot)) break;
++        const auto value = *reinterpret_cast<const std::uint64_t*>(slot);
++        if (!IsExecutable(value)) continue;
++        DescribeAddress(value, line, sizeof(line));
++        Report("[throw]   %s\n", line);
++        ++printed;
++    }
++}
++
+ LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
+     static std::atomic<bool> reported{false};
+     const auto* fault = info->ExceptionRecord;
+-    if (fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && fault->NumberParameters >= 2 && fault->ExceptionInformation[0] == 1 && GuestArena::GuestArenaHandleWrite_nid_postfix(fault->ExceptionInformation[1])) return EXCEPTION_CONTINUE_EXECUTION;
++    TraceThrow(info);
++    if (fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
++        const int renderer = RendererHandlesFault(info);
++        if (renderer == 1) return EXCEPTION_CONTINUE_EXECUTION;
++        if (renderer == 2) {
++            static std::atomic<unsigned> passed{0};
++            if (passed.fetch_add(1) < 20) {
++                std::fprintf(stderr, "[fault] passed to the renderer's guarded read: %p (rip %p)\n",
++                             reinterpret_cast<void*>(fault->ExceptionInformation[1]), fault->ExceptionAddress);
++            }
++            return EXCEPTION_CONTINUE_SEARCH;
++        }
++    }
++    if (fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && fault->NumberParameters >= 2 && fault->ExceptionInformation[0] == 1 && GuestArena::GuestArenaHandleWrite_nid_postfix(fault->ExceptionInformation[1])) {
++        // This unprotects the whole 16 KB view, including pages the renderer still tracks, so
++        // it should only happen for writes the renderer has nothing to do with.
++        static std::atomic<unsigned> logged{0};
++        if (logged.fetch_add(1) < 50) {
++            std::fprintf(stderr, "[fault] Ryty resumed a write to %p the renderer did not handle (rip %p)\n",
++                         reinterpret_cast<void*>(fault->ExceptionInformation[1]), fault->ExceptionAddress);
++        }
++        return EXCEPTION_CONTINUE_EXECUTION;
++    }
++    if (HandleBreak(info)) return EXCEPTION_CONTINUE_EXECUTION;
+     if (HandleWatch(info)) return EXCEPTION_CONTINUE_EXECUTION;
+     if (HandleSse4a(info)) return EXCEPTION_CONTINUE_EXECUTION;
+     const auto* record = info->ExceptionRecord;
+@@ -281,6 +552,14 @@ LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
+             Report("  [%s] %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx\n", name, words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
+         }
+     }
++    // APS5_CRASH_STRING=<ELF address> prints the text the title keeps there (a last error message,
++    // for instance), addressed like APS5_WATCH_WRITE.
++    if (const char* stringAddress = std::getenv("APS5_CRASH_STRING")) {
++        const auto address = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr)) + 0x10000 + std::strtoull(stringAddress, nullptr, 0);
++        if (IsReadable(address) && IsReadable(address + 0x7ff)) {
++            Report("  [string] %.2047s\n", reinterpret_cast<const char*>(address));
++        }
++    }
+     Report("  frame pointer chain:\n");
+     std::uint64_t frame = context->Rbp;
+     for (int depth = 0; depth < 32 && frame != 0 && (frame & 7) == 0 && IsReadable(frame) && IsReadable(frame + 8); ++depth) {
+@@ -330,6 +609,17 @@ LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
+         }
+     }
+     std::fflush(stderr);
++    // Ending the process here skips DLL_PROCESS_DETACH: an exit through the normal path from a faulting
++    // thread can deadlock in the GPU driver's teardown (seen with NVIDIA Vulkan), leaving a process that
++    // holds the run folder's files for minutes. APS5_CRASH_SEARCH keeps the previous behaviour.
++    // APS5_CRASH_PAUSE=<seconds> keeps the faulting process alive that long so its memory can be
++    // inspected from outside.
++    if (const char* pause = std::getenv("APS5_CRASH_PAUSE")) {
++        Report("  pausing %s s for inspection (pid %lu)\n", pause, GetCurrentProcessId());
++        std::fflush(stderr);
++        Sleep(static_cast<DWORD>(std::strtoul(pause, nullptr, 10) * 1000));
++    }
++    if (std::getenv("APS5_CRASH_SEARCH") == nullptr) TerminateProcess(GetCurrentProcess(), record->ExceptionCode);
+     return EXCEPTION_CONTINUE_SEARCH;
+ }
+ 
+@@ -367,9 +657,28 @@ const bool g_crashReportInstalled = [] {
+     g_sse4aEmulation = !IsEnvironmentSet("APS5_NO_SSE4A_EMULATION");
+     g_sse4aTrace = IsEnvironmentSet("APS5_TRACE_SSE4A");
+     AddVectoredExceptionHandler(1, ReportCrash);
++    // An exception every handler passed on (the renderer's guarded reads pass faults to their
++    // own structured handler): name it before the process ends without a report.
++    SetUnhandledExceptionFilter([](EXCEPTION_POINTERS* info) -> LONG {
++        const auto* record = info->ExceptionRecord;
++        HMODULE module = nullptr;
++        char name[MAX_PATH] = "?";
++        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++                               static_cast<LPCSTR>(record->ExceptionAddress), &module)) {
++            GetModuleFileNameA(module, name, sizeof(name));
++        }
++        std::fprintf(stderr, "FATAL (no handler took it): exception 0x%08lx at %p in %s+0x%llx, address %p, thread %lu\n",
++                     record->ExceptionCode, record->ExceptionAddress, name,
++                     static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(record->ExceptionAddress) - reinterpret_cast<std::uintptr_t>(module)),
++                     record->NumberParameters >= 2 ? reinterpret_cast<void*>(record->ExceptionInformation[1]) : nullptr,
++                     GetCurrentThreadId());
++        std::fflush(stderr);
++        return EXCEPTION_CONTINUE_SEARCH;
++    });
+     std::signal(SIGABRT, AbortSignalHandler);
+     _set_invalid_parameter_handler(InvalidParameterHandler);
+     InstallWatch();
++    InstallBreak();
+     return true;
+ }();
+ 
+diff --git a/core/libs/prx/libkernel/Aio/src/Aio.cpp b/core/libs/prx/libkernel/Aio/src/Aio.cpp
+index baff62d..e19bd3b 100644
+--- a/core/libs/prx/libkernel/Aio/src/Aio.cpp
++++ b/core/libs/prx/libkernel/Aio/src/Aio.cpp
+@@ -1,3 +1,4 @@
++#include "prx/libkernel/File/include/File.hpp"
+ #include <array>
+ #include <cerrno>
+ #include <chrono>
+@@ -61,6 +62,7 @@ std::int64_t NativePread(std::int32_t fd, void* buf, std::size_t nbyte, std::int
+         errno = error;
+         return -1;
+     }
++    PrepareGuestWrite(buf, nbyte);
+     const int result = ::_read(duped, buf, static_cast<unsigned int>(nbyte));
+     const int error = errno;
+     ::_close(duped);
+diff --git a/core/libs/prx/libkernel/AppMetadata/src/AppMetadata.cpp b/core/libs/prx/libkernel/AppMetadata/src/AppMetadata.cpp
+index b99d5aa..630d214 100644
+--- a/core/libs/prx/libkernel/AppMetadata/src/AppMetadata.cpp
++++ b/core/libs/prx/libkernel/AppMetadata/src/AppMetadata.cpp
+@@ -6,6 +6,7 @@
+ #include <cstring>
+ #include <filesystem>
+ #include <fstream>
++#include <iterator>
+ #include <stdexcept>
+ #include <string>
+ #include <vector>
+@@ -21,6 +22,7 @@ std::uint64_t g_downloadDataSizeMiB = 0;
+ std::vector<std::uint8_t> g_iconBytes;
+ 
+ constexpr const char* AppMetadataParamJsonGuestPath = "/app0/sce_sys/param.json";
++constexpr const char* AppMetadataParamSfoGuestPath = "/app0/sce_sys/param.sfo";
+ constexpr const char* AppMetadataIconGuestPath = "/app0/sce_sys/icon0.png";
+ 
+ void copyToFixedBuffer(char* destination, std::size_t destinationSize, const std::string& source) {
+@@ -29,11 +31,49 @@ void copyToFixedBuffer(char* destination, std::size_t destinationSize, const std
+     std::memcpy(destination, source.c_str(), source.size() + 1);
+ }
+ 
++// PS4 titles describe themselves in param.sfo: a header, then 16-byte entries pointing into a key
++// table and a data table. Strings are UTF-8 (format 0x0204), integers 32-bit (format 0x0404).
++ParsedParamJson parseParamSfo(const std::filesystem::path& path) {
++    std::ifstream file(path, std::ios::binary);
++    if (!file.is_open()) throw std::runtime_error("failed to open param.sfo");
++    const std::vector<char> bytes((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
++    const auto read32 = [&](std::size_t offset) {
++        if (offset + 4 > bytes.size()) throw std::runtime_error("param.sfo is truncated");
++        std::uint32_t value;
++        std::memcpy(&value, bytes.data() + offset, sizeof(value));
++        return value;
++    };
++    if (bytes.size() < 20 || std::memcmp(bytes.data(), "\0PSF", 4) != 0) throw std::runtime_error("param.sfo has no PSF header");
++    const std::uint32_t keyTable = read32(8);
++    const std::uint32_t dataTable = read32(12);
++    const std::uint32_t entries = read32(16);
++    ParsedParamJson parsed;
++    for (std::uint32_t index = 0; index < entries; ++index) {
++        const std::size_t entry = 20 + std::size_t{index} * 16;
++        const std::uint32_t keyAndFormat = read32(entry);
++        const std::size_t keyOffset = keyTable + (keyAndFormat & 0xFFFFu);
++        const std::uint32_t format = keyAndFormat >> 16;
++        const std::uint32_t length = read32(entry + 4);
++        const std::size_t dataOffset = dataTable + read32(entry + 12);
++        if (keyOffset >= bytes.size() || dataOffset + length > bytes.size()) throw std::runtime_error("param.sfo entry is out of range");
++        const std::string key(bytes.data() + keyOffset);
++        if (format == 0x0404 && key == "DOWNLOAD_DATA_SIZE") {
++            parsed.downloadDataSizeMiB = read32(dataOffset);
++        } else if (format == 0x0204 && (key == "TITLE" || key == "TITLE_ID")) {
++            std::string value(bytes.data() + dataOffset, length);
++            value.resize(std::strlen(value.c_str()));
++            (key == "TITLE" ? parsed.title : parsed.titleId) = value;
++        }
++    }
++    return parsed;
++}
++
+ void ensureTitleLoaded() {
+     if (g_titleLoaded) return;
+     const auto resolvedPath = ResolvePath_nid_no_patch(AppMetadataParamJsonGuestPath);
+-    if (!std::filesystem::exists(resolvedPath)) throw std::runtime_error("param.json not found");
+-    const auto parsed = parseParamJson(resolvedPath);
++    const auto sfoPath = ResolvePath_nid_no_patch(AppMetadataParamSfoGuestPath);
++    if (!std::filesystem::exists(resolvedPath) && !std::filesystem::exists(sfoPath)) throw std::runtime_error("neither param.json nor param.sfo found");
++    const auto parsed = std::filesystem::exists(resolvedPath) ? parseParamJson(resolvedPath) : parseParamSfo(sfoPath);
+     copyToFixedBuffer(g_title, sizeof(g_title), parsed.title);
+     copyToFixedBuffer(g_titleId, sizeof(g_titleId), parsed.titleId);
+     g_downloadDataSizeMiB = parsed.downloadDataSizeMiB;
+diff --git a/core/libs/prx/libkernel/CMakeLists.txt b/core/libs/prx/libkernel/CMakeLists.txt
+index 907294a..f4083f5 100644
+--- a/core/libs/prx/libkernel/CMakeLists.txt
++++ b/core/libs/prx/libkernel/CMakeLists.txt
+@@ -3,6 +3,7 @@ add_library(libkernel SHARED EXCLUDE_FROM_ALL
+         ${CMAKE_CURRENT_SOURCE_DIR}/Apr/src/Apr.cpp
+         ${CMAKE_CURRENT_SOURCE_DIR}/Equeue/Equeue.cpp
+         ${CMAKE_CURRENT_SOURCE_DIR}/Equeue/src/EventAccessors.cpp
++        ${CMAKE_CURRENT_SOURCE_DIR}/Equeue/src/HostBridge.cpp
+         ${CMAKE_CURRENT_SOURCE_DIR}/File/src/DirectoryDescriptor.cpp
+         ${CMAKE_CURRENT_SOURCE_DIR}/File/src/NativeStat.cpp
+         ${CMAKE_CURRENT_SOURCE_DIR}/File/src/Open.cpp
+diff --git a/core/libs/prx/libkernel/DirectMemory/DirectMemory.cpp b/core/libs/prx/libkernel/DirectMemory/DirectMemory.cpp
+index 6e8fc15..1c4c1eb 100644
+--- a/core/libs/prx/libkernel/DirectMemory/DirectMemory.cpp
++++ b/core/libs/prx/libkernel/DirectMemory/DirectMemory.cpp
+@@ -416,6 +416,9 @@ void* MapPlaced(void* addr, size_t len, int prot, int flags, size_t alignment) {
+     if (addr) {
+ #if defined(__linux__)
+         return MapAtOrAbove(reinterpret_cast<std::uintptr_t>(addr), len, prot, alignment);
++#elif defined(_WIN32)
++        // A non-fixed address is only a hint; PS4 titles accept any placement in the arena.
++        return mmap_aligned(len, prot, alignment);
+ #else
+         throw std::invalid_argument("Non-fixed mapping address hints are not implemented");
+ #endif
+@@ -468,6 +471,19 @@ void EraseProtections(std::uintptr_t start, std::uintptr_t end) {
+     }
+ }
+ 
++// Whether every byte of [start, end) already has the protection prot.
++bool ProtectionUnchanged(std::uintptr_t start, std::uintptr_t end, int prot) {
++    std::lock_guard lock(g_protectionLock);
++    auto it = g_protections.upper_bound(start);
++    if (it == g_protections.begin()) return false;
++    --it;
++    for (auto cursor = start; cursor < end; ++it) {
++        if (it == g_protections.end() || it->first > cursor || it->second.end <= cursor || it->second.prot != prot) return false;
++        cursor = it->second.end;
++    }
++    return true;
++}
++
+ void RecordProtection(const void* addr, size_t len, int prot) {
+     const auto start = reinterpret_cast<std::uintptr_t>(addr);
+     std::lock_guard lock(g_protectionLock);
+@@ -492,15 +508,54 @@ void ValidateOutput(void** addr) {
+ 
+ }
+ 
++// A renderer that caches GPU copies of guest memory (the shadGT-based libSceVideoOut.prx) must
++// drop them when the game unmaps or replaces that memory; it exports these entry points for it.
++// Called outside the allocation lock, since the renderer may read guest memory while flushing.
++void NotifyRenderer(const char* name, const void* addr, size_t len) {
++#ifdef _WIN32
++    using RangeFunction = void (*)(std::uint64_t, std::uint64_t);
++    static HMODULE renderer = nullptr;
++    if (renderer == nullptr) renderer = GetModuleHandleA("libSceVideoOut.prx");
++    if (renderer == nullptr || addr == nullptr || len == 0) return;
++    if (const auto function = reinterpret_cast<RangeFunction>(reinterpret_cast<void*>(GetProcAddress(renderer, name)))) {
++        function(reinterpret_cast<std::uint64_t>(addr), len);
++    }
++#else
++    (void)name;
++    (void)addr;
++    (void)len;
++#endif
++}
++
++// MAP_FIXED without MAP_NO_OVERWRITE replaces whatever is mapped there (PS4 titles rely on it,
++// e.g. GT Sport remaps a larger block over an existing one). A range wholly inside one registered
++// allocation is remapped in place by RemapFixedIntoRegistered; any other overlap is unmapped first.
++void ReleaseFixedOverlap(void* addr, size_t len, int flags) {
++    constexpr int GuestMapNoOverwrite = 0x80;
++    if (addr == nullptr || (flags & GuestMapFixedFlag) == 0 || (flags & GuestMapNoOverwrite) != 0) return;
++    bool overlaps = false;
++    {
++        GuestAllocations::Mutation mutation;
++        overlaps = !mutation.Covers(addr, len) && mutation.Overlaps(addr, len);
++    }
++    if (overlaps) {
++        Trace("fixed mapping %p+0x%zx replaces existing mappings", addr, len);
++        DoMunmap(addr, len);
++    }
++}
++
+ int DoMapDirect(void** addr, size_t len, int prot, int flags, int64_t physStart, size_t alignment) {
+     ValidateOutput(addr);
+     if (len == 0 || (len & (PS5_PAGE_SIZE - 1)) != 0) return SCE_KERNEL_ERROR_EINVAL;
+     if (physStart < 0 || (static_cast<std::uint64_t>(physStart) & (PS5_PAGE_SIZE - 1)) != 0 || static_cast<std::uint64_t>(physStart) >= DIRECT_MEMORY_SIZE || len > DIRECT_MEMORY_SIZE - static_cast<std::uint64_t>(physStart)) {
+         return SCE_KERNEL_ERROR_EINVAL;
+     }
++    if (*addr != nullptr && (flags & GuestMapFixedFlag) != 0) NotifyRenderer("RytyGpuUnmapMemory", *addr, len);
++    ReleaseFixedOverlap(*addr, len, flags);
+     GuestAllocations::Mutation mutation;
+     if (RemapFixedIntoRegistered(mutation, *addr, len, prot, flags, physStart)) {
+         RecordProtection(*addr, len, prot);
++        NotifyRenderer("RytyGpuMapMemory", *addr, len);
+         return 0;
+     }
+     if (*addr != nullptr && (flags & GuestMapFixedFlag) != 0) mutation.RequireAvailable(*addr, len);
+@@ -518,15 +573,19 @@ int DoMapDirect(void** addr, size_t len, int prot, int flags, int64_t physStart,
+     *addr = mapped;
+     RecordProtection(mapped, len, prot);
+     Trace("map direct %p+0x%zx phys=0x%llx prot=0x%x flags=0x%x align=0x%zx", mapped, len, static_cast<unsigned long long>(physStart), prot, flags, alignment);
++    NotifyRenderer("RytyGpuMapMemory", mapped, len);
+     return 0;
+ }
+ 
+ int DoMapAnon(void** addr, size_t len, int prot, int flags) {
+     ValidateOutput(addr);
+     if (len == 0 || (len & (PS5_PAGE_SIZE - 1)) != 0) return SCE_KERNEL_ERROR_EINVAL;
++    if (*addr != nullptr && (flags & GuestMapFixedFlag) != 0) NotifyRenderer("RytyGpuUnmapMemory", *addr, len);
++    ReleaseFixedOverlap(*addr, len, flags);
+     GuestAllocations::Mutation mutation;
+     if (RemapFixedIntoRegistered(mutation, *addr, len, prot, flags)) {
+         RecordProtection(*addr, len, prot);
++        NotifyRenderer("RytyGpuMapMemory", *addr, len);
+         return 0;
+     }
+     if (*addr != nullptr && (flags & GuestMapFixedFlag) != 0) mutation.RequireAvailable(*addr, len);
+@@ -540,6 +599,7 @@ int DoMapAnon(void** addr, size_t len, int prot, int flags) {
+     *addr = mapped;
+     RecordProtection(mapped, len, prot);
+     Trace("map anon %p+0x%zx prot=0x%x flags=0x%x", mapped, len, prot, flags);
++    NotifyRenderer("RytyGpuMapMemory", mapped, len);
+     return 0;
+ }
+ 
+@@ -552,6 +612,14 @@ int DoMprotect(const void* addr, size_t len, int prot) {
+     const auto first = address & ~pageMask;
+     const auto end = (address + len + pageMask) & ~pageMask;
+     const auto bytes = static_cast<std::size_t>(end - first);
++    // Like the PS4 kernel, an unchanged protection changes nothing. GT Sport re-applies read-write
++    // to its 2 MB pool chunks during play; re-protecting them dropped the renderer's write
++    // tracking there, so later CPU writes no longer reached its caches (wrong glyphs).
++    // Only in the guest arena, where the pools are: elsewhere (the kernel arena commits pages on
++    // mprotect) the recorded protection need not match what is committed.
++    constexpr std::uintptr_t GuestArenaBase = 0x200000000;
++    constexpr std::uintptr_t GuestArenaEnd = 0xFC00000000;
++    if (first >= GuestArenaBase && end <= GuestArenaEnd && ProtectionUnchanged(first, end, prot)) return 0;
+     const auto* pointer = reinterpret_cast<const void*>(first);
+     const auto nativeProtection = LinuxProtFromSce(prot);
+     GuestAllocations::Mutation mutation;
+@@ -569,12 +637,14 @@ int DoMprotect(const void* addr, size_t len, int prot) {
+         if (mprotect(const_cast<void*>(pointer), bytes, nativeProtection) != 0) throw std::system_error(errno, std::generic_category(), "mprotect failed");
+     });
+     RecordProtection(pointer, bytes, prot);
++    NotifyRenderer("RytyGpuProtectionChanged", pointer, bytes);
+     return 0;
+ }
+ 
+ int DoMunmap(void* addr, size_t len) {
+     Trace("unmap %p+0x%zx", addr, len);
+     if (len == 0 || (len & (PS5_PAGE_SIZE - 1)) != 0 || !addr) return SCE_KERNEL_ERROR_EINVAL;
++    NotifyRenderer("RytyGpuUnmapMemory", addr, len);
+     GuestAllocations::Mutation mutation;
+     mutation.Unmap(addr, len, [&](const void* piece, std::size_t pieceBytes, const void* allocation, bool last) {
+         auto* pieceAddress = const_cast<void*>(piece);
+@@ -589,6 +659,9 @@ int DoMunmap(void* addr, size_t len) {
+ #endif
+     });
+     RecordProtection(addr, len, -1);
++    // The renderer was told before the unmap so it stops using the memory; this tells it the
++    // pages are gone, so answers it cached in between are dropped.
++    NotifyRenderer("RytyGpuMappingChanged", addr, len);
+     return 0;
+ }
+ 
+@@ -624,6 +697,28 @@ void CreateDirectMemoryBacking(int64_t start, size_t len, int memoryType) {
+     Trace("allocate physical 0x%llx+0x%zx", static_cast<unsigned long long>(first), len);
+ }
+ 
++// Releasing direct memory on a PS4 also unmaps every virtual mapping of it; titles release
++// without unmapping first (GT Sport maps, queries and releases scratch blocks this way).
++void UnmapDirectMemory(int64_t start, size_t len) {
++    const auto first = static_cast<std::uint64_t>(start);
++    const auto last = first + len;
++    std::vector<std::pair<std::uintptr_t, std::size_t>> ranges;
++    {
++        std::lock_guard lock(g_directLock);
++        for (const auto& [base, mapping] : g_directMappings) {
++            const auto mappingEnd = mapping.phys + (mapping.end - base);
++            const auto overlapFirst = std::max(first, mapping.phys);
++            const auto overlapLast = std::min(last, mappingEnd);
++            if (overlapFirst >= overlapLast) continue;
++            ranges.emplace_back(base + (overlapFirst - mapping.phys), overlapLast - overlapFirst);
++        }
++    }
++    for (const auto& [address, bytes] : ranges) {
++        Trace("release unmaps %p+0x%zx", reinterpret_cast<void*>(address), bytes);
++        DoMunmap(reinterpret_cast<void*>(address), bytes);
++    }
++}
++
+ void ForgetDirectMemory(int64_t start, size_t len) {
+     const auto first = static_cast<std::uint64_t>(start);
+     std::lock_guard lock(g_directLock);
+diff --git a/core/libs/prx/libkernel/DirectMemory/DirectMemory.hpp b/core/libs/prx/libkernel/DirectMemory/DirectMemory.hpp
+index badcadc..67a0d1e 100644
+--- a/core/libs/prx/libkernel/DirectMemory/DirectMemory.hpp
++++ b/core/libs/prx/libkernel/DirectMemory/DirectMemory.hpp
+@@ -6,7 +6,12 @@
+ 
+ #include "prx/libkernel/KernelErrors.hpp"
+ 
++#ifdef RTY_PS4_MEMORY
++// Base PS4: 5248 MiB in total, of which 448 MiB is flexible memory.
++static constexpr size_t DIRECT_MEMORY_SIZE = (5248ULL - 448ULL) * 1024 * 1024;
++#else
+ static constexpr size_t DIRECT_MEMORY_SIZE = 13824ULL * 1024 * 1024;
++#endif
+ static constexpr size_t PS5_PAGE_SIZE = 0x4000;
+ 
+ int DirectMemoryAlloc(int64_t searchStart, int64_t searchEnd, size_t len, size_t alignment, int memoryType, int64_t* physOut);
+@@ -14,6 +19,7 @@ void DirectMemoryFree(int64_t start, size_t len);
+ void CreateDirectMemoryBacking(int64_t start, size_t len, int memoryType);
+ bool QueryDirectMapping(std::uintptr_t address, std::uintptr_t* start, std::uintptr_t* end, std::uint64_t* offset, int* memoryType);
+ void ForgetDirectMemory(int64_t start, size_t len);
++void UnmapDirectMemory(int64_t start, size_t len);
+ bool DirectMemoryFind(int64_t offset, bool findNext, int64_t* start, int64_t* end, int* memoryType);
+ size_t DirectMemoryFreeRun(uint64_t offset, uint64_t limit);
+ int DoMapDirect(void** addr, size_t len, int prot, int flags, int64_t physStart, size_t alignment);
+diff --git a/core/libs/prx/libkernel/DirectMemory/Export.cpp b/core/libs/prx/libkernel/DirectMemory/Export.cpp
+index 364b75f..1218b79 100644
+--- a/core/libs/prx/libkernel/DirectMemory/Export.cpp
++++ b/core/libs/prx/libkernel/DirectMemory/Export.cpp
+@@ -115,7 +115,9 @@ int APS5_VABI sceKernelAllocateDirectMemory(int64_t search_start, int64_t search
+   || (len & (PS5_PAGE_SIZE - 1)) || !phys_addr_out
+   || (alignment != 0 && (alignment & (PS5_PAGE_SIZE - 1))))
+   return SCE_KERNEL_ERROR_EINVAL;
+- return DirectMemoryAlloc(search_start, search_end, len, alignment, memory_type, phys_addr_out);
++ const int result = DirectMemoryAlloc(search_start, search_end, len, alignment, memory_type, phys_addr_out);
++ if (result != 0) std::fprintf(stderr, "[memory] allocate direct 0x%llx-0x%llx len=0x%zx align=0x%zx type=%d failed: 0x%x\n", static_cast<long long>(search_start), static_cast<long long>(search_end), len, alignment, memory_type, result);
++ return result;
+ }
+ 
+ int APS5_VABI sceKernelAllocateMainDirectMemory(size_t len, size_t alignment, int memory_type, int64_t* phys_addr_out) {
+@@ -148,8 +150,10 @@ size_t APS5_VABI sceKernelGetDirectMemorySize(void) {
+ }
+ 
+ int APS5_VABI sceKernelMapDirectMemory(void** addr, size_t len, int prot, int flags, int64_t direct_memory_start, size_t alignment) {
+- (void)alignment;
+- return DoMapDirect(addr, len, prot, flags, direct_memory_start, alignment);
++ void* requested = addr ? *addr : nullptr;
++ const int result = DoMapDirect(addr, len, prot, flags, direct_memory_start, alignment);
++ if (result != 0) std::fprintf(stderr, "[memory] map direct %p len=0x%zx prot=0x%x flags=0x%x phys=0x%llx align=0x%zx failed: 0x%x\n", requested, len, prot, flags, static_cast<long long>(direct_memory_start), alignment, result);
++ return result;
+ }
+ 
+ int APS5_VABI sceKernelMapDirectMemory2(void** addr, size_t len, int type, int prot, int flags, int64_t direct_memory_start, size_t alignment) {
+@@ -187,12 +191,16 @@ int APS5_VABI sceKernelMunmap(uint64_t vaddr, size_t len) {
+ 
+ int APS5_VABI sceKernelReleaseDirectMemory(int64_t start, size_t len) {
+  if (start < 0 || len == 0) return SCE_KERNEL_ERROR_EINVAL;
++ UnmapDirectMemory(start, len);
+  DirectMemoryFree(start, len);
+  return 0;
+ }
+ 
+ int APS5_VABI sceKernelReserveVirtualRange(void** addr, size_t len, int flags, size_t alignment) {
+- return DoReserveVirtual(addr, len, flags, alignment);
++ void* requested = addr ? *addr : nullptr;
++ const int result = DoReserveVirtual(addr, len, flags, alignment);
++ if (result != 0) std::fprintf(stderr, "[memory] reserve %p len=0x%zx flags=0x%x align=0x%zx failed: 0x%x\n", requested, len, flags, alignment, result);
++ return result;
+ }
+ 
+ int APS5_VABI sceKernelVirtualQuery(const void* addr, int flags, VirtualQueryInfo* info, uint64_t info_size) {
+@@ -274,11 +282,18 @@ int APS5_VABI sceKernelVirtualQuery(const void* addr, int flags, VirtualQueryInf
+ // Moved as-is (not yet implemented) from the monolithic libkernel/Export.cpp.
+ // ---------------------------------------------------------------------------
+ 
++// As sceKernelReleaseDirectMemory, but the whole range must be allocated.
+ int APS5_VABI sceKernelCheckedReleaseDirectMemory(int64_t start, size_t len) {
+- (void)start;
+- (void)len;
+- NotImplemented_nid_no_patch(__func__);
+- return 0;
++ if (start < 0 || len == 0 || (static_cast<std::uint64_t>(start) & (PS5_PAGE_SIZE - 1)) != 0 || (len & (PS5_PAGE_SIZE - 1)) != 0) return SCE_KERNEL_ERROR_EINVAL;
++ for (std::uint64_t offset = 0; offset < len;) {
++  int64_t blockStart = 0;
++  int64_t blockEnd = 0;
++  int memoryType = 0;
++  const auto address = static_cast<std::uint64_t>(start) + offset;
++  if (!DirectMemoryFind(static_cast<int64_t>(address), false, &blockStart, &blockEnd, &memoryType) || static_cast<std::uint64_t>(blockStart) > address) return SCE_KERNEL_ERROR_ENOENT;
++  offset = static_cast<std::uint64_t>(blockEnd) - static_cast<std::uint64_t>(start);
++ }
++ return sceKernelReleaseDirectMemory(start, len);
+ }
+ 
+ int APS5_VABI sceKernelMtypeprotect(const void* addr, size_t len, int type, int prot) {
+diff --git a/core/libs/prx/libkernel/DirectMemory/MemoryPoolExport.cpp b/core/libs/prx/libkernel/DirectMemory/MemoryPoolExport.cpp
+index 2707606..f3a1122 100644
+--- a/core/libs/prx/libkernel/DirectMemory/MemoryPoolExport.cpp
++++ b/core/libs/prx/libkernel/DirectMemory/MemoryPoolExport.cpp
+@@ -1,5 +1,8 @@
++#include <atomic>
+ #include <cstdint>
+ #include <cstddef>
++#include <cstdio>
++#include <cstring>
+ #include <exception>
+ #include <mutex>
+ #include "SceTypes.hpp"
+@@ -45,6 +48,31 @@ int PoolDecommit(void* addr, uint64_t len) {
+     return ret;
+ }
+ 
++// The PS4 moves the pool's physical pages from src to dst (dst gets src's bytes and protection,
++// src is decommitted). Pool memory here is a fixed range per address, so the bytes are copied.
++// GT Sport's batches use it; it failed with EINVAL before, leaving stale bytes at dst.
++int PoolMove(void* dst, void* src, uint64_t len) {
++    if (!dst || !src || len == 0 || !PageAligned(reinterpret_cast<uintptr_t>(dst)) ||
++        !PageAligned(reinterpret_cast<uintptr_t>(src)) || !PageAligned(len)) {
++        return SCE_KERNEL_ERROR_EINVAL;
++    }
++    int prot = 0;
++    if (!GuestProtection(reinterpret_cast<uintptr_t>(src), &prot) || prot == 0) prot = 0x33;
++    constexpr int CpuReadWrite = 0x3;
++    int ret = DoMprotect(dst, static_cast<size_t>(len), prot | CpuReadWrite);
++    if (ret == 0) ret = DoMprotect(src, static_cast<size_t>(len), prot | CpuReadWrite);
++    if (ret != 0) return ret;
++    std::memmove(dst, src, static_cast<size_t>(len));
++    ret = DoMprotect(dst, static_cast<size_t>(len), prot);
++    if (ret == 0) ret = DoMprotect(src, static_cast<size_t>(len), 0);
++    static std::atomic<int> logged{0};
++    if (logged.fetch_add(1) < 10) {
++        std::fprintf(stderr, "[MEMPOOL] move %p -> %p len 0x%llx prot 0x%x -> %d\n", src, dst,
++                     static_cast<unsigned long long>(len), prot, ret);
++    }
++    return ret;
++}
++
+ template <typename TFunction>
+ int Guarded(TFunction function) {
+     try {
+@@ -71,10 +99,19 @@ int APS5_VABI sceKernelMemoryPoolBatch(const KernelMemoryPoolBatchEntry* entries
+     case 2: return PoolDecommit(e.decommit.addr, e.decommit.len);
+     case 3: return DoMprotect(e.protect.addr, static_cast<size_t>(e.protect.len), e.protect.prot);
+     case 4: return DoMprotect(e.type_protect.addr, static_cast<size_t>(e.type_protect.len), e.type_protect.prot);
+-    default: return SCE_KERNEL_ERROR_EINVAL;
++    case 5: return PoolMove(e.move.dst, e.move.src, e.move.len);
++    default: {
++     static std::atomic<int> logged{0};
++     if (logged.fetch_add(1) < 10) std::fprintf(stderr, "[MEMPOOL] batch op %u not supported\n", e.op);
++     return SCE_KERNEL_ERROR_EINVAL;
++    }
+    }
+   });
+-  if (ret != 0) break;
++  if (ret != 0) {
++   static std::atomic<int> logged{0};
++   if (logged.fetch_add(1) < 10) std::fprintf(stderr, "[MEMPOOL] batch entry %d (op %u) failed: 0x%x\n", done, e.op, ret);
++   break;
++  }
+  }
+  if (num_entries_out) *num_entries_out = done;
+  return ret;
+diff --git a/core/libs/prx/libkernel/Equeue/src/EventAccessors.cpp b/core/libs/prx/libkernel/Equeue/src/EventAccessors.cpp
+index ad02f49..bf0a5d2 100644
+--- a/core/libs/prx/libkernel/Equeue/src/EventAccessors.cpp
++++ b/core/libs/prx/libkernel/Equeue/src/EventAccessors.cpp
+@@ -1,44 +1,44 @@
+ #include <cstdint>
+ #include <cstddef>
++#include <stdexcept>
+ #include "SceTypes.hpp"
+ #include "prx/libc/include/General.hpp"
+ 
++namespace {
++
++const KernelEvent& Checked(const KernelEvent* ev) {
++    if (ev == nullptr) throw std::invalid_argument("Null kernel event");
++    return *ev;
++}
++
++}
++
+ extern "C" {
+ 
+ intptr_t APS5_VABI sceKernelGetEventData(const KernelEvent* ev) {
+- (void)ev;
+- NotImplemented_nid_no_patch(__func__);
+- return 0;
++    return Checked(ev).data;
+ }
+ 
+ int APS5_VABI sceKernelGetEventError(const KernelEvent* ev) {
+- (void)ev;
+- NotImplemented_nid_no_patch(__func__);
+- return 0;
++    // kqueue reports errors through EV_ERROR (0x4000) with the error code in data.
++    const auto& event = Checked(ev);
++    return (event.flags & 0x4000) != 0 ? static_cast<int>(event.data) : 0;
+ }
+ 
+ intptr_t APS5_VABI sceKernelGetEventFflags(const KernelEvent* ev) {
+- (void)ev;
+- NotImplemented_nid_no_patch(__func__);
+- return 0;
++    return Checked(ev).fflags;
+ }
+ 
+ int APS5_VABI sceKernelGetEventFilter(const KernelEvent* ev) {
+- (void)ev;
+- NotImplemented_nid_no_patch(__func__);
+- return 0;
++    return Checked(ev).filter;
+ }
+ 
+ uintptr_t APS5_VABI sceKernelGetEventId(const KernelEvent* ev) {
+- (void)ev;
+- NotImplemented_nid_no_patch(__func__);
+- return 0;
++    return Checked(ev).ident;
+ }
+ 
+ void* APS5_VABI sceKernelGetEventUserData(const KernelEvent* ev) {
+- (void)ev;
+- NotImplemented_nid_no_patch(__func__);
+- return nullptr;
++    return Checked(ev).udata;
+ }
+ 
+ }
+diff --git a/core/libs/prx/libkernel/Equeue/src/HostBridge.cpp b/core/libs/prx/libkernel/Equeue/src/HostBridge.cpp
+new file mode 100644
+index 0000000..69a02c8
+--- /dev/null
++++ b/core/libs/prx/libkernel/Equeue/src/HostBridge.cpp
+@@ -0,0 +1,80 @@
++// C interface to the event queues for host libraries built with another C++ runtime (the PS4
++// video output and Gnm driver from shadGT are built with clang-cl, so they cannot construct
++// KernelEqueueEvent, which holds libstdc++ types).
++#include <cstdint>
++#include <x86intrin.h>
++#include "prx/libkernel/Equeue/Equeue.hpp"
++
++namespace {
++
++enum class TriggerMode : int {
++    Data = 0,       // event.data = trigger data (PS4 GraphicsCore end-of-pipe events)
++    Ps4Display = 1, // PS4 video-out flip/vblank: time, counter and flip argument packed into data
++    User = 2,       // event.udata = trigger data
++};
++
++void TriggerData(KernelEqueueEvent* e, void* data) {
++    e->event.data = static_cast<intptr_t>(reinterpret_cast<uintptr_t>(data));
++    e->triggered = true;
++}
++
++void TriggerPs4Display(KernelEqueueEvent* e, void* data) {
++    e->triggered = true;
++    if (data == nullptr) return;
++    const auto hint = static_cast<std::uint64_t>(reinterpret_cast<uintptr_t>(data));
++    const auto hintEventId = hint & 0xffu;
++    if (hintEventId != e->event.ident || e->event.ident == 0xfe) return;
++    const auto old = static_cast<std::uint64_t>(e->event.data);
++    auto counter = (old >> 12u) & 0xfu;
++    if (counter != 0xfu) counter++;
++    const auto time = static_cast<std::uint64_t>(__rdtsc());
++    e->event.data = static_cast<intptr_t>((time & 0xfffu) | (counter << 12u) | (hint & 0xffffffffffff0000ull));
++}
++
++void TriggerUser(KernelEqueueEvent* e, void* data) {
++    e->event.udata = data;
++    e->triggered = true;
++}
++
++void Reset(KernelEqueueEvent* e) {
++    e->triggered = false;
++    e->event.fflags = 0;
++    e->event.data = 0;
++}
++
++}
++
++extern "C" {
++
++int RytyEqueueAddEvent_nid_no_patch(KernelEqueue eq, std::uintptr_t ident, std::int16_t filter, std::uint16_t flags,
++                                    std::uint32_t fflags, std::intptr_t data, void* udata, int mode, int triggered) {
++    KernelEqueueEvent event{};
++    event.event.ident = ident;
++    event.event.filter = filter;
++    event.event.flags = flags;
++    event.event.fflags = fflags;
++    event.event.data = data;
++    event.event.udata = udata;
++    event.triggered = triggered != 0;
++    switch (static_cast<TriggerMode>(mode)) {
++    case TriggerMode::Ps4Display: event.filter.triggerFunc = TriggerPs4Display; break;
++    case TriggerMode::User: event.filter.triggerFunc = TriggerUser; break;
++    default: event.filter.triggerFunc = TriggerData; break;
++    }
++    event.filter.resetFunc = Reset;
++    return EqueueAddEvent_nid_postfix(eq, event);
++}
++
++int RytyEqueueTriggerEvent_nid_no_patch(KernelEqueue eq, std::uintptr_t ident, std::int16_t filter, void* triggerData) {
++    return EqueueTriggerEvent_nid_postfix(eq, ident, filter, triggerData);
++}
++
++int RytyEqueueDeleteEvent_nid_no_patch(KernelEqueue eq, std::uintptr_t ident, std::int16_t filter) {
++    return EqueueDeleteEvent_nid_postfix(eq, ident, filter);
++}
++
++int RytyEqueueExists_nid_no_patch(KernelEqueue eq) {
++    return EqueuePin_nid_postfix(eq) ? 1 : 0;
++}
++
++}
+diff --git a/core/libs/prx/libkernel/File/include/File.hpp b/core/libs/prx/libkernel/File/include/File.hpp
+index cb3f099..fd0707a 100644
+--- a/core/libs/prx/libkernel/File/include/File.hpp
++++ b/core/libs/prx/libkernel/File/include/File.hpp
+@@ -19,4 +19,9 @@ int APS5_VABI sceKernelUnlink(const char* path);
+ 
+ }
+ 
++// Before the host kernel writes guest memory directly (a file read into a guest buffer), lets a
++// renderer that write-protects guest pages it caches drop them; the write would otherwise fail
++// on a protected page instead of faulting.
++void PrepareGuestWrite(void* buffer, std::size_t bytes);
++
+ #endif
+diff --git a/core/libs/prx/libkernel/File/src/Open.cpp b/core/libs/prx/libkernel/File/src/Open.cpp
+index 469c4ad..1118bd8 100644
+--- a/core/libs/prx/libkernel/File/src/Open.cpp
++++ b/core/libs/prx/libkernel/File/src/Open.cpp
+@@ -12,6 +12,10 @@
+ #include <string>
+ 
+ #ifdef _WIN32
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
+ #include <fcntl.h>
+ #include <io.h>
+ #include <sys/stat.h>
+@@ -87,6 +91,22 @@ static int MapFlags(int sceFlags) {
+ }
+ #endif
+ 
++void PrepareGuestWrite(void* buffer, std::size_t bytes) {
++#ifdef _WIN32
++    using RangeFunction = void (*)(std::uint64_t, std::uint64_t);
++    static RangeFunction invalidate = nullptr;
++    if (invalidate == nullptr) {
++        if (HMODULE renderer = GetModuleHandleA("libSceVideoOut.prx")) {
++            invalidate = reinterpret_cast<RangeFunction>(reinterpret_cast<void*>(GetProcAddress(renderer, "RytyGpuInvalidateMemory")));
++        }
++    }
++    if (invalidate != nullptr && buffer != nullptr && bytes != 0) invalidate(reinterpret_cast<std::uint64_t>(buffer), bytes);
++#else
++    (void)buffer;
++    (void)bytes;
++#endif
++}
++
+ static int SceErrorFromErrno(int error) {
+     constexpr int GuestEio = 5;
+     const int guest = error > 0 && error <= 34 ? error : GuestEio;
+@@ -125,6 +145,7 @@ std::int64_t APS5_VABI sceKernelRead(int d, void* buf, std::size_t nbytes) {
+     if (buf == nullptr) {
+         throw std::invalid_argument(std::string(__func__) + ": buf is null");
+     }
++    PrepareGuestWrite(buf, nbytes);
+     auto n = NativeRead(d, buf, nbytes);
+     if (n < 0) {
+         throw std::runtime_error(std::string(__func__) + ": read failed, fd=" + std::to_string(d) + ", errno=" + std::to_string(errno));
+diff --git a/core/libs/prx/libkernel/File/src/Stdio.cpp b/core/libs/prx/libkernel/File/src/Stdio.cpp
+index 0846da2..bf8f2a9 100644
+--- a/core/libs/prx/libkernel/File/src/Stdio.cpp
++++ b/core/libs/prx/libkernel/File/src/Stdio.cpp
+@@ -66,6 +66,7 @@ static std::int64_t NativePositioned(int descriptor, void* buf, std::size_t nbyt
+     overlapped.Offset = static_cast<DWORD>(offset);
+     overlapped.OffsetHigh = static_cast<DWORD>(static_cast<std::uint64_t>(offset) >> 32u);
+     DWORD done = 0;
++    if (!write) PrepareGuestWrite(buf, nbytes);
+     const BOOL ok = write ? ::WriteFile(handle, buf, static_cast<DWORD>(nbytes), &done, &overlapped)
+                           : ::ReadFile(handle, buf, static_cast<DWORD>(nbytes), &done, &overlapped);
+     if (!ok) {
+diff --git a/core/libs/prx/libkernel/Module/src/DynamicLoader.cpp b/core/libs/prx/libkernel/Module/src/DynamicLoader.cpp
+index e1091de..00459a4 100644
+--- a/core/libs/prx/libkernel/Module/src/DynamicLoader.cpp
++++ b/core/libs/prx/libkernel/Module/src/DynamicLoader.cpp
+@@ -71,7 +71,12 @@ void* APS5_VABI dlopen_nid_postfix(const char* path, int flags) {
+         } else {
+             if (!*path) { Error("dlopen: empty module path"); return nullptr; }
+             const auto resolved = ResolvePath_nid_no_patch(path);
+-            module->native = LoadLibraryExW(resolved.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
++            // A module the converter already turned into a startup guest module (for example a PS4
++            // title's /app0/logiWheel.prx) is loaded and initialized; hand out that instance.
++            const auto guestName = resolved.filename().wstring() + L".guest.prx";
++            module->native = GetModuleHandleW(guestName.c_str());
++            if (module->native) module->owned = false;
++            else module->native = LoadLibraryExW(resolved.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+         }
+         if (!module->native) {
+             char message[128];
+diff --git a/core/libs/prx/libkernel/Semaphore/include/Semaphore.hpp b/core/libs/prx/libkernel/Semaphore/include/Semaphore.hpp
+index 774d1f9..96b3851 100644
+--- a/core/libs/prx/libkernel/Semaphore/include/Semaphore.hpp
++++ b/core/libs/prx/libkernel/Semaphore/include/Semaphore.hpp
+@@ -24,6 +24,8 @@ struct KernelSemaPrivate {
+     bool isFifo;
+     bool deleted = false;
+     std::int32_t waiterCount = 0;
++    std::int32_t initCount = 0;
++    std::uint64_t cancelGeneration = 0;
+ };
+ 
+ extern "C" {
+diff --git a/core/libs/prx/libkernel/Semaphore/src/Semaphore.cpp b/core/libs/prx/libkernel/Semaphore/src/Semaphore.cpp
+index 6c5e07d..9e0a734 100644
+--- a/core/libs/prx/libkernel/Semaphore/src/Semaphore.cpp
++++ b/core/libs/prx/libkernel/Semaphore/src/Semaphore.cpp
+@@ -7,7 +7,7 @@
+ #include <utility>
+ 
+ KernelSemaPrivate::KernelSemaPrivate(std::int32_t initCount, std::int32_t maxCount, std::string name, bool isFifo)
+- : name(std::move(name)), tokenCount(initCount), maxCount(maxCount), isFifo(isFifo) {
++ : name(std::move(name)), tokenCount(initCount), maxCount(maxCount), isFifo(isFifo), initCount(initCount) {
+ }
+ 
+ extern "C" {
+@@ -63,26 +63,33 @@ int APS5_VABI sceKernelWaitSema(KernelSema sem, int need, KernelUseconds* time)
+    sem->condition.NotifyAll();
+   }
+  } waiterGuard{sem};
++ const auto generation = sem->cancelGeneration;
+ 
+  const auto waitStart = std::chrono::steady_clock::now();
+  const auto traceWait = [&](bool timedOut) {
+   KernelTraceWait_nid_postfix("sema", __builtin_return_address(0), static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - waitStart).count()), timedOut);
+  };
+  if (time == nullptr) {
+-  sem->condition.Wait(lock, [&] { return sem->tokenCount >= need || sem->deleted; });
++  sem->condition.Wait(lock, [&] { return sem->tokenCount >= need || sem->deleted || sem->cancelGeneration != generation; });
+   traceWait(false);
+   if (sem->deleted) {
+    return SCE_KERNEL_ERROR_EACCES;
+   }
++  if (sem->cancelGeneration != generation) {
++   return SCE_KERNEL_ERROR_ECANCELED;
++  }
+   sem->tokenCount -= need;
+   return KERNEL_SEMA_OK;
+  }
+ 
+- const bool acquired = sem->condition.WaitUntil(lock, TimedWait::DeadlineNanos(*time), [&] { return sem->tokenCount >= need || sem->deleted; });
++ const bool acquired = sem->condition.WaitUntil(lock, TimedWait::DeadlineNanos(*time), [&] { return sem->tokenCount >= need || sem->deleted || sem->cancelGeneration != generation; });
+  traceWait(!acquired);
+  if (sem->deleted) {
+   return SCE_KERNEL_ERROR_EACCES;
+  }
++ if (sem->cancelGeneration != generation) {
++  return SCE_KERNEL_ERROR_ECANCELED;
++ }
+  if (!acquired) {
+   return SCE_KERNEL_ERROR_ETIMEDOUT;
+  }
+@@ -91,11 +98,19 @@ int APS5_VABI sceKernelWaitSema(KernelSema sem, int need, KernelUseconds* time)
+ }
+ 
+ int APS5_VABI sceKernelCancelSema(KernelSema sem, int count, int* threads) {
+- (void)sem;
+- (void)count;
+- (void)threads;
+- NotImplemented_nid_no_patch(__func__);
+- return 0;
++ if (sem == nullptr) {
++  APS5_INVALID_ARG_EX;
++ }
++ std::lock_guard<std::mutex> lock(sem->mutex);
++ if (count > sem->maxCount) {
++  return SCE_KERNEL_ERROR_EINVAL;
++ }
++ // Every current waiter returns ECANCELED; the count becomes `count`, or the initial count for -1.
++ if (threads) *threads = sem->waiterCount;
++ sem->tokenCount = count < 0 ? sem->initCount : count;
++ ++sem->cancelGeneration;
++ sem->condition.NotifyAll();
++ return KERNEL_SEMA_OK;
+ }
+ 
+ int APS5_VABI sceKernelDeleteSema(KernelSema sem) {
+diff --git a/core/libs/prx/libkernel/System/src/Process.cpp b/core/libs/prx/libkernel/System/src/Process.cpp
+index 7755b15..abb3003 100644
+--- a/core/libs/prx/libkernel/System/src/Process.cpp
++++ b/core/libs/prx/libkernel/System/src/Process.cpp
+@@ -218,6 +218,22 @@ void* APS5_VABI sceKernelGetProcParam(void) {
+     return const_cast<void*>(ApplicationProcessParameters_nid_no_patch());
+ }
+ 
++// The process parameters start with size (8 bytes), magic (4), entry count (4) and the SDK version
++// the application was built with.
++int APS5_VABI sceKernelGetCompiledSdkVersion(std::int32_t* version) {
++    if (!version) return sceInvalidArgument;
++    const auto* parameters = static_cast<const std::uint8_t*>(ApplicationProcessParameters_nid_no_patch());
++    std::memcpy(version, parameters + 0x10, sizeof(*version));
++    return 0;
++}
++
++// On a PS4 the system folders (fonts among them) sit under a random per-boot directory name that
++// this returns. Guest paths resolve below the run folder, so system fonts go in
++// <run folder>/sys/common/font and font2.
++const char* APS5_VABI sceKernelGetFsSandboxRandomWord(void) {
++    return "sys";
++}
++
+ int APS5_VABI sceKernelUuidCreate(std::uint32_t* uuid) {
+     if (!uuid) return sceInvalidArgument;
+     static thread_local std::random_device device;
+diff --git a/core/relinker/codegen/include/codegen/IInstructionScanner.hpp b/core/relinker/codegen/include/codegen/IInstructionScanner.hpp
+index 1f63952..c18470c 100644
+--- a/core/relinker/codegen/include/codegen/IInstructionScanner.hpp
++++ b/core/relinker/codegen/include/codegen/IInstructionScanner.hpp
+@@ -20,6 +20,8 @@ public:
+ };
+ 
+ std::unique_ptr<IInstructionScanner> MakeInstructionScanner();
++// Skips bytes that do not decode instead of failing; only for informational scans.
++std::unique_ptr<IInstructionScanner> MakeResyncingInstructionScanner();
+ 
+ }
+ 
+diff --git a/core/relinker/codegen/src/InstructionScanner.cpp b/core/relinker/codegen/src/InstructionScanner.cpp
+index 6824dcd..c8c5fd0 100644
+--- a/core/relinker/codegen/src/InstructionScanner.cpp
++++ b/core/relinker/codegen/src/InstructionScanner.cpp
+@@ -9,11 +9,18 @@ namespace Codegen {
+ 
+ class InstructionScanner : public IInstructionScanner {
+ public:
++    explicit InstructionScanner(const bool skipUndecodable) : _skipUndecodable(skipUndecodable) {}
++
+     [[nodiscard]] std::vector<InstructionMatch> ScanCodeSection(
+         const std::vector<std::uint8_t>& codeSection,
+         Domain::FileByteOffset codeSectionOffset,
+         Domain::FileByteOffset codeSectionSize
+     ) const override;
++
++private:
++    // Data embedded in executable segments (jump tables, constant pools) does not decode.
++    // When set, such bytes are stepped over one at a time instead of failing the scan.
++    bool _skipUndecodable;
+ };
+ 
+ std::vector<InstructionMatch> InstructionScanner::ScanCodeSection(
+@@ -37,6 +44,10 @@ std::vector<InstructionMatch> InstructionScanner::ScanCodeSection(
+             length = decoder.Decode(cursor, available);
+         } catch (const CodegenException& e) {
+             if (std::all_of(cursor, cursor + available, [](const std::uint8_t b) { return b == 0; })) break;
++            if (_skipUndecodable) {
++                ++i;
++                continue;
++            }
+             throw CodegenException(std::string("Cannot decode instruction: ") + e.what(), codeSectionOffset + i);
+         }
+ 
+@@ -49,7 +60,11 @@ std::vector<InstructionMatch> InstructionScanner::ScanCodeSection(
+ }
+ 
+ std::unique_ptr<IInstructionScanner> MakeInstructionScanner() {
+-    return std::make_unique<InstructionScanner>();
++    return std::make_unique<InstructionScanner>(false);
++}
++
++std::unique_ptr<IInstructionScanner> MakeResyncingInstructionScanner() {
++    return std::make_unique<InstructionScanner>(true);
+ }
+ 
+ }
+diff --git a/core/relinker/elfpatcher/src/linux/LinuxGuestModuleWriter.cpp b/core/relinker/elfpatcher/src/linux/LinuxGuestModuleWriter.cpp
+index 46fc148..6bcfc97 100644
+--- a/core/relinker/elfpatcher/src/linux/LinuxGuestModuleWriter.cpp
++++ b/core/relinker/elfpatcher/src/linux/LinuxGuestModuleWriter.cpp
+@@ -62,8 +62,8 @@ std::vector<std::uint8_t> GuestModuleWriter::WriteLinux(const Relinker::GuestIma
+     bytes.insert(bytes.end(), image.Dynamic.RelaData.begin(), image.Dynamic.RelaData.end());
+     const auto pltAddress = address();
+     bytes.insert(bytes.end(), image.Dynamic.RelaPltData.begin(), image.Dynamic.RelaPltData.end());
+-    const auto lifecycle = [&](std::uint64_t target) {
+-        if (target == 0) return std::uint64_t{};
++    const auto lifecycle = [&](bool present, std::uint64_t target) {
++        if (!present) return std::uint64_t{};
+         const auto start = address();
+         bytes.insert(bytes.end(), {0x31, 0xff, 0x31, 0xf6, 0x31, 0xd2, 0xe9});
+         const auto displacement = static_cast<std::int64_t>(target) - static_cast<std::int64_t>(address() + 4);
+@@ -71,8 +71,8 @@ std::vector<std::uint8_t> GuestModuleWriter::WriteLinux(const Relinker::GuestIma
+         Io::AppendU32(bytes, static_cast<std::uint32_t>(displacement));
+         return start;
+     };
+-    const auto init = lifecycle(image.Init);
+-    const auto fini = lifecycle(image.Fini);
++    const auto init = lifecycle(image.HasInit, image.Init);
++    const auto fini = lifecycle(image.HasFini, image.Fini);
+     Io::AlignBuffer(bytes, 8);
+     const auto dynamicOffset = bytes.size();
+     const auto dynamicAddress = address();
+diff --git a/core/relinker/elfpatcher/src/windows/WindowsGuestModuleWriter.cpp b/core/relinker/elfpatcher/src/windows/WindowsGuestModuleWriter.cpp
+index 42a6e72..484264e 100644
+--- a/core/relinker/elfpatcher/src/windows/WindowsGuestModuleWriter.cpp
++++ b/core/relinker/elfpatcher/src/windows/WindowsGuestModuleWriter.cpp
+@@ -166,8 +166,8 @@ std::vector<std::uint8_t> GuestModuleWriter::WriteWindows(const Relinker::GuestI
+     sections.push_back({".dllmain", entry, SectionRead | SectionExecute | 0x20u, {0xb8, 1, 0, 0, 0, 0xc3}});
+     for (const auto slot : guest.InitArray) runtime.InitArrayRvas.push_back(image.GetRva(slot, 8));
+     for (const auto slot : guest.FiniArray) runtime.FiniArrayRvas.push_back(image.GetRva(slot, 8));
+-    runtime.InitRva = guest.Init == 0 ? 0 : image.GetRva(guest.Init);
+-    runtime.FiniRva = guest.Fini == 0 ? 0 : image.GetRva(guest.Fini);
++    runtime.InitRva = guest.HasInit ? image.GetRva(guest.Init) : 0;
++    runtime.FiniRva = guest.HasFini ? image.GetRva(guest.Fini) : 0;
+     auto result = WindowsPeWriter().Write(sections, entry, directories);
+     const auto characteristics = Io::ReadU16(result, 0x80 + 22);
+     Io::WriteU16(result, 0x80 + 22, static_cast<std::uint16_t>((characteristics | 0x2000) & ~1u));
+diff --git a/core/relinker/elfpatcher/src/windows/WindowsPeWriter.cpp b/core/relinker/elfpatcher/src/windows/WindowsPeWriter.cpp
+index 61c0a56..5293ec8 100644
+--- a/core/relinker/elfpatcher/src/windows/WindowsPeWriter.cpp
++++ b/core/relinker/elfpatcher/src/windows/WindowsPeWriter.cpp
+@@ -30,7 +30,11 @@ std::vector<std::uint8_t> WindowsPeWriter::Write(const std::vector<PeSection>& s
+     Io::WriteU16(result, optionalOffset + 50, 2);
+     Io::WriteU32(result, optionalOffset + 60, LoadRva);
+     Io::WriteU16(result, optionalOffset + 68, windowsGui ? 2 : 3);
+-    Io::WriteU16(result, optionalOffset + 70, directories[5].Size == 0 ? 0x100 : 0x160);
++    // No HIGH_ENTROPY_VA: high-entropy ASLR scatters Windows allocations across the range the guest
++    // arena must reserve (PS4 titles map fixed addresses up to 0xFC00000000). No DYNAMIC_BASE either:
++    // ASLR can place the image above 2^40, where a PS4 GPU (and renderers tracking guest pages in a
++    // 40-bit table) cannot address the title's own data; the image stays at ImageBase.
++    Io::WriteU16(result, optionalOffset + 70, 0x100);
+     Io::WriteU64(result, optionalOffset + 72, 0x210000);
+     Io::WriteU64(result, optionalOffset + 80, 0x200000);
+     Io::WriteU64(result, optionalOffset + 88, 0x100000);
+diff --git a/core/relinker/relinker/include/relinker/guest/GuestImage.hpp b/core/relinker/relinker/include/relinker/guest/GuestImage.hpp
+index 8325e82..d2bde1d 100644
+--- a/core/relinker/relinker/include/relinker/guest/GuestImage.hpp
++++ b/core/relinker/relinker/include/relinker/guest/GuestImage.hpp
+@@ -35,6 +35,9 @@ struct GuestImage {
+     std::vector<std::uint64_t> FiniArray;
+     std::uint64_t Init = 0;
+     std::uint64_t Fini = 0;
++    // PS4 modules can place DT_INIT/DT_FINI at address 0, so presence is tracked separately from the value.
++    bool HasInit = false;
++    bool HasFini = false;
+     std::uint64_t Got = 0;
+     bool UsePlatformTlsResolver = true;
+ };
+diff --git a/core/relinker/relinker/include/relinker/pipeline/RelinkerPipeline.hpp b/core/relinker/relinker/include/relinker/pipeline/RelinkerPipeline.hpp
+index b00c7bd..2b4dd23 100644
+--- a/core/relinker/relinker/include/relinker/pipeline/RelinkerPipeline.hpp
++++ b/core/relinker/relinker/include/relinker/pipeline/RelinkerPipeline.hpp
+@@ -30,6 +30,7 @@ private:
+ 
+     static constexpr std::uint32_t PT_LOAD = 1;
+     static constexpr std::uint32_t PT_DYNAMIC = 2;
++    static constexpr std::uint32_t PT_SCE_DYNLIBDATA = 0x61000000;
+     static constexpr std::uint32_t PF_X = 0x1;
+ 
+     static constexpr std::int64_t DT_NEEDED = 0x00000001;
+diff --git a/core/relinker/relinker/src/analysis/CallSiteResolver.cpp b/core/relinker/relinker/src/analysis/CallSiteResolver.cpp
+index 39e2049..39adcbe 100644
+--- a/core/relinker/relinker/src/analysis/CallSiteResolver.cpp
++++ b/core/relinker/relinker/src/analysis/CallSiteResolver.cpp
+@@ -75,7 +75,7 @@ private:
+ std::vector<FileByteOffset> CallSiteResolver::ResolveCallSites(const std::vector<std::uint8_t>& textSection, const FileByteOffset textSectionVAddr, const VirtualAddress targetGotOrPltAddress, const ByteCount targetGotOrPltSize) {
+     if (textSection.empty()) return {};
+     if (_cachedTextPtr != &textSection) {
+-        auto scanner = Codegen::MakeInstructionScanner();
++        auto scanner = Codegen::MakeResyncingInstructionScanner();
+         auto instructions = scanner->ScanCodeSection(textSection, textSectionVAddr, textSection.size());
+         _cachedTargetToInstr.clear();
+         for (const auto& m : instructions) {
+diff --git a/core/relinker/relinker/src/analysis/CodeInstructionCollector.cpp b/core/relinker/relinker/src/analysis/CodeInstructionCollector.cpp
+index 0b009c3..71f123f 100644
+--- a/core/relinker/relinker/src/analysis/CodeInstructionCollector.cpp
++++ b/core/relinker/relinker/src/analysis/CodeInstructionCollector.cpp
+@@ -4,6 +4,8 @@
+ #include <codegen/x86/X64InstructionDecoder.hpp>
+ #include <codegen/CodegenException.hpp>
+ #include <io/BufferUtils.hpp>
++#include <algorithm>
++#include <iostream>
+ #include <limits>
+ #include <map>
+ #include <string>
+@@ -121,6 +123,9 @@ std::set<Domain::VirtualAddress> CodeInstructionCollector::Collect(const std::ve
+     }
+     CodePointers pointers;
+     std::set<std::uint64_t> importSlots;
++    // PS4 images keep read-only data (strings, tables) in the executable segment, so a relocated pointer
++    // into it is not necessarily code. Such pointers become roots only if they land inside a known function.
++    std::set<std::uint64_t> pointerTargets;
+     const auto readRelocations = [&](std::uint64_t addressTag, std::uint64_t sceAddressTag, std::uint64_t sizeTag, std::uint64_t sceSizeTag) {
+         const auto size = value(sizeTag, sceSizeTag);
+         if (!size) return;
+@@ -135,7 +140,7 @@ std::set<Domain::VirtualAddress> CodeInstructionCollector::Collect(const std::ve
+             const auto addend = Io::ReadU64(bytes, offset + 16);
+             if (type == 8) {
+                 if (index != 0 || !pointers.Values.emplace(slot, addend).second) throw Domain::RelinkerException("Code analysis: invalid relative relocation", slot);
+-                addRoot(addend);
++                pointerTargets.insert(addend);
+             } else if (type == 1 || type == 6 || type == 7) {
+                 if (index == 0 || index >= symbolCount) throw Domain::RelinkerException("Code analysis: invalid relocation symbol", slot);
+                 const auto symbol = symbols + index * 24;
+@@ -143,7 +148,7 @@ std::set<Domain::VirtualAddress> CodeInstructionCollector::Collect(const std::ve
+                 else {
+                     const auto target = Io::ReadU64(bytes, symbol + 8) + addend;
+                     if (!pointers.Values.emplace(slot, target).second) throw Domain::RelinkerException("Code analysis: duplicate pointer relocation", slot);
+-                    addRoot(target);
++                    pointerTargets.insert(target);
+                 }
+             }
+         }
+@@ -170,12 +175,22 @@ std::set<Domain::VirtualAddress> CodeInstructionCollector::Collect(const std::ve
+         addFunction(function.Begin, function.End - function.Begin);
+         for (const auto target : function.ExtraTargets) addRoot(target);
+     }
++    for (const auto target : pointerTargets) {
++        if (functions.empty()) { addRoot(target); continue; }
++        auto containing = functions.upper_bound(target);
++        if (containing == functions.begin()) continue;
++        --containing;
++        if (target < containing->second) addRoot(target);
++    }
+     if (roots.empty()) throw Domain::RelinkerException("Code analysis: no code entry points");
+     std::set<std::uint64_t> instructions;
+     const Codegen::X64InstructionDecoder decoder;
+     for (const auto& [begin, end] : functions) {
+         const auto offset = fileOffset(begin, end - begin);
+         for (auto address = begin; address < end;) {
++            // Function ranges can include alignment padding (nop/int3/zero bytes); it is not code.
++            const auto* rest = bytes.data() + offset + address - begin;
++            if (std::all_of(rest, rest + (end - address), [](const std::uint8_t b) { return b == 0x00 || b == 0x90 || b == 0xcc; })) break;
+             Codegen::DecodedInstructionInfo info;
+             try {
+                 info = decoder.DecodeInstruction(bytes.data() + offset + address - begin, end - address);
+@@ -209,9 +224,20 @@ std::set<Domain::VirtualAddress> CodeInstructionCollector::Collect(const std::ve
+             }
+         }
+     } while (roots.size() != previousRoots);
++    // Fall-through after calls to no-return functions can decode alignment padding that runs into the next
++    // function. On overlap, a known entry point wins; otherwise the instruction decoded first is kept.
++    std::set<std::uint64_t> resolved;
++    std::uint64_t previousAddress = 0;
+     std::uint64_t previousEnd = 0;
++    std::size_t overlaps = 0;
+     for (const auto address : instructions) {
+-        if (address < previousEnd) throw Domain::RelinkerException("Code analysis: overlapping instruction boundaries", address);
++        if (address < previousEnd) {
++            ++overlaps;
++            if (!roots.contains(address)) continue;
++            resolved.erase(previousAddress);
++        }
++        resolved.insert(address);
++        previousAddress = address;
+         for (const auto& header : headers) {
+             if (header.Type != 1 || (header.Flags & 1) == 0 || address < header.MappedAddress || address - header.MappedAddress >= header.FileSize) continue;
+             const auto offset = address - header.MappedAddress;
+@@ -219,7 +245,8 @@ std::set<Domain::VirtualAddress> CodeInstructionCollector::Collect(const std::ve
+             break;
+         }
+     }
+-    return instructions;
++    if (overlaps != 0) std::cerr << "warning: code analysis resolved " << overlaps << " overlapping instruction decodings\n";
++    return resolved;
+ }
+ 
+ }
+diff --git a/core/relinker/relinker/src/guest/GuestImageReader.cpp b/core/relinker/relinker/src/guest/GuestImageReader.cpp
+index 4e8e5cf..4af3f64 100644
+--- a/core/relinker/relinker/src/guest/GuestImageReader.cpp
++++ b/core/relinker/relinker/src/guest/GuestImageReader.cpp
+@@ -122,7 +122,13 @@ GuestImage GuestImageReader::Read(const std::filesystem::path& path, std::vector
+     for (std::uint64_t offset = 0; offset < symSize; offset += 24) {
+         auto name = string(Io::ReadU32(bytes, symOffset + offset));
+         name = name.substr(0, name.find('#'));
+-        const auto info = bytes[symOffset + offset + 4];
++        auto info = bytes[symOffset + offset + 4];
++        // PS4 system modules each carry a module-info record as an STT_SCE (type 11) symbol with the same
++        // NID; only the loader reads it, so keep it as a local object rather than an export.
++        if ((info & 15) == 11) {
++            info = 1;
++            image.Dynamic.DynSymData[offset + 4] = info;
++        }
+         const auto visibility = bytes[symOffset + offset + 5];
+         const auto section = Io::ReadU16(bytes, symOffset + offset + 6);
+         const auto value = Io::ReadU64(bytes, symOffset + offset + 8);
+@@ -132,7 +138,9 @@ GuestImage GuestImageReader::Read(const std::filesystem::path& path, std::vector
+             image.Symbols.push_back({{}, 0, 0, 0, 0, 0});
+             continue;
+         }
+-        if (offset != 0 && ((info >> 4) > 2 || (visibility & ~3u) != 0 || ((info & 15) != 0 && (info & 15) != 1 && (info & 15) != 2 && (info & 15) != 6))) fail("Unsupported symbol attributes: " + name);
++        // PS4 modules carry an empty, undefined local STT_SECTION placeholder at index 1; it binds nothing.
++        const bool sectionPlaceholder = (info & 15) == 3 && (info >> 4) == 0 && section == 0 && value == 0 && size == 0 && name.empty();
++        if (offset != 0 && !sectionPlaceholder && ((info >> 4) > 2 || (visibility & ~3u) != 0 || ((info & 15) != 0 && (info & 15) != 1 && (info & 15) != 2 && (info & 15) != 6))) fail("Unsupported symbol attributes: " + name);
+         if (section != 0 && (info >> 4) != 0 && visibility != 1 && visibility != 2) {
+             if (name.empty() || !exports.insert(name).second) fail("Duplicate or empty export after stripping #: " + name);
+         }
+@@ -164,8 +172,16 @@ GuestImage GuestImageReader::Read(const std::filesystem::path& path, std::vector
+         const auto offset = table(addressTag, sceAddressTag, size);
+         output.assign(bytes.begin() + offset, bytes.begin() + offset + size);
+         for (std::uint64_t index = 0; index < size; index += 24) {
+-            const auto info = Io::ReadU64(output, index + 8);
++            auto info = Io::ReadU64(output, index + 8);
+             const auto relocation = static_cast<std::uint32_t>(info);
++            // PS4 modules point module-local TLS relocations at the section placeholder; that means "this module", as symbol 0 does.
++            if ((relocation == 16 || relocation == 17 || relocation == 18) && (info >> 32) != 0 && (info >> 32) < image.Symbols.size()) {
++                const auto& symbol = image.Symbols[info >> 32];
++                if ((symbol.Info & 15) == 3 && (symbol.Info >> 4) == 0 && symbol.Section == 0 && symbol.Name.empty()) {
++                    info = relocation;
++                    Io::WriteU64(output, index + 8, info);
++                }
++            }
+             if ((info >> 32) >= image.Symbols.size() || (plt && relocation != 7) || (relocation != 1 && relocation != 6 && relocation != 7 && relocation != 8 && relocation != 16 && relocation != 17 && relocation != 18)) fail("Unsupported relocation or symbol index");
+             const auto target = Io::ReadU64(output, index);
+             const auto addend = Io::ReadU64(output, index + 16);
+@@ -192,10 +208,10 @@ GuestImage GuestImageReader::Read(const std::filesystem::path& path, std::vector
+     copyRelocations(23, 0x61000029, 2, 0x6100002d, image.Dynamic.RelaPltData, true);
+     if (!image.Dynamic.RelaPltData.empty() && get(20, 0x6100002b) != 7) fail("Unsupported PLT relocation format");
+     if (tags.contains(3) || tags.contains(0x61000027)) image.Got = get(3, 0x61000027);
+-    if (tags.contains(12)) image.Init = tags.at(12);
+-    if (tags.contains(13)) image.Fini = tags.at(13);
+-    if (image.Init != 0) mapped(image.Init, 1, 1);
+-    if (image.Fini != 0) mapped(image.Fini, 1, 1);
++    if (tags.contains(12)) { image.Init = tags.at(12); image.HasInit = true; }
++    if (tags.contains(13)) { image.Fini = tags.at(13); image.HasFini = true; }
++    if (image.HasInit) mapped(image.Init, 1, 1);
++    if (image.HasFini) mapped(image.Fini, 1, 1);
+     const auto readLifecycleArray = [&](std::uint64_t addressTag, std::uint64_t sizeTag, std::vector<std::uint64_t>& entries) {
+         if (!tags.contains(addressTag) && !tags.contains(sizeTag)) return;
+         if (!tags.contains(sizeTag) || (tags.at(sizeTag) != 0 && !tags.contains(addressTag))) fail("Incomplete guest lifecycle array");
+@@ -228,7 +244,7 @@ GuestImage GuestImageReader::Read(const std::filesystem::path& path, std::vector
+     };
+     readLifecycleArray(25, 27, image.InitArray);
+     readLifecycleArray(26, 28, image.FiniArray);
+-    if (tags.contains(33) && tags.at(33) != 0 && image.Init == 0) fail("Guest PREINIT_ARRAY has no module initializer");
++    if (tags.contains(33) && tags.at(33) != 0 && !image.HasInit) fail("Guest PREINIT_ARRAY has no module initializer");
+     image.Bytes = std::move(bytes);
+     return image;
+ }
+diff --git a/core/relinker/relinker/src/guest/GuestModuleBuilder.cpp b/core/relinker/relinker/src/guest/GuestModuleBuilder.cpp
+index fca6785..820a8b5 100644
+--- a/core/relinker/relinker/src/guest/GuestModuleBuilder.cpp
++++ b/core/relinker/relinker/src/guest/GuestModuleBuilder.cpp
+@@ -100,7 +100,12 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
+     std::vector<std::size_t> order;
+     std::vector<unsigned char> states(images.size());
+     const std::function<void(std::size_t)> visit = [&](std::size_t index) {
+-        if (states[index] == 1) throw Domain::RelinkerException("Cyclic guest initialization dependency: " + images[index].SourcePath.string());
++        // Mutually importing modules (e.g. PS4 libc.prx and libSceFios2.prx) are legal; like the console loader,
++        // break the cycle at the back edge and initialize in depth-first order.
++        if (states[index] == 1) {
++            std::cerr << "warning: cyclic guest initialization dependency through " << images[index].SourcePath.string() << "; using depth-first order\n";
++            return;
++        }
+         if (states[index] == 2) return;
+         states[index] = 1;
+         for (const auto dependency : dependencies[index]) visit(dependency);
+diff --git a/core/relinker/relinker/src/pipeline/RelinkerPipeline.cpp b/core/relinker/relinker/src/pipeline/RelinkerPipeline.cpp
+index 0ac6df6..64b3c8d 100644
+--- a/core/relinker/relinker/src/pipeline/RelinkerPipeline.cpp
++++ b/core/relinker/relinker/src/pipeline/RelinkerPipeline.cpp
+@@ -65,6 +65,15 @@ RelinkResult RelinkerPipeline::Relink(const std::vector<std::uint8_t>& sourceElf
+     if (!hasDynamicSegment)
+         throw RelinkerException("No PT_DYNAMIC segment found");
+ 
++    // DT_OS_* table values are offsets relative to PT_SCE_DYNLIBDATA, not file offsets.
++    FileByteOffset sceDynlibBase = 0;
++    for (const auto& ph : programHeaders) {
++        if (ph.Type == PT_SCE_DYNLIBDATA) {
++            sceDynlibBase = ph.Offset;
++            break;
++        }
++    }
++
+     auto hasTag = [&](const std::int64_t tag) {
+         for (const auto& t : dynTags)
+             if (t.Tag == tag)
+@@ -91,7 +100,7 @@ RelinkResult RelinkerPipeline::Relink(const std::vector<std::uint8_t>& sourceElf
+ 
+     auto readAsOffset = [&](const std::int64_t osTag, const std::int64_t sysvTag, const char* name) -> FileByteOffset {
+         if (requireExactlyOneOf(osTag, sysvTag, name))
+-            return getTagValue(osTag);
++            return sceDynlibBase + getTagValue(osTag);
+         return _elfReader->TranslateVirtualAddress(getTagValue(sysvTag));
+     };
+ 
+diff --git a/core/shader/recompiler/CMakeLists.txt b/core/shader/recompiler/CMakeLists.txt
+index e37bef9..17dd91c 100644
+--- a/core/shader/recompiler/CMakeLists.txt
++++ b/core/shader/recompiler/CMakeLists.txt
+@@ -134,9 +134,11 @@ function(add_shader_recompiler target runtimeTarget)
+             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/SpirvBackend/src/SpirvMemory/SpirvTypes.cpp
+             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/SpirvBackend/src/SpirvMemory/SpirvEmitterHelpers.cpp
+             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/SpirvBackend/src/SpirvMemory/SpirvMemoryInstructions.cpp
+-
+-            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/DummyShaders.cpp
+     )
++    # tests/DummyShaders.cpp is not published with the repository.
++    if(EXISTS "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/DummyShaders.cpp")
++        target_sources(${target} PRIVATE "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/DummyShaders.cpp")
++    endif()
+ 
+     target_include_directories(${target} PUBLIC
+             ${PROJECT_SOURCE_DIR}/core/libs

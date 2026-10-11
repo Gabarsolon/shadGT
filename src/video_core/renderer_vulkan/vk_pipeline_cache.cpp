@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <array>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
@@ -10,6 +12,10 @@
 #include <mutex>
 #include <ranges>
 #include <sstream>
+#include <chrono>
+#include <thread>
+#include <string>
+#include <unordered_map>
 
 #include "common/elf_info.h"
 #include "common/guest_clock.h"
@@ -37,8 +43,15 @@
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
+#include "video_core/renderer_vulkan/vk_rasterizer.h"
 
 namespace Vulkan {
+
+static bool SaneTessConstants(const Shader::Info& hull, const AmdGpu::Liverpool* liverpool,
+                              bool read_ahead); // FIX-058
+#ifdef RYTY_GPU
+void RytyWatchWrites(std::uint64_t address, std::uint32_t ms, std::string label); // DIAG-067
+#endif
 
 // PERF-019: worker threads that build graphics pipelines ahead of the draws that need them.
 // PERF-038: stored pipelines are built in the background on a few of them, at low priority.
@@ -119,6 +132,8 @@ struct PipelineCache::PipelineBuild {
     bool urgent{};
     // PERF-038: a stored pipeline built in the background (no runtime shader state needed).
     bool preloading{};
+    // PERF-076: a new pipeline its draws skip until a worker has built it.
+    bool async{};
     // Whoever sets this first builds the pipeline: a worker, or the command thread when a
     // draw needs it before a worker got to it.
     std::atomic<bool> started{};
@@ -209,7 +224,9 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
         BuildCommon(regs.ls_program);
         Shader::TessellationDataConstantBuffer tess_constants{};
         const auto* hull_info = infos[u32(SwStage::TessellationControl)];
-        hull_info->ReadTessConstantBuffer(tess_constants);
+        if (hull_info) { // FIX-058: no hull info when its draw is skipped
+            hull_info->ReadTessConstantBuffer(tess_constants);
+        }
         info.hw.ls.ls_stride = tess_constants.ls_stride;
         break;
     }
@@ -927,6 +944,102 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         Common::GuestClock::CompilePause hold; // FIX-044
         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
         LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
+        // DIAG-050: the parts of new keys of tessellated pipelines (GT Sport's race summary built
+        // hundreds of keys for the same few programs).
+        // DIAG-051: which part of a new key differs from the last key with the same stages
+        // (GT Sport's race summary asks for thousands of new pipelines).
+        {
+            static std::unordered_map<u64, GraphicsPipelineKey> last_by_stages;
+            static std::unordered_map<std::string, u32> diff_counts;
+            static u32 keys_seen = 0;
+            const u64 stages_hash = XXH3_64bits(graphics_key.stage_hashes.data(),
+                                                sizeof(graphics_key.stage_hashes));
+            auto [prev, first] = last_by_stages.try_emplace(stages_hash, graphics_key);
+            std::string fields = first ? "new stages" : "";
+            if (!first) {
+                const auto& a = prev->second;
+                const auto& b = graphics_key;
+                const auto differs = [&](const auto& x, const auto& y) {
+                    return std::memcmp(&x, &y, sizeof(x)) != 0;
+                };
+                const auto add = [&](const char* name) {
+                    fields += fields.empty() ? name : std::string(",") + name;
+                };
+                if (differs(a.vertex_buffer_formats, b.vertex_buffer_formats)) add("vtx");
+                if (a.patch_control_points != b.patch_control_points) add("pcp");
+                if (a.num_color_attachments != b.num_color_attachments) add("ncb");
+                if (differs(a.color_buffers, b.color_buffers)) add("cb");
+                if (differs(a.blend_controls, b.blend_controls)) add("blend");
+                if (differs(a.write_masks, b.write_masks)) add("mask");
+                if (differs(a.cb_shader_mask, b.cb_shader_mask)) add("shmask");
+                if (a.logic_op != b.logic_op) add("logic");
+                if (a.num_samples != b.num_samples || a.depth_samples != b.depth_samples ||
+                    differs(a.color_samples, b.color_samples)) add("samples");
+                if (a.mrt_mask != b.mrt_mask) add("mrt");
+                if (a.z_format != b.z_format || a.stencil_format != b.stencil_format ||
+                    a.depth_clamp_enable != b.depth_clamp_enable) add("depth");
+                if (a.prim_type != b.prim_type || a.polygon_mode != b.polygon_mode ||
+                    a.clip_space != b.clip_space || a.provoking_vtx_last != b.provoking_vtx_last ||
+                    a.depth_clip_enable != b.depth_clip_enable) add("raster");
+                if (fields.empty()) {
+                    add("padding");
+                    static u32 logged = 0;
+                    if (logged++ < 10) {
+                        const auto* x = reinterpret_cast<const u8*>(&a);
+                        const auto* y = reinterpret_cast<const u8*>(&b);
+                        std::string offsets;
+                        for (size_t i = 0; i < sizeof(GraphicsPipelineKey); ++i) {
+                            if (x[i] != y[i]) {
+                                offsets += fmt::format(" {}:{:02x}/{:02x}", i, x[i], y[i]);
+                            }
+                        }
+                        LOG_WARNING(Render_Vulkan,
+                                    "DIAG-051: keys differ only outside named fields (size {}, "
+                                    "color_buffers at {}, mrt_mask at {}):{}",
+                                    sizeof(GraphicsPipelineKey),
+                                    offsetof(GraphicsPipelineKey, color_buffers),
+                                    offsetof(GraphicsPipelineKey, mrt_mask), offsets);
+                    }
+                }
+                prev->second = graphics_key;
+            }
+            ++diff_counts[fields];
+            if (++keys_seen % 250 == 0) {
+                std::string summary;
+                for (const auto& [name, count] : diff_counts) {
+                    summary += fmt::format(" {}={}", name, count);
+                }
+                LOG_WARNING(Render_Vulkan, "DIAG-051: {} new keys; differences from the last "
+                            "key with the same stages:{}", keys_seen, summary);
+            }
+        }
+        // SHADGT_LOG_KEYS=1 logs every new key the same way (up to 5000).
+        static const bool log_all_keys = [] {
+            const char* env = std::getenv("SHADGT_LOG_KEYS");
+            return env && env[0] == '1';
+        }();
+        if (log_all_keys ||
+            graphics_key.stage_hashes[u32(Shader::SwStage::TessellationControl)] != 0) {
+            static std::atomic<u32> logged{};
+            if (const u32 n = ++logged; n <= (log_all_keys ? 5000u : 80u)) {
+                const auto& k = graphics_key;
+                const auto part = [](const auto& field) {
+                    return XXH3_64bits(&field, sizeof(field)) & 0xffff;
+                };
+                LOG_WARNING(Render_Vulkan,
+                            "DIAG-050: new key {} {:#x}: stages {:#x} {:#x} {:#x} {:#x} {:#x}; "
+                            "pcp {} prim {} vtx {:#x} cb {:#x} blend {:#x} mask {:#x} "
+                            "shmask {:#x} samples {} {} mrt {:#x} z {} clip {}; all {:#x}",
+                            n, pipeline_hash, k.stage_hashes[0], k.stage_hashes[1],
+                            k.stage_hashes[2], k.stage_hashes[3], k.stage_hashes[4],
+                            k.patch_control_points,
+                            u32(k.prim_type), part(k.vertex_buffer_formats), part(k.color_buffers),
+                            part(k.blend_controls), part(k.write_masks), part(k.cb_shader_mask),
+                            k.num_samples, k.depth_samples, k.mrt_mask, u32(k.z_format),
+                            u32(k.depth_clip_enable),
+                            XXH3_64bits(&k, sizeof(k)) & 0xffffff);
+            }
+        }
 
         GraphicsPipeline::SerializationSupport sdata{};
         // PERF-019: the pipeline may already be building from an earlier read-ahead. If not,
@@ -935,7 +1048,8 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         std::shared_ptr<PipelineBuild> build;
         bool predicted = false;
         auto pending = pending_builds.find(graphics_key);
-        if (pending != pending_builds.end() && pending->second->preloading) {
+        if (pending != pending_builds.end() &&
+            (pending->second->preloading || pending->second->async)) {
             auto stored = pending->second;
             if (stored->done.wait_for(std::chrono::seconds{0}) == std::future_status::ready) {
                 // PERF-038: built in the background before the draw needed it; no miss.
@@ -943,10 +1057,16 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
                 stored->pipeline->SetStageInfos(infos);
                 sdata = stored->sdata;
                 it.value() = std::move(stored->pipeline);
-                ++prewarm_stats.hits;
+                ++(stored->async ? async_stats.installed : prewarm_stats.hits);
                 // Stored again, so the next session builds it among the first.
                 RegisterPipelineData(graphics_key, pipeline_hash, sdata);
                 return it->second.get();
+            }
+            if (stored->async && !WritesMemory(infos) && !NeverSkipped(infos)) {
+                // PERF-076: still building; this draw is skipped, the next ones look again.
+                graphics_pipelines.erase(it);
+                ++async_stats.skipped_draws;
+                return nullptr;
             }
             if (CancelBuild(*stored)) {
                 // Not started in the background yet: built now the usual way.
@@ -987,6 +1107,19 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
             // PERF-034: a worker builds it while this thread starts the builds the command
             // thread's read-ahead queues meanwhile.
             build = StartPipelineBuild(true);
+        }
+        // PERF-076: a draw does not wait for a new pipeline. Its build goes on on a worker, the
+        // draws that need it are skipped until it is done (a frame or two of a missing object),
+        // and the game does not stall for the 60-140 ms a build takes. SHADGT_ASYNC_PIPELINES=0
+        // or -DisablePerf 76 waits as before.
+        if (build && AsyncPipelines() && !WritesMemory(infos) && !NeverSkipped(infos) &&
+            build->done.wait_for(std::chrono::seconds{0}) != std::future_status::ready) {
+            build->async = true;
+            pending_builds[graphics_key] = build;
+            graphics_pipelines.erase(it);
+            ++async_stats.deferred;
+            ++async_stats.skipped_draws;
+            return nullptr;
         }
         if (build) {
             const auto wait_start = std::chrono::steady_clock::now();
@@ -1354,6 +1487,10 @@ bool PipelineCache::RefreshGraphicsStages() {
         if (!bind_stage(HwStage::Hull, SwStage::TessellationControl)) {
             return false;
         }
+        if (const auto* hull = infos[u32(SwStage::TessellationControl)];
+            !hull || !SaneTessConstants(*hull, liverpool, regs_override != nullptr)) {
+            return false; // FIX-058: the local stage reads the hull's constants
+        }
         if (!bind_stage(HwStage::Vertex, SwStage::TessellationEval)) {
             return false;
         }
@@ -1375,6 +1512,10 @@ bool PipelineCache::RefreshGraphicsStages() {
         }
         if (!bind_stage(HwStage::Hull, SwStage::TessellationControl)) {
             return false;
+        }
+        if (const auto* hull = infos[u32(SwStage::TessellationControl)];
+            !hull || !SaneTessConstants(*hull, liverpool, regs_override != nullptr)) {
+            return false; // FIX-058: the local stage reads the hull's constants
         }
         if (!bind_stage(HwStage::Export, SwStage::TessellationEval)) {
             return false;
@@ -1812,10 +1953,65 @@ bool PipelineCache::InstallPrewarmRecord(PrewarmRecord& record) {
     return true;
 }
 
+bool PipelineCache::NeverSkipped(const std::array<const Shader::Info*, MaxShaderStages>& infos) {
+    // FIX-064: tessellated draws wait for their pipeline. On GT Sport's race summary they are
+    // the driver figure; skipped while each of its pipelines built, parts of it blinked out
+    // frame after frame. -DisablePerf 88 skips them like other draws.
+    static const bool wait_for_tessellation = Common::PerfFeatureEnabled(88);
+    return wait_for_tessellation && infos[u32(Shader::SwStage::TessellationControl)] != nullptr;
+}
+
+bool PipelineCache::WritesMemory(const std::array<const Shader::Info*, MaxShaderStages>& infos) {
+    // PERF-076: a draw that writes buffers or images is never skipped. GT Sport's results screen
+    // writes data later draws read as vertex descriptors; skipping those draws left garbage
+    // there and the renderer ran out of memory on it.
+    for (const auto* info : infos) {
+        if (!info) {
+            continue;
+        }
+        if (info->has_storage_images) {
+            return true;
+        }
+        for (const auto& buffer : info->buffers) {
+            if (buffer.is_written) {
+                return true;
+            }
+        }
+        for (const auto& image : info->images) {
+            if (image.is_written) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool PipelineCache::AsyncPipelines() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("SHADGT_ASYNC_PIPELINES");
+#ifdef RYTY_GPU
+        const bool by_default = true;
+#else
+        const bool by_default = false;
+#endif
+        const bool on = env ? env[0] != '0' : by_default;
+        return on && Common::PerfFeatureEnabled(76);
+    }();
+    return enabled;
+}
+
 void PipelineCache::ReportPrewarm(std::chrono::steady_clock::time_point now) {
     auto& stats = prewarm_stats;
     if (now - stats.since < std::chrono::seconds{2}) {
         return;
+    }
+    if (async_stats.deferred + async_stats.installed + async_stats.skipped_draws != 0) {
+        LOG_WARNING(Render_Vulkan,
+                    "PERF-076 background pipelines in {:.1f} s: {} new ones built without a wait, "
+                    "{} ready and installed, {} draws skipped meanwhile",
+                    std::chrono::duration<double>(now - stats.since).count(),
+                    async_stats.deferred, async_stats.installed, async_stats.skipped_draws);
+        async_stats = {};
     }
     const u64 built = prewarm_built.load();
     if (stats.installed + stats.hits + stats.cancelled + stats.promoted != 0 ||
@@ -1926,6 +2122,321 @@ void PipelineCache::SaveElseScopeFixed() const {
     }
 }
 
+// FIX-058: GT Sport's race summary draws tessellated objects whose tessellation constants are
+// garbage (strides of hundreds of MB). Hull shaders translated from them declared arrays of 200
+// million entries, and the driver ran out of memory compiling their pipelines (the process went
+// from 11 GB to 100 GB in seconds; the driver figure flickered while they built). Constants are
+// sane when they fit the 64 KB of LDS they describe; draws with others are skipped.
+// -DisablePerf 82 draws them.
+// DIAG-063: the tessellation-constant V#s (HS user data 7..10) an indirect buffer sets, read
+// from a copy of it.
+static std::vector<VAddr> TessBasesInIb(const u32* data, u32 dwords) {
+    std::vector<u32> ib(dwords);
+    Common::CopyGuest(ib.data(), data, ib.size() * sizeof(u32));
+    std::vector<VAddr> bases;
+    std::array<u32, 16> hs{};
+    constexpr u32 HsUserData = 0x2D0C;
+    const auto apply = [&](u32 first, std::span<const u32> values) {
+        bool touched = false;
+        for (u32 i = 0; i < values.size(); ++i) {
+            if (first + i >= HsUserData + 7 && first + i < HsUserData + 11) {
+                hs[first + i - HsUserData] = values[i];
+                touched = true;
+            }
+        }
+        if (touched && hs[9] == 3) {
+            bases.push_back((VAddr(hs[8] & 0xffff) << 32) | hs[7]);
+        }
+    };
+    std::span<const u32> rest{ib};
+    while (!rest.empty()) {
+        const u32 type = rest.front() >> 30;
+        if (type == 2) {
+            rest = rest.subspan(1);
+        } else if (type == 0) {
+            const u32 first = rest.front() & 0xffff;
+            const u32 count = ((rest.front() >> 16) & 0x3fff) + 1;
+            if (count + 1 > rest.size()) {
+                break;
+            }
+            apply(first, rest.subspan(1, count));
+            rest = rest.subspan(count + 1);
+        } else if (type == 3) {
+            const u32 count = ((rest.front() >> 16) & 0x3fff) + 1;
+            const u32 opcode = (rest.front() >> 8) & 0xff;
+            if (count + 1 > rest.size()) {
+                break;
+            }
+            if (opcode == 0x76 && count >= 1) { // SET_SH_REG
+                apply(0x2C00 + (rest[1] & 0xffff), rest.subspan(2, count - 1));
+            }
+            rest = rest.subspan(count + 1);
+        } else {
+            break;
+        }
+    }
+    return bases;
+}
+
+// DIAG-063: whether the indirect buffer a draw came from changes after it was decoded, and the
+// constant V#s it sets before and after.
+static void WatchIbAfterDecode(u32 n, bool sane, VAddr base) {
+    const auto [ib, dwords] = AmdGpu::Liverpool::CurrentDecodeIb();
+    if (!ib || dwords == 0 || dwords > 4'000'000) {
+        LOG_WARNING(Render_Vulkan, "DIAG-063: {} draw {}: not inside an indirect buffer",
+                    sane ? "sane" : "garbage", n);
+        return;
+    }
+    std::vector<u32> before(dwords);
+    Common::CopyGuest(before.data(), ib, before.size() * sizeof(u32));
+    const auto bases_before = TessBasesInIb(ib, dwords);
+    static std::atomic<u32> dumps{};
+    if ((!sane || n == 5000) && dumps.fetch_add(1) < 6) {
+        // DIAG-064: the indirect buffer and 64 KB around the constants, for offline study.
+        const auto dir = Common::FS::GetUserPath(Common::FS::PathType::LogDir);
+        const auto name = fmt::format("tess_{}_{}", sane ? "sane" : "garbage", n);
+        if (std::ofstream f{dir / (name + "_ib.bin"), std::ios::binary}) {
+            f.write(reinterpret_cast<const char*>(before.data()), before.size() * sizeof(u32));
+        }
+        std::vector<u8> around(64_KB);
+        const VAddr from = base - 32_KB;
+        Common::CopyGuest(around.data(), reinterpret_cast<const void*>(from), around.size());
+        if (std::ofstream f{dir / (name + "_mem.bin"), std::ios::binary}) {
+            f.write(reinterpret_cast<const char*>(around.data()), around.size());
+        }
+        LOG_WARNING(Render_Vulkan, "DIAG-064: {} draw {}: indirect buffer {:#x} ({} dwords) and "
+                                   "memory from {:#x} saved as {}_*.bin",
+                    sane ? "sane" : "garbage", n, reinterpret_cast<VAddr>(ib), dwords, from,
+                    name);
+    }
+    std::thread([n, sane, base, ib, dwords, before = std::move(before), bases_before] {
+        std::string timeline;
+        for (const u32 ms : {1u, 3u, 10u, 30u}) {
+            std::this_thread::sleep_until(std::chrono::steady_clock::now() +
+                                          std::chrono::milliseconds(ms));
+            std::vector<u32> now(dwords);
+            Common::CopyGuest(now.data(), ib, now.size() * sizeof(u32));
+            size_t first_diff = dwords;
+            for (size_t i = 0; i < dwords; ++i) {
+                if (now[i] != before[i]) {
+                    first_diff = i;
+                    break;
+                }
+            }
+            std::array<u32, 7> c{};
+            Common::CopyGuest(c.data(), reinterpret_cast<const void*>(base), sizeof(c));
+            const bool constants_sane =
+                c[2] != 0 && std::ranges::all_of(c, [](u32 x) { return x <= 64_KB; });
+            timeline += fmt::format(" | +{} ms: ib {}, constants {}", ms,
+                                    first_diff == dwords
+                                        ? std::string("same")
+                                        : fmt::format("changed from dword {}", first_diff),
+                                    constants_sane ? "sane" : "garbage");
+        }
+        const auto bases_after = TessBasesInIb(ib, dwords);
+        const auto list = [](const std::vector<VAddr>& v) {
+            std::string out;
+            for (size_t i = 0; i < std::min<size_t>(v.size(), 8); ++i) {
+                out += fmt::format(" {:#x}", v[i]);
+            }
+            return out + (v.size() > 8 ? fmt::format(" (+{})", v.size() - 8) : "");
+        };
+        LOG_WARNING(Render_Vulkan,
+                    "DIAG-063: {} draw {} (constants {:#x}) in indirect buffer {:#x} ({} "
+                    "dwords){}; constant V#s in it at decoding:{}; 30 ms later:{}",
+                    sane ? "sane" : "garbage", n, base, reinterpret_cast<VAddr>(ib), dwords,
+                    timeline, list(bases_before), list(bases_after));
+    }).detach();
+}
+
+static bool SaneTessConstants(const Shader::Info& hull, const AmdGpu::Liverpool* liverpool,
+                              bool read_ahead) {
+    static const bool check = Common::PerfFeatureEnabled(82);
+    if (!check || hull.tess_consts_dword_offset < 0) {
+        return true;
+    }
+    const auto buf = hull.ReadUdReg<AmdGpu::Buffer>(static_cast<u32>(hull.tess_consts_ptr_base),
+                                                    static_cast<u32>(hull.tess_consts_dword_offset));
+    const VAddr base = buf.base_address;
+    Shader::TessellationDataConstantBuffer c{};
+#ifdef RYTY_GPU
+    if (base == 0 || !Core::RytyMemory::IsGuestReadable(base, sizeof(c))) {
+        return false;
+    }
+#endif
+    constexpr u32 Lds = 64_KB;
+    const auto is_sane = [&] {
+        return c.ls_stride <= Lds && c.hs_cp_stride <= Lds && c.num_patches != 0 &&
+               c.num_patches <= Lds && c.hs_output_base <= Lds && c.patch_const_size <= Lds &&
+               c.patch_const_base <= Lds && c.patch_output_size <= Lds;
+    };
+    Common::CopyGuest(&c, reinterpret_cast<const void*>(base), sizeof(c));
+    const bool sane = is_sane();
+    {
+        // DIAG-060: sane and garbage constants per hull program, every 5 s.
+        static std::mutex stats_mutex;
+        static std::unordered_map<u64, std::pair<u32, u32>> per_hull;
+        static u32 garbage_drawn{};
+        static u32 garbage_read_ahead{};
+        if (!sane) {
+            ++(read_ahead ? garbage_read_ahead : garbage_drawn);
+        }
+        static auto last = std::chrono::steady_clock::now();
+        std::scoped_lock lk{stats_mutex};
+        auto& [good, bad] = per_hull[hull.pgm_hash];
+        ++(sane ? good : bad);
+        if (const auto now = std::chrono::steady_clock::now(); now - last >= std::chrono::seconds{5}) {
+            last = now;
+            std::string line;
+            for (const auto& [hash, counts] : per_hull) {
+                if (counts.second != 0) {
+                    line += fmt::format(" {:#x}={}/{}", hash, counts.first, counts.second);
+                }
+            }
+            if (!line.empty()) {
+                LOG_WARNING(Render_Vulkan,
+                            "DIAG-060: hulls with garbage constants (sane/garbage):{}; decoding "
+                            "submission {} of {}; garbage in {} draws, {} read-ahead states",
+                            line, liverpool ? liverpool->DecodingSubmit() : 0,
+                            liverpool ? liverpool->SubmittedCount() : 0, garbage_drawn,
+                            garbage_read_ahead);
+                garbage_drawn = 0;
+                garbage_read_ahead = 0;
+            }
+            per_hull.clear();
+        }
+    }
+#ifdef RYTY_GPU
+    if (sane && !read_ahead) {
+        // DIAG-067: who writes these constants next, and when (SHADGT_WATCH_TESS=<ms>).
+        static const u32 watch_ms = [] {
+            const char* env = std::getenv("SHADGT_WATCH_TESS");
+            return env ? static_cast<u32>(std::strtoul(env, nullptr, 10)) : 0u;
+        }();
+        static auto next_watch = std::chrono::steady_clock::now();
+        if (watch_ms != 0 && std::chrono::steady_clock::now() >= next_watch) {
+            next_watch = std::chrono::steady_clock::now() + std::chrono::milliseconds{watch_ms + 50};
+            RytyWatchWrites(base, watch_ms,
+                            fmt::format("tessellation constants of hs {:#x} decoded in submission "
+                                        "{}; {}",
+                                        hull.pgm_hash, liverpool ? liverpool->DecodingSubmit() : 0,
+                                        AmdGpu::Liverpool::DescribeEops()));
+        }
+    }
+#endif
+    if (sane) {
+        // DIAG-059: what sane constants and their V#s look like, to compare with garbage ones.
+        static std::atomic<u32> sane_logged{};
+        if (const u32 n = ++sane_logged; n <= 40 || n % 5000 == 0) {
+            if (n % 5000 == 0 && std::getenv("SHADGT_TESS_SUBMIT_CHECK")) {
+                WatchIbAfterDecode(n, true, base);
+            }
+            const auto dump = liverpool ? liverpool->FindRecentConstDump(base, sizeof(c))
+                                        : std::nullopt;
+            const auto rec = AmdGpu::Liverpool::FindTessSubmit(base);
+            LOG_WARNING(Render_Vulkan, "DIAG-059: sane constants {}: {}; DIAG-061: {} at "
+                                       "submission {}, decoding {} of {}; DIAG-066: {}",
+                        n,
+                        dump ? fmt::format("CE dump {} of {}", dump->sequence,
+                                           liverpool->ConstDumpSequence())
+                             : std::string("not from a recent CE dump"),
+                        rec ? (rec->sane ? "sane" : "garbage") : "unseen", rec ? rec->submit : 0,
+                        liverpool ? liverpool->DecodingSubmit() : 0,
+                        liverpool ? liverpool->SubmittedCount() : 0,
+                        AmdGpu::Liverpool::DescribeEops());
+            LOG_WARNING(Render_Vulkan,
+                        "DIAG-059: sane tessellation constants {} of hs {:#x} at {:#x}: ls stride "
+                        "{:#x}, cp stride {:#x}, patches {:#x}, output base {:#x}, patch output "
+                        "size {:#x}; V# {:08x} {:08x} {:08x} {:08x}",
+                        n, hull.pgm_hash, base, c.ls_stride, c.hs_cp_stride, c.num_patches,
+                        c.hs_output_base, c.patch_output_size,
+                        reinterpret_cast<const u32*>(&buf)[0], reinterpret_cast<const u32*>(&buf)[1],
+                        reinterpret_cast<const u32*>(&buf)[2], reinterpret_cast<const u32*>(&buf)[3]);
+        }
+    }
+    if (!sane) {
+        static std::atomic<u32> logged{};
+        if (const u32 n = ++logged; n <= 60 || n % 100 == 0) {
+            if (n <= 40 && std::getenv("SHADGT_TESS_SUBMIT_CHECK")) {
+                WatchIbAfterDecode(n, false, base);
+            }
+            auto* rasterizer = Core::Memory::Instance()->GetRasterizer();
+            const bool gpu_written =
+                rasterizer && rasterizer->GetBufferCache().IsRegionGpuModified(base, sizeof(c));
+            // Where the V# itself was read: a table in memory the user data points to, or the
+            // user data registers.
+            VAddr table = 0;
+            if (u32(hull.tess_consts_ptr_base) != Shader::IR::NumScalarRegs &&
+                u32(hull.tess_consts_ptr_base) + 1 < hull.user_data.size()) {
+                std::memcpy(&table, &hull.user_data[u32(hull.tess_consts_ptr_base)], sizeof(table));
+                table &= 0xFFFFFFFFFFFFULL;
+                table += u64(hull.tess_consts_dword_offset) * 4;
+            }
+            const bool table_gpu_written =
+                rasterizer && table != 0 &&
+                rasterizer->GetBufferCache().IsRegionGpuModified(table, 16);
+            const auto dump = liverpool ? liverpool->FindRecentConstDump(base, sizeof(c))
+                                        : std::nullopt;
+            LOG_WARNING(Render_Vulkan,
+                        "FIX-058: constants of draw {}: {}", n,
+                        dump ? fmt::format("CE dump {} of {} (ce {} de {}) at {:#x}+{:#x}",
+                                           dump->sequence, liverpool->ConstDumpSequence(),
+                                           dump->ce_count, dump->de_count, dump->address,
+                                           dump->size)
+                             : std::string("not from a recent CE dump"));
+            if (liverpool) {
+                // DIAG-061: the same constants when the game submitted the draw.
+                const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now().time_since_epoch())
+                                    .count();
+                const auto cmd = liverpool->FindRecentCmdBuffer(base, sizeof(c));
+                const auto rec = AmdGpu::Liverpool::FindTessSubmit(base);
+                LOG_WARNING(Render_Vulkan,
+                            "DIAG-061: constants of draw {} {}; decoding submission {} of {}; "
+                            "inside a recent command buffer: {}; DIAG-062: its indirect buffer "
+                            "changed after submission: {}",
+                            n,
+                            rec ? fmt::format("were {} at submission {} ({:.1f} ms ago, ls stride "
+                                              "{:#x}{})",
+                                              rec->sane ? "sane" : "garbage", rec->submit,
+                                              (now - rec->time_ns) / 1e6, rec->ls_stride,
+                                              rec->in_cmd_buffer ? ", in its command buffer" : "")
+                                : std::string("were not seen at any submission"),
+                            liverpool->DecodingSubmit(), liverpool->SubmittedCount(),
+                            cmd ? fmt::format("yes ({} of {})", cmd->sequence,
+                                              liverpool->CmdBufferSequence())
+                                : std::string("no"),
+                            AmdGpu::Liverpool::CurrentIbChangedSinceSubmit());
+            }
+            // DIAG-065: the renderer's own recent writes over the constants (readbacks, fault
+            // flushes, CP writes), newest last.
+            LOG_WARNING(Render_Vulkan, "DIAG-065: emulator writes over the constants of draw {}:{}",
+                        n, Core::Memory::Instance()->DescribeBackingWrites(base, 0));
+            LOG_WARNING(Render_Vulkan, "DIAG-066: draw {} decoded in submission {} of {}; {}", n,
+                        liverpool ? liverpool->DecodingSubmit() : 0,
+                        liverpool ? liverpool->SubmittedCount() : 0,
+                        AmdGpu::Liverpool::DescribeEops());
+            LOG_WARNING(Render_Vulkan,
+                        "FIX-058: V# of draw {} read from {} {:#x} (GPU-written: {}); user data "
+                        "regs {} (ptr base {}, dword {})",
+                        n, table ? "memory" : "user data", table, table_gpu_written,
+                        hull.user_data.size(), u32(hull.tess_consts_ptr_base),
+                        hull.tess_consts_dword_offset);
+            LOG_WARNING(Render_Vulkan,
+                        "FIX-058: skipping tessellated {} {} of hs {:#x}: constants at {:#x} "
+                        "are garbage (ls stride {:#x}, cp stride {:#x}, patches {:#x}, output "
+                        "base {:#x}, patch output size {:#x}); GPU-written: {}; V# {:08x} "
+                        "{:08x} {:08x} {:08x}",
+                        read_ahead ? "read-ahead state" : "draw", n, hull.pgm_hash, base,
+                        c.ls_stride, c.hs_cp_stride, c.num_patches,
+                        c.hs_output_base, c.patch_output_size, gpu_written,
+                        reinterpret_cast<const u32*>(&buf)[0], reinterpret_cast<const u32*>(&buf)[1],
+                        reinterpret_cast<const u32*>(&buf)[2], reinterpret_cast<const u32*>(&buf)[3]);
+        }
+    }
+    return sane;
+}
+
 PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_stage,
                                                 const Shader::ShaderParams& params,
                                                 Shader::Backend::Bindings& binding) {
@@ -2005,6 +2516,7 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
             flats.push_back(i < memo.flats.size() ? memo.flats[i] : std::vector<u32>{});
         }
     };
+    bool tess_checked = false;
     for (size_t perm_idx = 0; perm_idx < program->modules.size(); ++perm_idx) {
         auto& permutation = program->modules[perm_idx];
         if (!permutation.info) {
@@ -2017,6 +2529,14 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
         info.pgm_base = params.Base();
         info.user_data = params.user_data;
         info.RefreshFlatBuf();
+        if (hw_stage == HwStage::Hull && !tess_checked) {
+            // FIX-058: checked with the first translation's info, before a new permutation
+            // could be made from garbage constants.
+            tess_checked = true;
+            if (!SaneTessConstants(info, liverpool, regs_override != nullptr)) {
+                return std::make_tuple(nullptr, vk::ShaderModule{}, u64{0});
+            }
+        }
         if (memo_usable && (perm_idx > memo.perm || memo.flats[perm_idx] != info.flattened_ud_buf)) {
             // The inputs differ from here on; the search goes on the usual way.
             stop_replay(perm_idx);

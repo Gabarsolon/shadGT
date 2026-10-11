@@ -16,6 +16,36 @@
 #include "core/address_space.h"
 #include "core/libraries/kernel/memory.h"
 
+#ifdef RYTY_GPU
+#include <vector>
+namespace Core::RytyMemory {
+// In the Ryty build, guest memory is mapped by Ryty's libkernel, so mapping queries go to the host.
+/// Stops looking once the area is known to reach limit, so the result may be lower than its end.
+VAddr MappedAreaEnd(VAddr virtual_addr, VAddr limit = ~VAddr{0});
+/// Called when Ryty maps or unmaps guest memory, so cached MappedAreaEnd answers are dropped.
+void NoteMappingChange(VAddr address, u64 size);
+/// A guarded direct read of guest memory is running on this thread (see ryty_core_shims.cpp).
+bool InGuardedRead();
+/// Whether page tracking, rather than the game, made the page of address unreadable.
+bool TrackingMadeUnreadable(VAddr address);
+/// Mapped and readable for the game (pages page tracking made unreadable still count).
+bool IsGuestReadable(VAddr virtual_addr, u64 size);
+/// FIX-072: whether the range is committed memory the renderer may write, guest or not.
+bool IsWritableTarget(VAddr virtual_addr, u64 size);
+bool GuardedCopy(void* dest, const void* source, size_t size);
+bool IsValidMapping(VAddr virtual_addr, u64 size);
+/// FIX-073: told of each renderer write into guest memory, after it was made.
+using OwnWriteObserver = void (*)(VAddr address, u64 size);
+void SetOwnWriteObserver(OwnWriteObserver observer);
+struct ExecRange {
+    VAddr address;
+    u64 size;
+    bool executable;
+};
+std::vector<ExecRange> ExecRanges(VAddr virtual_addr, u64 size);
+} // namespace Core::RytyMemory
+#endif
+
 namespace Vulkan {
 class Rasterizer;
 }
@@ -191,6 +221,13 @@ public:
         rasterizer = rasterizer_;
     }
 
+#ifdef RYTY_GPU
+    // Ryty's libkernel owns guest memory and reports unmaps to the renderer through this.
+    Vulkan::Rasterizer* GetRasterizer() const {
+        return rasterizer;
+    }
+#endif
+
     AddressSpace& GetAddressSpace() {
         return impl;
     }
@@ -220,7 +257,10 @@ public:
     /// FIX-027: whether the address is inside a mapped area (not free or only reserved).
     /// PERF-058: the end of the mapped area containing virtual_addr, or 0 when it is not mapped
     /// (as IsMappedAddress decides). Lock-free like IsMappedAddress.
-    VAddr MappedAreaEnd(VAddr virtual_addr) {
+    VAddr MappedAreaEnd(VAddr virtual_addr, [[maybe_unused]] VAddr limit = ~VAddr{0}) {
+#ifdef RYTY_GPU
+        return RytyMemory::MappedAreaEnd(virtual_addr, limit);
+#endif
         if (vma_map.empty() || virtual_addr < vma_map.begin()->first) {
             return 0;
         }
@@ -232,6 +272,9 @@ public:
     }
 
     bool IsMappedAddress(VAddr virtual_addr) {
+#ifdef RYTY_GPU
+        return RytyMemory::MappedAreaEnd(virtual_addr, virtual_addr + 1) != 0;
+#endif
         if (vma_map.empty() || virtual_addr < vma_map.begin()->first) {
             return false;
         }
@@ -243,6 +286,12 @@ public:
     /// the guest's CPU execute permission changes. Lock-free like IsValidMapping.
     template <typename Func>
     void ForEachExecRange(VAddr virtual_addr, u64 size, Func&& func) {
+#ifdef RYTY_GPU
+        for (const auto& range : RytyMemory::ExecRanges(virtual_addr, size)) {
+            func(range.address, range.size, range.executable);
+        }
+        return;
+#endif
         const VAddr end = virtual_addr + size;
         VAddr run_start = virtual_addr;
         bool run_exec = false;
@@ -285,6 +334,9 @@ public:
     }
 
     bool IsValidMapping(const VAddr virtual_addr, const u64 size = 0) {
+#ifdef RYTY_GPU
+        return RytyMemory::IsValidMapping(virtual_addr, size);
+#endif
         const auto end_it = std::prev(vma_map.end());
         const VAddr end_addr = end_it->first + end_it->second.size;
 

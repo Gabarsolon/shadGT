@@ -2,8 +2,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <chrono>
+#include <functional>
 #include <map>
 #include <string>
+#include <immintrin.h>
+#include <boost/container/small_vector.hpp>
 
 #include "common/assert.h"
 #include "common/debug.h"
@@ -64,9 +67,144 @@ void Scheduler::StartPerfMonitor() {
 }
 
 Scheduler::~Scheduler() {
+    if (command_thread.joinable()) {
+        command_thread.request_stop();
+        ring->Wake();
+        command_thread.join();
+    }
 #if TRACY_GPU_ENABLED
     std::free(profiler_scope);
 #endif
+}
+
+void Scheduler::EnableCommandThread() {
+    if (ring) {
+        return;
+    }
+    ring = std::make_unique<CommandRing>();
+    command_thread = std::jthread(std::bind_front(&Scheduler::CommandThread, this));
+    LOG_WARNING(Render_Vulkan, "PERF-084: Vulkan commands are made on a command thread");
+}
+
+vk::CommandBuffer ReplayCommandBuffer(Scheduler& scheduler, CmdTarget target) {
+    if (target == CmdTarget::Upload) {
+        return scheduler.OpenUploadCommandBuffer();
+    }
+    return scheduler.sessions.back().primary;
+}
+
+void CommandRing::WaitForSpace(size_t needed) {
+    ++full_waits;
+    while (head_local + needed - tail.load(std::memory_order_acquire) > Capacity) {
+        std::this_thread::yield();
+    }
+}
+
+void CommandRing::WaitForWork(u64 seen, const std::stop_token& stoken) {
+    // The recorder hands over commands steadily while it works; spin briefly before sleeping.
+    for (u32 i = 0; i < 2048; ++i) {
+        if (head.load(std::memory_order_acquire) != seen) {
+            return;
+        }
+        _mm_pause();
+    }
+    const u32 wake_value = wake.load(std::memory_order_acquire);
+    sleeping.store(true, std::memory_order_seq_cst);
+    if (head.load(std::memory_order_seq_cst) != seen || stoken.stop_requested()) {
+        sleeping.store(false, std::memory_order_relaxed);
+        return;
+    }
+    wake.wait(wake_value, std::memory_order_acquire);
+}
+
+void Scheduler::SyncCommandThread() {
+    if (!ring) {
+        return;
+    }
+    const u64 target = ring->Recorded();
+    if (ring->Replayed() >= target) {
+        return;
+    }
+    const auto start = std::chrono::steady_clock::now();
+    u32 spins = 0;
+    while (ring->Replayed() < target) {
+        if (++spins < 512) {
+            _mm_pause();
+        } else {
+            std::this_thread::yield();
+        }
+    }
+    sync_waits.fetch_add(1, std::memory_order_relaxed);
+    sync_wait_ns.fetch_add(u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now() - start)
+                                   .count()),
+                           std::memory_order_relaxed);
+}
+
+void Scheduler::WaitSubmitted(u64 tick) {
+    if (!ring) {
+        return;
+    }
+    u64 submitted = submitted_tick.load(std::memory_order_acquire);
+    while (submitted < tick) {
+        submitted_tick.wait(submitted, std::memory_order_acquire);
+        submitted = submitted_tick.load(std::memory_order_acquire);
+    }
+}
+
+vk::CommandBuffer Scheduler::DirectCommandBuffer() {
+    SyncCommandThread();
+    return sessions.back().primary;
+}
+
+void Scheduler::CommandThread(std::stop_token stoken) {
+    Common::SetCurrentThreadName("shadGT:VkCommands");
+    auto& commands = *ring;
+    u64 position = commands.Replayed();
+    u64 window_commands = 0;
+    u64 window_busy_ns = 0;
+    auto window_start = std::chrono::steady_clock::now();
+    while (!stoken.stop_requested()) {
+        const u64 end = commands.Published();
+        if (position == end) {
+            commands.SetReplayed(position);
+            const auto now = std::chrono::steady_clock::now();
+            if (now - window_start >= std::chrono::seconds{2}) {
+                const double seconds = std::chrono::duration<double>(now - window_start).count();
+                LOG_WARNING(Render_Vulkan,
+                            "PERF-084 command thread in {:.1f} s: {} commands, busy {:.0f}%; "
+                            "recorder waited {} times for ring space, {} times for the thread "
+                            "({:.1f} ms)",
+                            seconds, window_commands, window_busy_ns / (seconds * 1e7),
+                            commands.full_waits, sync_waits.exchange(0),
+                            sync_wait_ns.exchange(0) / 1e6);
+                commands.full_waits = 0;
+                window_commands = 0;
+                window_busy_ns = 0;
+                window_start = now;
+            }
+            commands.WaitForWork(position, stoken);
+            continue;
+        }
+        const auto start = std::chrono::steady_clock::now();
+        u32 since_progress = 0;
+        while (position != end) {
+            auto* header = commands.At(position);
+            if (header->exec != nullptr) {
+                header->exec(*this, reinterpret_cast<u8*>(header) + header->fn_offset);
+                ++window_commands;
+            }
+            position += header->size;
+            if (++since_progress == 64) {
+                commands.SetReplayed(position);
+                since_progress = 0;
+            }
+        }
+        commands.SetReplayed(position);
+        window_busy_ns += u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                  std::chrono::steady_clock::now() - start)
+                                  .count());
+    }
 }
 
 void Scheduler::BeginRendering(const RenderState& new_state) {
@@ -132,7 +270,14 @@ void Scheduler::EndRendering() {
     CommandBuffer().endRendering();
 }
 
-vk::CommandBuffer Scheduler::UploadCommandBuffer() {
+CmdBuf Scheduler::UploadCommandBuffer() {
+    if (ring) {
+        return CmdBuf{ring.get(), CmdTarget::Upload};
+    }
+    return CmdBuf{OpenUploadCommandBuffer()};
+}
+
+vk::CommandBuffer Scheduler::OpenUploadCommandBuffer() {
     auto& upload_cmdbuf = sessions.back().upload;
     if (upload_cmdbuf) {
         return upload_cmdbuf;
@@ -208,14 +353,13 @@ void Scheduler::PopPendingOperations() {
 void Scheduler::BeginSession() {
     EndSession();
 
-    auto& session = sessions.emplace_back();
+    session_open = true;
     ++session_id;
-
-    const vk::CommandBufferBeginInfo begin_info = {
-        .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
-    };
-    session.primary = command_pool.Commit();
-    Check(session.primary.begin(begin_info));
+    if (ring) {
+        ring->RecordControl([](Scheduler& scheduler) { scheduler.OpenSession(); });
+    } else {
+        OpenSession();
+    }
 
     // Invalidate dynamic state so it gets applied to the new command buffer.
     dynamic_state.Invalidate();
@@ -230,8 +374,17 @@ void Scheduler::BeginSession() {
 #endif
 }
 
+void Scheduler::OpenSession() {
+    auto& session = sessions.emplace_back();
+    const vk::CommandBufferBeginInfo begin_info = {
+        .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
+    };
+    session.primary = command_pool.Commit();
+    Check(session.primary.begin(begin_info));
+}
+
 void Scheduler::EndSession() {
-    if (sessions.empty()) {
+    if (!session_open) {
         return;
     }
 
@@ -239,6 +392,16 @@ void Scheduler::EndSession() {
         on_session();
     }
 
+    EndRendering();
+    session_open = false;
+    if (ring) {
+        ring->RecordControl([](Scheduler& scheduler) { scheduler.CloseSession(); });
+    } else {
+        CloseSession();
+    }
+}
+
+void Scheduler::CloseSession() {
     const auto& session = sessions.back();
     if (session.upload) {
         // PERF-066: the session's work sees the uploads.
@@ -254,14 +417,13 @@ void Scheduler::EndSession() {
         });
         Check(session.upload.end());
     }
-
-    EndRendering();
     Check(session.primary.end());
 }
 
 void Scheduler::SubmitExecution(SubmitInfo& info) {
     Common::PhaseTimer submit_timer{Common::Phase::Submit};
-    std::scoped_lock lk{submit_mutex};
+    // PERF-084: the queue lock is taken only around queue calls (the submit callback's sparse
+    // binds take it themselves), so the command thread can submit while the recorder works.
     const u64 signal_value = work_semaphore.NextTick();
 
 #if TRACY_GPU_ENABLED
@@ -278,9 +440,23 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
 
     EndSession();
 
-    std::vector<vk::CommandBuffer> cmd_buffers;
-    cmd_buffers.reserve(sessions.size() * 2);
+    info.AddSignal(work_semaphore.Handle(), signal_value);
+    if (ring) {
+        ring->RecordControl([info, signal_value](Scheduler& scheduler) mutable {
+            scheduler.SubmitSessions(info, signal_value);
+        });
+    } else {
+        SubmitSessions(info, signal_value);
+    }
 
+    BeginSession();
+
+    // Apply pending operations
+    PopPendingOperations();
+}
+
+void Scheduler::SubmitSessions(SubmitInfo& info, u64 signal_value) {
+    boost::container::small_vector<vk::CommandBuffer, 4> cmd_buffers;
     for (const auto& session : sessions) {
         if (session.upload) {
             cmd_buffers.push_back(session.upload);
@@ -288,9 +464,6 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
         cmd_buffers.push_back(session.primary);
     }
     sessions.clear();
-
-    const vk::Semaphore timeline = work_semaphore.Handle();
-    info.AddSignal(timeline, signal_value);
 
     // A ready frame is sampled by the fragment shader, before color attachment output.
     // Include every supported wait semaphore and protect uploads and other shader accesses too.
@@ -316,15 +489,18 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
         .pSignalSemaphores = info.signal_semas.data(),
     };
 
-    ImGui::Core::TextureManager::Submit();
-    auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
-    ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
+    {
+        std::scoped_lock lk{submit_mutex};
+        ImGui::Core::TextureManager::Submit();
+        auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
+        ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
+    }
 
     work_semaphore.Refresh();
-    BeginSession();
-
-    // Apply pending operations
-    PopPendingOperations();
+    if (ring) {
+        submitted_tick.store(signal_value, std::memory_order_release);
+        submitted_tick.notify_all();
+    }
 }
 
 void Scheduler::PerfMonitorThread(std::stop_token stoken) {
@@ -387,7 +563,7 @@ void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {
     }
 }
 
-void DynamicState::Commit(const Instance& instance, const vk::CommandBuffer& cmdbuf) {
+void DynamicState::Commit(const Instance& instance, const CmdBuf& cmdbuf) {
     if (dirty_state.viewports) {
         dirty_state.viewports = false;
         cmdbuf.setViewportWithCount(viewports);

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include <utility>
 #include "common/assert.h"
 #include "common/number_utils.h"
@@ -544,8 +545,16 @@ vk::ComponentSwizzle ComponentSwizzle(AmdGpu::CompSwizzle comp_swizzle) {
         return vk::ComponentSwizzle::eB;
     case AmdGpu::CompSwizzle::Alpha:
         return vk::ComponentSwizzle::eA;
-    default:
-        UNREACHABLE();
+    default: {
+        // FIX-051: the reserved values (2, 3) come from garbage T#s; GT Sport's race had one
+        // and the assertion stopped the game. The view keeps the channel as it is.
+        static std::atomic<u32> logged{};
+        if (logged++ < 10) {
+            LOG_WARNING(Render_Vulkan, "FIX-051: reserved component swizzle {} treated as identity",
+                        static_cast<u32>(comp_swizzle));
+        }
+        return vk::ComponentSwizzle::eIdentity;
+    }
     }
 }
 

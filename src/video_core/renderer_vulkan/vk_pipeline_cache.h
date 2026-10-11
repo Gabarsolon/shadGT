@@ -278,6 +278,15 @@ private:
     std::atomic<u64> prewarm_read{};
     std::atomic<u64> prewarm_total{};
     std::atomic<bool> prewarm_reader_done{};
+    /// PERF-076: new graphics pipelines build in the background while their draws are skipped.
+    static bool AsyncPipelines();
+    static bool WritesMemory(const std::array<const Shader::Info*, MaxShaderStages>& infos);
+    static bool NeverSkipped(const std::array<const Shader::Info*, MaxShaderStages>& infos);
+    struct AsyncStats {
+        u64 deferred{};
+        u64 installed{};
+        u64 skipped_draws{};
+    } async_stats;
     struct PrewarmStats {
         u64 installed{};
         u64 skipped{};

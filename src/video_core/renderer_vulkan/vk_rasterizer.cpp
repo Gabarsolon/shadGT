@@ -66,6 +66,11 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
         runtime.FlushBarriers();
         buffer_cache.SubmitPendingArenaBinds(info);
     });
+
+    // PERF-084: Vulkan calls on a command thread. -DisablePerf 97 makes them here as before.
+    if (Common::PerfFeatureEnabled(97)) {
+        scheduler.EnableCommandThread();
+    }
 }
 
 Rasterizer::~Rasterizer() = default;
@@ -577,6 +582,8 @@ bool Rasterizer::PrepareBuffersAhead(const SelectedPipeline& selected, BufferPla
         return true; // Nothing to obtain, or BindResources is not reached.
     }
     plan.generation = texture_cache.RegistryGeneration();
+    plan.labels_done = liverpool->LabelsDone(); // PERF-082
+    plan.labels_pushed = liverpool->LabelsPushed();
     struct FlatView {
         const std::vector<u32>& flattened_ud_buf;
         VAddr pgm_base;
@@ -618,14 +625,16 @@ bool Rasterizer::PrepareBuffersAhead(const SelectedPipeline& selected, BufferPla
             }
             const u32 size =
                 static_cast<u32>(memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize()));
+            bool overlapped = false;
             const auto result = buffer_cache.ObtainBufferAhead(
-                vsharp.base_address, size, desc.is_written, desc.is_formatted, plan.uploads);
+                vsharp.base_address, size, desc.is_written, desc.is_formatted, plan.uploads,
+                &overlapped);
             if (!result) {
                 ++plan_refusals[2];
                 return false;
             }
             plan.entries.push_back({vsharp.base_address, size, desc.is_written, desc.is_formatted,
-                                    result->first, result->second});
+                                    result->first, result->second, overlapped});
         }
     }
     return true;
@@ -646,9 +655,19 @@ std::optional<std::pair<const VideoCore::Buffer*, u64>> Rasterizer::TakePlannedB
         return std::nullopt;
     }
     ++plan->next;
+    if (liverpool->LabelWrittenOver(plan->labels_done, plan->labels_pushed, address, size)) {
+        // PERF-082: a label was written into it after the stage read it.
+        ++plan_stats.redone;
+        return std::nullopt;
+    }
     if (texture_cache.RegistryGeneration() != plan->generation &&
         texture_cache.AnyImageInRegion(address, size)) {
         // An image over the range appeared since: obtained again, with its export.
+        ++plan_stats.redone;
+        return std::nullopt;
+    }
+    if (entry.overlapped && buffer_cache.ExportImagesOver(address, size)) {
+        // PERF-079: an image over it had to be exported first; obtained again after it.
         ++plan_stats.redone;
         return std::nullopt;
     }
@@ -1686,6 +1705,10 @@ void Rasterizer::RecordDrain(DrainSource source, std::chrono::steady_clock::time
     stats.window_start = now;
 }
 
+extern std::atomic<u64> g_defer_readbacks; // DIAG-068
+extern std::atomic<u64> g_defer_address;
+extern std::atomic<u64> g_defer_order;
+
 bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& signal,
                                   bool compute_queue, std::span<const u8> value) {
     // Hardware writes a fence when the work before it has finished. With readbacks pending,
@@ -1706,6 +1729,23 @@ bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& 
     // (they are rare, unlike the small ones PERF-009 v1 slowed races with).
     // -DisablePerf 40 signals them right away.
     static const bool wait_large = Common::PerfFeatureEnabled(40);
+    // FIX-070: small images read back every frame (GT Sport's 8x8 to 1x1 brightness chain for
+    // auto exposure) no longer hold the fence. Each one deferred a fence, and every later fence
+    // waited behind it (FIX-049), so the game waited for full GPU completion every frame: races
+    // ran at about 30 FPS with the recorder 75-88% busy. They are read back when the GPU gets
+    // there without holding anything; the game sees the value a frame later at most. Large ones
+    // (car thumbnails, FIX-032) still hold the fence. -DisablePerf 93 holds fences for all.
+    static const bool small_in_background = Common::PerfFeatureEnabled(93);
+    if (small_in_background && !compute_queue && texture_cache.HasPendingReadbacks() &&
+        !texture_cache.HasLargePendingReadbacks()) {
+        texture_cache.ReleaseFinishedReadbacks();
+        if (auto small = texture_cache.RecordPendingReadbacks(); !small.empty()) {
+            ++background_readbacks;
+            scheduler.DeferPriorityOperation([this, small = std::move(small)]() mutable {
+                texture_cache.CompleteReadbacks(small);
+            });
+        }
+    }
     const bool readbacks_pending = compute_queue
                                        ? wait_large && texture_cache.HasLargePendingReadbacks()
                                        : texture_cache.HasPendingReadbacks();
@@ -1726,6 +1766,8 @@ bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& 
     if (!readbacks_pending && !address_pending && !earlier_deferred) {
         return false;
     }
+    // DIAG-068: why fences wait for the GPU.
+    ++(readbacks_pending ? g_defer_readbacks : address_pending ? g_defer_address : g_defer_order);
     if (readbacks_pending) {
         last_readback_fence_ns.store(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1818,6 +1860,10 @@ std::optional<u32> Rasterizer::PendingFenceDword(VAddr address) {
     return std::nullopt;
 }
 
+std::atomic<u64> g_defer_readbacks{};
+std::atomic<u64> g_defer_address{};
+std::atomic<u64> g_defer_order{};
+
 void Rasterizer::RecordDeferredFenceLatency(std::chrono::steady_clock::time_point deferred_at) {
     // DIAG-015: how long the guest waits on a deferred fence, reported every 2 seconds.
     const auto now = std::chrono::steady_clock::now();
@@ -1835,8 +1881,13 @@ void Rasterizer::RecordDeferredFenceLatency(std::chrono::steady_clock::time_poin
     if (now - stats.window_start >= std::chrono::seconds{2}) {
         const u64 frames = u64(DebugState.GetFrameNum()) - stats.window_frame;
         LOG_WARNING(
-            Render_Vulkan, "Deferred fences: {} in {} frames, latency avg {:.2f} ms max {:.2f} ms",
-            stats.count, frames, stats.total_us / 1000.0 / stats.count, stats.max_us / 1000.0);
+            Render_Vulkan,
+            "Deferred fences: {} in {} frames, latency avg {:.2f} ms max {:.2f} ms; DIAG-068: "
+            "deferred for image readbacks {}, same address {}, behind an earlier one {}; FIX-070: "
+            "{} small readbacks without a fence",
+            stats.count, frames, stats.total_us / 1000.0 / stats.count, stats.max_us / 1000.0,
+            g_defer_readbacks.exchange(0), g_defer_address.exchange(0), g_defer_order.exchange(0),
+            background_readbacks.exchange(0));
         stats = {};
         stats.window_start = now;
         stats.window_frame = u64(DebugState.GetFrameNum());
@@ -1988,6 +2039,55 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
         }
     };
 
+#ifdef RYTY_GPU
+    // FIX-053: a V# whose start is not mapped is garbage (the game rewrote its descriptors
+    // before this draw was recorded). Binding it made the buffer cache try to hold hundreds of
+    // megabytes and the GPU ran out of memory; such a binding is left empty instead.
+    for (size_t index = 0; index < guest_buffers.size(); ++index) {
+        auto& buffer = guest_buffers[index];
+        if (buffer.base_address != 0 && buffer.GetSize() > 0 &&
+            memory->MappedAreaEnd(buffer.base_address, buffer.base_address + 1) == 0) {
+            static std::atomic<u32> logged{};
+            if (const u32 n = logged++; n < 10 || n % 500 == 0) {
+                const auto& draw_regs = liverpool->DrawRegs();
+                LOG_WARNING(Render_Vulkan,
+                            "FIX-053: vertex buffer at unmapped {:#x}+{:#x} not bound ({} times; "
+                            "draw of {} indices x {} instances, vs {:#x})",
+                            u64{buffer.base_address}, buffer.GetSize(), n + 1,
+                            draw_regs.num_indices, draw_regs.num_instances.num_instances,
+                            pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash);
+            }
+            // DIAG-071: where the V# was read from, what is there now, and the renderer's own
+            // writes to it (garbage V#s came back in race summaries with a faster recorder).
+            static std::atomic<u32> traced{};
+            const auto& attribs = pipeline->GetFetchShader().attributes;
+            const auto& vs = pipeline->GetStage(Shader::SwStage::Vertex);
+            if (index < attribs.size() && attribs[index].sgpr_base != Shader::IR::NumScalarRegs &&
+                traced++ < 30) {
+                const auto& attrib = attribs[index];
+                u64 table = 0;
+                std::memcpy(&table, &vs.user_data[attrib.sgpr_base], sizeof(table));
+                table &= 0xFFFFFFFFFFFFULL;
+                const VAddr source = table + attrib.dword_offset * 4;
+                std::array<u32, 4> now{};
+                Common::CopyGuest(now.data(), reinterpret_cast<const void*>(source), sizeof(now));
+                std::array<u32, 4> read{};
+                std::memcpy(read.data(), &buffer, sizeof(read));
+                LOG_WARNING(Render_Vulkan,
+                            "DIAG-071: garbage V# {:08x} {:08x} {:08x} {:08x} read from {:#x} "
+                            "(table {:#x} + {:#x}); now {:08x} {:08x} {:08x} {:08x}; renderer "
+                            "writes near it:{}; range: {}; readbacks over it:{}; {}",
+                            read[0], read[1], read[2], read[3], source, table,
+                            attrib.dword_offset * 4, now[0], now[1], now[2], now[3],
+                            memory->DescribeBackingWrites(source, 4096),
+                            buffer_cache.DescribeRange(source, 16),
+                            buffer_cache.DescribeRecentReadbacks(source, 16),
+                            buffer_cache.DescribeReadbackPage(source));
+            }
+            buffer.base_address = 0;
+        }
+    }
+#endif
     // Build list of ranges covering the requested buffers
     VertexInputs<BufferRange> ranges{};
     for (const auto& buffer : guest_buffers) {
@@ -3552,7 +3652,15 @@ bool Rasterizer::IsMapped(VAddr addr, u64 size) {
     const auto range = decltype(mapped_ranges)::interval_type::right_open(addr, addr + size);
 
     Common::RecursiveSharedLock lock{mapped_ranges_mutex};
+#ifdef RYTY_GPU
+    // Ryty reports mappings only once libSceVideoOut and the rasterizer exist, so memory the game
+    // mapped earlier is missing here, yet the page manager tracks it. A CPU write fault there was
+    // declined, Ryty then unprotected the whole 16 KB view, and the caches kept stale copies
+    // (exploded geometry, wrong glyphs). Committed guest memory counts as mapped.
+    return boost::icl::contains(mapped_ranges, range) || memory->IsValidMapping(addr, size);
+#else
     return boost::icl::contains(mapped_ranges, range);
+#endif
 }
 
 void Rasterizer::MapMemory(VAddr addr, u64 size) {
@@ -3571,6 +3679,16 @@ bool Rasterizer::IsMappedStart(VAddr address) {
     // page tracking (Protect: "out of bounds"). A first version also required the start to be in
     // a mapped area (FIX-027's test) and refused GT Sport's 105 MB GPU resource at 0x2900000000
     // (likely its shadow map; shadows broke in Lance's 22:18 run).
+#ifdef RYTY_GPU
+    // Ryty's IsValidMapping asks Windows whether the page is committed, which refused that same
+    // resource: it is never CPU-mapped. Anything in Ryty's guest arena counts as guest address
+    // space, as in shadGT; reads of its uncommitted parts give zeros.
+    constexpr VAddr GuestArenaBase = 0x200000000;
+    constexpr VAddr GuestArenaEnd = 0xFC00000000;
+    if (address >= GuestArenaBase && address < GuestArenaEnd) {
+        return true;
+    }
+#endif
     return memory->IsValidMapping(address);
 }
 

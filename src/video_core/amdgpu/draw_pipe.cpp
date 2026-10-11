@@ -4,6 +4,9 @@
 #include <chrono>
 
 #include <immintrin.h>
+#include <string>
+#include <fmt/format.h>
+#include "common/logging/log.h"
 #include "common/nvtx.h"
 #include "common/perf_monitor.h"
 #include "common/thread.h"
@@ -67,6 +70,23 @@ void DrawPipe::Push(Work&& work, JobKind kind, Prepare&& prepare) {
             ++stats.pushed;
         }
         std::scoped_lock lk{stage_mutex};
+        if (kind == JobKind::Barrier) {
+            // DIAG-069: which jobs make the stage wait for the recorder, every 2 s.
+            ++barrier_tags[push_tag ? push_tag : "untagged"];
+            const auto now = std::chrono::steady_clock::now();
+            if (barrier_tags_since == std::chrono::steady_clock::time_point{}) {
+                barrier_tags_since = now;
+            } else if (now - barrier_tags_since >= std::chrono::seconds{2}) {
+                std::string line;
+                for (const auto& [tag, count] : barrier_tags) {
+                    line += fmt::format(" {}={}", tag, count);
+                }
+                LOG_WARNING(Render, "DIAG-069: buffer stage barriers in 2 s:{}", line);
+                barrier_tags.clear();
+                barrier_tags_since = now;
+            }
+        }
+        push_tag = nullptr;
         stage_queue.push_back(StageJob{std::move(work), std::move(prepare), kind});
         stage_cv.notify_one();
         return;

@@ -1135,6 +1135,7 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/renderer_vulkan/vk_runtime.h
                src/video_core/renderer_vulkan/vk_scheduler.cpp
                src/video_core/renderer_vulkan/vk_scheduler.h
+               src/video_core/renderer_vulkan/vk_command_stream.h
                src/video_core/renderer_vulkan/vk_semaphore.cpp
                src/video_core/renderer_vulkan/vk_semaphore.h
                src/video_core/renderer_vulkan/vk_shader_hle.cpp
@@ -1392,6 +1393,11 @@ target_include_directories(shadps4 PRIVATE ${IMGUI_RESOURCES_INCLUDE})
 # Discord RPC
 if (ENABLE_DISCORD_RPC)
     target_link_libraries(shadps4 PRIVATE discord-rpc)
+endif()
+
+option(SHADGT_RYTY_GPU "Build the renderer as a Ryty host library (libSceVideoOut.prx)" OFF)
+if (SHADGT_RYTY_GPU)
+    include(ryty_gpu/RytyGpu.cmake)
 endif()
 
 # Install rules

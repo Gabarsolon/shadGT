@@ -99,7 +99,20 @@ public:
     /// Removes all protection from a page and ensures GPU data has been flushed if requested
     void InvalidateRegion(VAddr cpu_addr, u64 size, auto&& on_flush) noexcept {
         if (readbacks_mode == GpuReadbacksMode::Disabled) {
-            return MarkRegionAsCpuModified(cpu_addr, size);
+            // FIX-067: CPU write faults are counted here too, so pages the game writes every
+            // frame become hot pages (left writable and checked by hashing) as with readbacks
+            // on. Without it GT Sport's per-frame memory was re-protected on every upload and
+            // faulted again on every write (100,000 protection calls over 5 GB per 2 s; the
+            // race ran at half speed).
+            IteratePages(cpu_addr, size, [](RegionManager* manager, u64 offset, u64 size) {
+                const auto bounds = manager->GetBounds(offset, size);
+                manager->Lock(bounds);
+                manager->template ChangeRegionState<StateOp::Set, StateOp::None, false>(offset,
+                                                                                        size);
+                manager->NoteCpuWriteFault(offset, size);
+                manager->Unlock(bounds);
+            });
+            return;
         }
         bool should_flush = false;
         IteratePages(cpu_addr, size, [&should_flush](RegionManager* manager, u64 offset, u64 size) {

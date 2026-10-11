@@ -5,7 +5,9 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <chrono>
 #include <deque>
+#include <unordered_map>
 #include <functional>
 #include <mutex>
 #include <thread>
@@ -52,6 +54,11 @@ public:
     /// PERF-067: whether the buffer stage thread runs (SHADGT_BUFFER_STAGE=1).
     bool HasStage() const noexcept {
         return stage_enabled;
+    }
+
+    /// DIAG-069: what the next barrier job pushed from this thread is (a static string).
+    static void SetPushTag(const char* tag) noexcept {
+        push_tag = tag;
     }
 
     /// Returns once every job pushed so far has finished. A no-op on the recorder thread.
@@ -129,6 +136,9 @@ private:
     std::atomic<u64> stage_syncs{};
     std::atomic<u64> stage_prepared{};
     std::atomic<u64> stage_barriers{};
+    static inline thread_local const char* push_tag = nullptr; // DIAG-069
+    std::unordered_map<const char*, u64> barrier_tags;         // under stage_mutex
+    std::chrono::steady_clock::time_point barrier_tags_since{};
     std::mutex stage_wait_mutex;
     std::condition_variable stage_wait_cv;
     std::atomic<u64> stage_wait_target{};

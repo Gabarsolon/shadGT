@@ -13,6 +13,7 @@
 #include "common/unique_function.h"
 #include "video_core/amdgpu/regs_color.h"
 #include "video_core/amdgpu/regs_primitive.h"
+#include "video_core/renderer_vulkan/vk_command_stream.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
 #include "vulkan/vulkan.hpp"
@@ -166,7 +167,7 @@ struct DynamicState {
     vk::ImageAspectFlags feedback_loop_enabled{};
 
     /// Commits the dynamic state to the provided command buffer.
-    void Commit(const Instance& instance, const vk::CommandBuffer& cmdbuf);
+    void Commit(const Instance& instance, const CmdBuf& cmdbuf);
 
     /// Invalidates all dynamic state to be flushed into the next command buffer.
     void Invalidate() {
@@ -385,7 +386,27 @@ public:
     /// Returns the current command buffer used for uploads. PERF-066: it runs before the
     /// session's primary command buffer, after everything submitted before it (barriers at its
     /// start and end).
-    vk::CommandBuffer UploadCommandBuffer();
+    CmdBuf UploadCommandBuffer();
+
+    /// PERF-084: from now on, Vulkan commands are recorded into a ring and replayed by a
+    /// command thread, which also submits. Call once, from the thread that records.
+    void EnableCommandThread();
+
+    /// PERF-084: whether commands go through the command thread.
+    bool HasCommandThread() const noexcept {
+        return ring != nullptr;
+    }
+
+    /// PERF-084: waits until the command thread replayed everything recorded so far.
+    void SyncCommandThread();
+
+    /// PERF-084: waits until the work signaling `tick` was submitted to the queue. A submission
+    /// waiting for it on the same queue must not be submitted first.
+    void WaitSubmitted(u64 tick);
+
+    /// The current command buffer itself, for code that calls it directly. With a command
+    /// thread, waits for it to replay everything recorded so far first.
+    vk::CommandBuffer DirectCommandBuffer();
 
     /// PERF-066: changes with every new session.
     u64 SessionId() const noexcept {
@@ -413,8 +434,11 @@ public:
     }
 
     /// Returns the current command buffer.
-    vk::CommandBuffer CommandBuffer() const {
-        return sessions.back().primary;
+    CmdBuf CommandBuffer() const {
+        if (ring) {
+            return CmdBuf{ring.get(), CmdTarget::Primary};
+        }
+        return CmdBuf{sessions.back().primary};
     }
 
     /// Returns the current command buffer tick.
@@ -459,9 +483,19 @@ public:
     static std::mutex submit_mutex;
 
 private:
+    friend vk::CommandBuffer ReplayCommandBuffer(Scheduler& scheduler, CmdTarget target);
+
     void EndSession();
 
     void SubmitExecution(SubmitInfo& info);
+
+    /// The parts that touch command buffers and the queue (the command thread, if any).
+    void OpenSession();
+    void CloseSession();
+    void SubmitSessions(SubmitInfo& info, u64 signal_value);
+    vk::CommandBuffer OpenUploadCommandBuffer();
+
+    void CommandThread(std::stop_token stoken);
 
     void PriorityPendingOpsThread(std::stop_token stoken);
 
@@ -478,8 +512,17 @@ private:
         vk::CommandBuffer upload{};
         vk::CommandBuffer primary{};
     };
-    std::vector<Session> sessions;
+    std::vector<Session> sessions; ///< The command thread's, when there is one.
+    bool session_open{};           ///< Recorder side.
     u64 session_id{};
+    // PERF-084
+    std::unique_ptr<CommandRing> ring;
+    std::jthread command_thread;
+    std::atomic<u64> submitted_tick{};
+    std::atomic<u64> replayed_commands{};
+    std::atomic<u64> replay_busy_ns{};
+    std::atomic<u64> sync_waits{};
+    std::atomic<u64> sync_wait_ns{};
     std::condition_variable_any event_cv;
     struct PendingOp {
         Common::UniqueFunction<void> callback;

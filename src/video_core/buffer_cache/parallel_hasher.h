@@ -18,6 +18,7 @@
 
 #if defined(_MSC_VER) || defined(__x86_64__)
 #include <immintrin.h>
+#include "core/guest_hash.h"
 #endif
 
 namespace VideoCore {
@@ -104,7 +105,7 @@ private:
         const size_t count = pages.size();
         for (size_t i = next.fetch_add(1, std::memory_order_relaxed); i < count;
              i = next.fetch_add(1, std::memory_order_relaxed)) {
-            hashes[i] = XXH3_64bits(pages[i], page_size);
+            hashes[i] = Core::HashGuestBytes(reinterpret_cast<VAddr>(pages[i]), page_size);
             done.fetch_add(1, std::memory_order_acq_rel);
         }
     }

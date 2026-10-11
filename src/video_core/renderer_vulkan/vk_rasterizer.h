@@ -145,11 +145,14 @@ public:
             bool texel;
             const VideoCore::Buffer* buffer;
             u64 offset;
+            bool overlapped; // PERF-079: images lie over it
         };
         std::vector<Entry> entries;
         VideoCore::BufferCache::AheadUploads uploads;
         u64 generation{};
         size_t next{};
+        u64 labels_done{};   // PERF-082: label writes the recorder had run when planned
+        u64 labels_pushed{}; // and the ones pushed by then
     };
     /// PERF-067 (buffer stage thread): obtains what it can of the selected draw's shader
     /// buffers. False when it stopped early (the recorder obtains the rest, and must have
@@ -462,6 +465,7 @@ private:
     u32 invalid_texture_context_count{};
     std::unordered_set<u64> logged_gpu_constant_shaders;
     std::atomic<u32> deferred_fences{};
+    std::atomic<u64> background_readbacks{}; // FIX-070
     std::atomic<s64> last_readback_fence_ns{}; // PERF-063
     /// PERF-014b: deferred fences that will also bring GPU data back to guest memory.
     std::atomic<u32> readback_fences{};

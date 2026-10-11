@@ -5,11 +5,14 @@
 #include <array>
 #include <atomic>
 #include <condition_variable>
+#include <functional>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <immintrin.h>
 #include <magic_enum/magic_enum.hpp>
@@ -40,6 +43,7 @@
 #include <vk_mem_alloc.h>
 #ifdef _WIN32
 #include <windows.h>
+#include "core/guest_hash.h"
 #endif
 
 namespace VideoCore {
@@ -148,6 +152,28 @@ private:
 } // namespace
 
 static std::atomic<HotPagePrehasher*> s_prehasher{nullptr}; // PERF-049
+static std::atomic<BufferCache*> s_own_write_cache{nullptr}; // FIX-073
+
+// DIAG-072: SHADGT_TRACE_READBACKS=1 keeps the last readbacks written into guest memory.
+static bool TraceReadbacks() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("SHADGT_TRACE_READBACKS");
+        return env && env[0] == '1';
+    }();
+    return enabled;
+}
+
+static s64 TraceNowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+// FIX-073 (described at NoteGpuWriteOverReadbackPages). -DisablePerf 99 turns it off.
+static bool ReadbackHashEnabled() {
+    static const bool enabled = Common::PerfFeatureEnabled(99);
+    return enabled;
+}
 
 static constexpr size_t GDS_BUFFER_SIZE = 64_KB;
 static constexpr size_t STREAM_BUFFER_SIZE = 128_MB;
@@ -178,7 +204,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     : instance{instance_}, scheduler{scheduler_}, runtime{runtime_},
       staging_pool{runtime_.GetStagingPool()}, liverpool{liverpool_},
       memory{Core::Memory::Instance()}, texture_cache{texture_cache_},
-      memory_tracker{std::make_unique<MemoryTracker>(tracker)},
+      memory_tracker{std::make_unique<MemoryTracker>(tracker)}, page_manager{tracker},
       stream_buffer{instance, scheduler, MemoryType::Stream, STREAM_BUFFER_SIZE},
       ahead_stream{instance, scheduler, MemoryType::Stream, STREAM_BUFFER_SIZE},
       ahead_staging{instance, scheduler, MemoryType::HostUncached, STREAM_BUFFER_SIZE},
@@ -251,9 +277,22 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
             },
             std::memory_order_release);
     }
+#ifdef RYTY_GPU
+    // FIX-073: the renderer's own writes into guest memory keep readback page hashes current.
+    s_own_write_cache = this;
+    Core::RytyMemory::SetOwnWriteObserver([](VAddr address, u64 size) {
+        if (auto* cache = s_own_write_cache.load(std::memory_order_acquire)) {
+            cache->RefreshReadbackPageHashes(address, size);
+        }
+    });
+#endif
 }
 
 BufferCache::~BufferCache() {
+#ifdef RYTY_GPU
+    Core::RytyMemory::SetOwnWriteObserver(nullptr);
+    s_own_write_cache.store(nullptr, std::memory_order_release);
+#endif
     g_upload_epoch_listener.store(nullptr, std::memory_order_release);
     s_prehasher.store(nullptr, std::memory_order_release);
     prehasher.reset();
@@ -331,6 +370,19 @@ void BufferCache::NoteCpuReadFault(VAddr address, u64 size, u64 exact_write_size
         if (!hot_pages.insert(page).second) {
             continue;
         }
+        if (ReadbackHashEnabled()) {
+            // FIX-073: its snapshot is taken when the fault's GPU data reaches guest memory.
+            std::scoped_lock lk{readback_hash_mutex};
+            if (pending_snapshot_pages.size() > 4096) {
+                pending_snapshot_pages.clear();
+            }
+            if (!readback_page_snapshots.contains(page)) {
+                pending_snapshot_pages.insert(page);
+            }
+            if (TraceReadbacks()) {
+                hot_page_since_ns[page] = TraceNowNs();
+            }
+        }
         ++hot_page_stats.new_pages;
         hot_page_order.push_back(page);
         if (hot_page_order.size() > MaxHotPages) {
@@ -347,23 +399,33 @@ bool BufferCache::RecordHotPageReadbacks() {
         return false;
     }
     constexpr u64 PageSize = 4_KB;
-    std::unordered_map<VAddr, bool> inflight_pages;
-    {
-        std::scoped_lock lk{async_readbacks_mutex};
-        for (const auto* list : {&pending_async_readbacks, &inflight_async_readbacks}) {
-            for (const auto& readback : *list) {
-                if (readback->valid) {
-                    inflight_pages[Common::AlignDown(readback->address, PageSize)] = true;
+    // PERF-087: the pages with readbacks in flight are listed only when a page needs one (this
+    // runs at every fence, and most fences find no hot page the GPU wrote since).
+    boost::container::small_vector<VAddr, 64> inflight_pages;
+    bool inflight_listed = false;
+    const auto has_inflight = [&](VAddr page) {
+        if (!inflight_listed) {
+            inflight_listed = true;
+            std::scoped_lock lk{async_readbacks_mutex};
+            for (const auto* list : {&pending_async_readbacks, &inflight_async_readbacks}) {
+                for (const auto& readback : *list) {
+                    if (readback->valid) {
+                        inflight_pages.push_back(Common::AlignDown(readback->address, PageSize));
+                    }
                 }
             }
+            std::ranges::sort(inflight_pages);
         }
-    }
+        return std::ranges::binary_search(inflight_pages, page);
+    };
     std::vector<std::shared_ptr<AsyncReadback>> recorded;
+    std::vector<std::pair<VAddr, VAddr>> cpu_newer_parts;   // FIX-069
+    std::vector<std::pair<VAddr, VAddr>> cpu_rewrote_parts; // FIX-073
     for (const VAddr page : hot_page_order) {
         // A CPU-modified page may hold CPU writes over GPU ranges (PERF-011); those ranges are
         // only read back with a snapshot check, at write faults.
-        if (inflight_pages.contains(page) || !memory_tracker->IsRegionGpuModified(page, PageSize) ||
-            memory_tracker->IsRegionCpuModified(page, PageSize)) {
+        if (!memory_tracker->IsRegionGpuModified(page, PageSize) ||
+            memory_tracker->IsRegionCpuModified(page, PageSize) || has_inflight(page)) {
             continue;
         }
         const u64 block = page >> block_shift;
@@ -371,12 +433,28 @@ bool BufferCache::RecordHotPageReadbacks() {
         // Same ranges as DownloadMemory: only bytes the GPU wrote, so CPU writes not yet uploaded
         // to the arena are never overwritten.
         memory_tracker->ForEachDownloadRange<false>(page, PageSize, [&](u64 address, u64 size) {
-            gpu_modified_ranges.ForEachInRange(address, size, [&](VAddr start, VAddr end) {
+            gpu_modified_ranges.ForEachInRange(address, size, [&](VAddr start_all, VAddr end_all) {
+                SplitByWriter(start_all, end_all, [&](VAddr start, VAddr end) {
+                if (CpuRewroteReadbackRange(start, end)) {
+                    // FIX-073: the CPU changed these bytes after the GPU wrote them, unseen.
+                    cpu_rewrote_parts.emplace_back(start, end);
+                    return;
+                }
                 auto readback = std::make_shared<AsyncReadback>();
                 readback->address = start;
                 readback->size = static_cast<u32>(end - start);
                 readback->download =
                     staging_pool.Request(readback->size, MemoryType::HostCached, 4, true);
+                // FIX-071: the guest bytes now, so the completion keeps them when the CPU has
+                // written them meanwhile (the game may reuse the memory once a fence before
+                // the completion was signaled).
+                readback->snapshot.resize(readback->size);
+                Common::CopyGuest(readback->snapshot.data(), std::bit_cast<const void*>(start),
+                                  readback->size);
+                if (TraceReadbacks()) { // DIAG-072
+                    readback->writer = DescribeGpuWriters(start, end - start);
+                    readback->recorded_ns = TraceNowNs();
+                }
                 const vk::BufferCopy copy = {
                     .srcOffset = start - arena->cpu_addr,
                     .dstOffset = readback->download.offset,
@@ -385,8 +463,20 @@ bool BufferCache::RecordHotPageReadbacks() {
                 runtime.CopyBuffer(arena, readback->download.buffer, std::span{&copy, 1});
                 hot_page_stats.recorded_bytes += readback->size;
                 recorded.push_back(std::move(readback));
+                }, [&](VAddr s, VAddr e) { cpu_newer_parts.emplace_back(s, e); }); // FIX-069
             });
         });
+    }
+    for (const auto& [s, e] : cpu_newer_parts) {
+        gpu_modified_ranges.Subtract(s, e - s);
+        ++writebacks_cpu_newer;
+    }
+    for (const auto& [s, e] : cpu_rewrote_parts) {
+        // FIX-073: the CPU's bytes are newer; they go to the GPU on its next use of them.
+        gpu_modified_ranges.Subtract(s, e - s);
+        NoteCpuChange(s, e - s);
+        memory_tracker->MarkRegionAsCpuModified(s, e - s);
+        ++readbacks_cpu_rewrote;
     }
     if (recorded.empty()) {
         return false;
@@ -427,11 +517,32 @@ void BufferCache::LogHotPageStats() {
                 "Readback pages in 2.0 s: {} CPU faults ({} only share a page with GPU writes, "
                 "{} handled without a drain, {} beside GDS copies, {} GPU ranges then written "
                 "by the CPU), {} new pages ({} tracked), {} readbacks ({} KB), {} completed, {} "
-                "superseded;{}",
+                "superseded; FIX-066: {} uploads over GPU-written bytes; FIX-069: {} parts kept by the "
+                "CPU; FIX-073: {} parts the CPU rewrote unseen, {} unseen CPU bytes sent to the "
+                "GPU;{}",
                 stats.faults, stats.page_only_faults, stats.split_faults, stats.gds_split_faults,
                 stats.cpu_overwrote.exchange(0), stats.new_pages, hot_page_order.size(),
                 stats.recorded, stats.recorded_bytes / 1024, stats.completed.exchange(0),
-                stats.invalidated.exchange(0), top);
+                stats.invalidated.exchange(0), stats.uploads_over_gpu_bytes,
+                std::exchange(writebacks_cpu_newer, 0), std::exchange(readbacks_cpu_rewrote, 0),
+                std::exchange(unseen_cpu_bytes_synced, 0), top);
+    if (auto& sync = image_sync_stats; sync.calls != 0) {
+        const u64 generation = texture_cache.RegistryGeneration();
+        LOG_WARNING(Render_Vulkan,
+                    "DIAG-048: image checks of buffers in 2.0 s: {} calls, {} exact memo hits, {} "
+                    "block memo hits, {} walked and free ({} MB walked), {} overlapping images; "
+                    "{} image registry changes; PERF-078: {} image lists reused, {} with nothing "
+                    "to export (PERF-086: {} known quiet); FIX-065: {} old images on unwatched "
+                    "pages not exported; {} walks of 64 MB or more ({} over images):{}",
+                    sync.calls, sync.exact_hits, sync.block_hits, sync.full_free,
+                    sync.full_bytes >> 20, sync.with_images,
+                    sync.generation ? generation - sync.generation : 0, sync.overlap_hits,
+                    sync.nothing_to_export, sync.quiet_hits, sync.stale_skipped,
+                    sync.large,
+                    sync.large_with_images, sync.samples);
+        sync = {};
+        sync.generation = generation;
+    }
     // PERF-033: hot-page uploads avoided because the bytes had not changed.
     const u64 unchanged = hot_pages_unchanged.exchange(0);
     const u64 uploaded = hot_pages_uploaded.exchange(0);
@@ -466,12 +577,32 @@ void BufferCache::LogHotPageStats() {
     stats.drain_reports = 0;
     stats.split_faults = 0;
     stats.gds_split_faults = 0;
+    stats.uploads_over_gpu_bytes = 0;
     stats.pages.clear();
     stats.window_start = now;
     stats.faults = 0;
     stats.new_pages = 0;
     stats.recorded = 0;
     stats.recorded_bytes = 0;
+}
+
+std::string BufferCache::DescribeRecentReadbacks(VAddr address, u64 size) {
+    if (!TraceReadbacks()) {
+        return " (SHADGT_TRACE_READBACKS=1 to trace)";
+    }
+    const s64 now = TraceNowNs();
+    std::string out;
+    std::scoped_lock lk{readback_trace_mutex};
+    for (auto it = readback_trace.rbegin(); it != readback_trace.rend(); ++it) {
+        if (it->address < address + size && address < it->address + it->size) {
+            out += fmt::format(" [{:#x}+{:#x} recorded {:.1f} ms ago, written {:.1f} ms ago, "
+                               "{} bytes changed; writers:{}]",
+                               it->address, it->size, (now - it->recorded_ns) / 1e6,
+                               (now - it->completed_ns) / 1e6, it->changed_bytes,
+                               it->writer.substr(0, 400));
+        }
+    }
+    return out.empty() ? std::string{" none"} : out;
 }
 
 // DIAG-053: GPU data written back into guest memory over a recent command buffer.
@@ -513,6 +644,19 @@ void BufferCache::CompleteAsyncReadbacks(
             readback->download.Invalidate();
             NoteWritebackOverCommands(liverpool, "async readback", readback->address,
                                       readback->size);
+            if (TraceReadbacks()) { // DIAG-072
+                const u8* guest = std::bit_cast<const u8*>(readback->address);
+                u32 changed = 0;
+                for (u32 i = 0; i < readback->size; ++i) {
+                    changed += guest[i] != readback->download.mapped[i];
+                }
+                std::scoped_lock trace_lock{readback_trace_mutex};
+                readback_trace.push_back({readback->address, readback->size, changed,
+                                          readback->recorded_ns, TraceNowNs(), readback->writer});
+                if (readback_trace.size() > 512) {
+                    readback_trace.pop_front();
+                }
+            }
             memory->TryWriteBacking(std::bit_cast<void*>(readback->address),
                                     readback->download.mapped, readback->size);
             completed_readback_ranges.emplace_back(readback->address, readback->size);
@@ -725,6 +869,26 @@ bool BufferCache::TrySplitWriteFault(const Buffer* arena, VAddr address, u64 siz
 
 void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks,
                                    u64 exact_write_size) {
+    NoteCpuChange(device_addr, size); // FIX-069
+    static const bool readbacks_disabled =
+        EmulatorSettings.GetReadbacksMode() == GpuReadbacksMode::Disabled &&
+        Common::PerfFeatureEnabled(91);
+    if (readbacks_disabled) {
+        // FIX-068: without readbacks a CPU write makes the CPU's bytes the current ones and the
+        // next upload sends them to the GPU. The pages stopped being GPU-written only when a
+        // readback flushed them, which never happens in this mode, so once written by the GPU
+        // they stayed GPU-written for good: never streamed again, deferred fences behind every
+        // GPU completion (GT Sport raced at 27 FPS against 42 with readbacks).
+        memory_tracker->InvalidateRegion(device_addr, size, [] {});
+        const VAddr first = Common::AlignDown(device_addr, 4_KB);
+        const VAddr end = Common::AlignUp(device_addr + std::max<u64>(size, 1), 4_KB);
+        std::scoped_lock buffer_lock{mutex};
+        if (gpu_modified_ranges.Intersects(first, end - first)) {
+            gpu_modified_ranges.Subtract(first, end - first);
+            memory_tracker->UnmarkRegionAsGpuModified(first, end - first, false);
+        }
+        return;
+    }
     memory_tracker->InvalidateRegion(
         device_addr, size, [this, device_addr, size, assume_locks, exact_write_size] {
             ReadMemory(device_addr, size, true, assume_locks, exact_write_size);
@@ -767,7 +931,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
                             : fmt::format("{} {:#x} at {:#x}+{:#x}", it->second.kind,
                                           it->second.tag, it->second.address, it->second.size));
         }
-        DownloadMemory(arena, window_start, window_end - window_start);
+        DownloadMemory(arena, window_start, window_end - window_start, device_addr, size);
         if (is_write) {
             memory_tracker->MarkRegionAsCpuModified(device_addr, size);
         }
@@ -837,6 +1001,313 @@ void BufferCache::WaitForFaultWritebacks(u64 tick) {
     }
 }
 
+// FIX-069: GT Sport rewrites its per-frame memory every frame, often on hot pages it writes
+// without faulting. GPU results recorded over that memory frames earlier were later copied
+// back over the newer CPU bytes (a fault flush or a hot-page readback only checks that guest
+// memory did not change after the download was recorded): an earlier frame's vertex data
+// over the race summary's draw constants and descriptor tables (the driver figure flickered
+// and glowed green). CPU changes (write faults, hot pages found changed) and GPU writes now
+// share one sequence; a part whose page the CPU changed after the GPU wrote it keeps the CPU's
+// bytes. -DisablePerf 92 copies back as before.
+static bool WriterOrderEnabled() {
+    static const bool enabled = Common::PerfFeatureEnabled(92);
+    return enabled;
+}
+
+void BufferCache::NoteCpuChange(VAddr address, u64 size) {
+    if (!WriterOrderEnabled()) {
+        return;
+    }
+    const u64 seq = write_seq.fetch_add(1, std::memory_order_relaxed);
+    const VAddr end = address + std::max<u64>(size, 1);
+    std::scoped_lock lk{cpu_change_mutex};
+    if (cpu_change_seqs.size() > (1u << 21)) {
+        cpu_change_seqs.clear();
+    }
+    for (VAddr page = Common::AlignDown(address, 4_KB); page < end; page += 4_KB) {
+        cpu_change_seqs[page] = seq;
+    }
+}
+
+void BufferCache::NoteGpuWriteSeq(VAddr address, u64 size) {
+    if (!WriterOrderEnabled() || size == 0) {
+        return;
+    }
+    const u64 seq = write_seq.fetch_add(1, std::memory_order_relaxed);
+    gpu_write_seqs.Subtract(address, size);
+    gpu_write_seqs.Add(address, size, seq);
+    NoteGpuWriteOverReadbackPages(address, size); // FIX-073
+}
+
+// FIX-073: hot-page readbacks (PERF-010) copied GPU data back over CPU writes. The CPU rewrites
+// GT Sport's per-frame memory on these pages without faulting (they are not write-protected), so
+// its writes never reached the GPU copy. A shader writing part of the page was bound over the
+// whole range, the readback copied the whole range back, and the bytes the shader did not write
+// came back stale: an earlier frame's vertex data over the race summary's vertex buffer tables
+// (garbage V#s, FIX-053; DIAG-071/072 traced it). A faster recorder made it common. Each readback
+// page keeps the guest bytes the GPU copy last took in; before a shader writes over the page, the
+// bytes the CPU changed since are copied to the GPU, and a readback is not recorded over bytes
+// the CPU changed after that. -DisablePerf 99 copies back as before.
+void BufferCache::NoteSnapshotUpdate(VAddr page, const char* reason) {
+    // DIAG-073 (under readback_hash_mutex)
+    if (TraceReadbacks()) {
+        if (snapshot_updates.size() > 8192) {
+            snapshot_updates.clear();
+        }
+        snapshot_updates[page] = {TraceNowNs(), reason};
+    }
+}
+
+std::string BufferCache::DescribeReadbackPage(VAddr address) {
+    const VAddr page = Common::AlignDown(address, 4_KB);
+    const s64 now = TraceNowNs();
+    std::scoped_lock lk{readback_hash_mutex};
+    std::string out = fmt::format("page {:#x}:", page);
+    if (const auto it = hot_page_since_ns.find(page); it != hot_page_since_ns.end()) {
+        out += fmt::format(" hot since {:.1f} ms ago;", (now - it->second) / 1e6);
+    } else {
+        out += " not seen hot;";
+    }
+    out += pending_snapshot_pages.contains(page) ? " snapshot pending;" : "";
+    if (const auto it = readback_page_snapshots.find(page);
+        it != readback_page_snapshots.end() && it->second) {
+        std::array<u8, 4096> guest;
+        Common::CopyGuest(guest.data(), std::bit_cast<const void*>(page), 4_KB);
+        u32 differ = 0;
+        for (u32 i = 0; i < 4096; ++i) {
+            differ += guest[i] != (*it->second)[i];
+        }
+        out += fmt::format(" snapshot differs from guest in {} bytes;", differ);
+    } else {
+        out += " no snapshot;";
+    }
+    if (const auto it = snapshot_updates.find(page); it != snapshot_updates.end()) {
+        out += fmt::format(" snapshot last set {:.1f} ms ago by {}", (now - it->second.first) / 1e6,
+                           it->second.second);
+    }
+    return out;
+}
+
+void BufferCache::NoteGpuWriteOverReadbackPages(VAddr address, u64 size) {
+    if (!ReadbackHashEnabled() || hot_page_order.empty()) {
+        return;
+    }
+    const VAddr end = address + size;
+    for (const VAddr page : hot_page_order) {
+        if (page >= end || address >= page + 4_KB) {
+            continue;
+        }
+        std::scoped_lock lk{readback_hash_mutex};
+        auto& snapshot = readback_page_snapshots[page];
+        if (!snapshot) {
+            if (readback_page_snapshots.size() > 4096) {
+                readback_page_snapshots.clear();
+                continue;
+            }
+            // First seen: the GPU copy is taken to match guest memory.
+            snapshot = std::make_unique<std::array<u8, 4096>>();
+            Common::CopyGuest(snapshot->data(), std::bit_cast<const void*>(page), 4_KB);
+            pending_snapshot_pages.erase(page);
+            NoteSnapshotUpdate(page, "GPU write (first)");
+        }
+    }
+}
+
+void BufferCache::SyncUnseenCpuWrites(const Buffer* arena, VAddr address, u64 size) {
+    if (!ReadbackHashEnabled() || hot_page_order.empty()) {
+        return;
+    }
+    const VAddr end = address + size;
+    std::array<u8, 4096> now;
+    for (const VAddr page : hot_page_order) {
+        if (page >= end || address >= page + 4_KB) {
+            continue;
+        }
+        std::scoped_lock lk{readback_hash_mutex};
+        const auto it = readback_page_snapshots.find(page);
+        if (it == readback_page_snapshots.end() || !it->second) {
+            continue;
+        }
+        auto& snapshot = *it->second;
+        Common::CopyGuest(now.data(), std::bit_cast<const void*>(page), 4_KB);
+        const u32 last = static_cast<u32>(std::min(end, page + 4_KB) - page);
+        u32 i = static_cast<u32>(std::max(address, page) - page);
+        while (i < last) {
+            while (i < last && now[i] == snapshot[i]) {
+                ++i;
+            }
+            if (i >= last) {
+                break;
+            }
+            u32 j = i;
+            while (j < last && now[j] != snapshot[j]) {
+                ++j;
+            }
+            // vkCmdUpdateBuffer works in 4-byte units.
+            const u32 lo = i & ~3u;
+            const u32 hi = std::min<u32>((j + 3) & ~3u, 4096);
+            runtime.InlineData(arena, page + lo - arena->cpu_addr,
+                               std::span<const u8>{now.data() + lo, hi - lo});
+            std::memcpy(snapshot.data() + lo, now.data() + lo, hi - lo);
+            unseen_cpu_bytes_synced += hi - lo;
+            NoteSnapshotUpdate(page, "unseen CPU write sync");
+            i = j;
+        }
+    }
+}
+
+bool BufferCache::CpuRewroteReadbackRange(VAddr start, VAddr end) {
+    if (!ReadbackHashEnabled()) {
+        return false;
+    }
+    std::scoped_lock lk{readback_hash_mutex};
+    for (VAddr page = Common::AlignDown(start, 4_KB); page < end; page += 4_KB) {
+        const auto it = readback_page_snapshots.find(page);
+        if (it == readback_page_snapshots.end() || !it->second) {
+            continue;
+        }
+        const VAddr s = std::max(start, page);
+        const VAddr e = std::min<VAddr>(end, page + 4_KB);
+        if (std::memcmp(std::bit_cast<const void*>(s), it->second->data() + (s - page), e - s) !=
+            0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void BufferCache::RefreshReadbackPageHashes(VAddr address, u64 size) {
+    if (!ReadbackHashEnabled()) {
+        return;
+    }
+    // The renderer wrote GPU data into guest memory (or the GPU copy took in guest bytes): those
+    // bytes now match the GPU copy.
+    std::scoped_lock lk{readback_hash_mutex};
+    if (readback_page_snapshots.empty() && pending_snapshot_pages.empty()) {
+        return;
+    }
+    const VAddr end = address + std::max<u64>(size, 1);
+    const auto refresh = [&](VAddr page, std::array<u8, 4096>& snapshot) {
+        const VAddr s = std::max(address, page);
+        const VAddr e = std::min<VAddr>(end, page + 4_KB);
+        Common::CopyGuest(snapshot.data() + (s - page), std::bit_cast<const void*>(s), e - s);
+        NoteSnapshotUpdate(page, "renderer write or upload");
+    };
+    const VAddr first = Common::AlignDown(address, 4_KB);
+    // A page that became hot at a CPU fault gets its snapshot once the fault's GPU data is in
+    // guest memory, before the faulting thread goes on to write it.
+    for (auto it = pending_snapshot_pages.begin(); it != pending_snapshot_pages.end();) {
+        const VAddr page = *it;
+        if (page < end && first < page + 4_KB) {
+            auto& snapshot = readback_page_snapshots[page];
+            if (!snapshot) {
+                snapshot = std::make_unique<std::array<u8, 4096>>();
+                Common::CopyGuest(snapshot->data(), std::bit_cast<const void*>(page), 4_KB);
+                NoteSnapshotUpdate(page, "fault write-back");
+            }
+            it = pending_snapshot_pages.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    if ((end - first) / 4_KB > readback_page_snapshots.size()) {
+        for (auto& [page, snapshot] : readback_page_snapshots) {
+            if (snapshot && page < end && first < page + 4_KB) {
+                refresh(page, *snapshot);
+            }
+        }
+        return;
+    }
+    for (VAddr page = first; page < end; page += 4_KB) {
+        const auto it = readback_page_snapshots.find(page);
+        if (it != readback_page_snapshots.end() && it->second) {
+            refresh(page, *it->second);
+        }
+    }
+}
+
+template <typename Keep, typename Drop>
+void BufferCache::SplitByWriter(VAddr start, VAddr end, Keep&& keep, Drop&& drop) {
+    if (!WriterOrderEnabled()) {
+        keep(start, end);
+        return;
+    }
+    std::scoped_lock lk{cpu_change_mutex};
+    VAddr run_start = start;
+    bool run_cpu = false;
+    for (VAddr page = Common::AlignDown(start, 4_KB); page < end; page += 4_KB) {
+        const VAddr s = std::max(start, page);
+        const VAddr e = std::min<VAddr>(end, page + 4_KB);
+        bool cpu_newer = false;
+        if (const auto it = cpu_change_seqs.find(page); it != cpu_change_seqs.end()) {
+            u64 gpu = ~u64{0};
+            bool any = false;
+            gpu_write_seqs.ForEachInRange(s, e - s, [&](VAddr, VAddr, u64 seq) {
+                gpu = std::min(gpu, seq);
+                any = true;
+            });
+            cpu_newer = !any || it->second > gpu;
+        }
+        if (s == start) {
+            run_cpu = cpu_newer;
+        } else if (cpu_newer != run_cpu) {
+            if (run_cpu) {
+                drop(run_start, s);
+            } else {
+                keep(run_start, s);
+            }
+            run_start = s;
+            run_cpu = cpu_newer;
+        }
+    }
+    if (run_cpu) {
+        drop(run_start, end);
+    } else {
+        keep(run_start, end);
+    }
+}
+
+// FIX-063: a CPU fault writes GPU results back for the whole 512 KB window around it. On a page
+// nobody watches (a hot page tracked by hashing), the CPU writes without faulting, so its bytes
+// can be newer than GPU-written ones still recorded there; writing those back put stale GPU data
+// over them. GT Sport reuses its per-frame memory (draw constants and descriptor tables) where an
+// earlier frame's GPU work wrote vertex data, and a flush for a fault nearby put that vertex data
+// back over the new frame's tessellation constants and tables (the race summary's driver figure
+// flickered and glowed green). Only the faulting pages and pages still watched get GPU bytes;
+// the others keep the CPU's. -DisablePerf 86 writes back the whole window as before.
+static void SplitWriteback(VAddr start, VAddr end, VAddr fault_addr, u64 fault_size,
+                           const PageManager& pages,
+                           const std::function<void(VAddr, VAddr)>& keep,
+                           const std::function<void(VAddr, VAddr)>& drop) {
+    static const bool enabled = Common::PerfFeatureEnabled(86);
+    // -DisablePerf 87 also writes back pages still watched, as in the first version.
+    static const bool faulting_pages_only = Common::PerfFeatureEnabled(87);
+    if (!enabled) {
+        keep(start, end);
+        return;
+    }
+    const VAddr fault_first = Common::AlignDown(fault_addr, 4_KB);
+    const VAddr fault_end = Common::AlignUp(fault_addr + std::max<u64>(fault_size, 1), 4_KB);
+    VAddr run_start = start;
+    bool run_kept = true;
+    for (VAddr page = Common::AlignDown(start, 4_KB); page < end; page += 4_KB) {
+        const VAddr s = std::max(start, page);
+        // Only the pages being faulted on: GPU-written ranges elsewhere in the window can be
+        // whole bound buffers whose GPU copy is older game data (GT Sport binds buffers of
+        // hundreds of MB), and they get their own fault when the game touches them.
+        const bool kept = (page >= fault_first && page < fault_end) ||
+                          (!faulting_pages_only && !pages.IsUnwatched(page));
+        if (s == start) {
+            run_kept = kept;
+        } else if (kept != run_kept) {
+            (run_kept ? keep : drop)(run_start, s);
+            run_start = s;
+            run_kept = kept;
+        }
+    }
+    (run_kept ? keep : drop)(run_start, end);
+}
+
 std::shared_ptr<BufferCache::FaultDownload> BufferCache::BeginFaultFlush(VAddr device_addr,
                                                                          u64 size, bool is_write,
                                                                          u64 exact_write_size) {
@@ -862,18 +1333,40 @@ std::shared_ptr<BufferCache::FaultDownload> BufferCache::BeginFaultFlush(VAddr d
     auto fault = std::make_shared<FaultDownload>();
     u64 total_size_bytes = 0;
     const VAddr arena_base = arena->cpu_addr;
+    std::vector<std::pair<VAddr, VAddr>> dropped; // FIX-063
+    std::vector<std::pair<VAddr, VAddr>> cpu_newer; // FIX-069
     memory_tracker->ForEachDownloadRange<false>(
         window_start, window_end - window_start, [&](u64 address, u64 range_size) {
-            gpu_modified_ranges.ForEachInRange(address, range_size, [&](VAddr start, VAddr end) {
-                fault->copies.push_back(vk::BufferCopy{
-                    .srcOffset = start - arena_base,
-                    .dstOffset = total_size_bytes,
-                    .size = end - start,
-                });
-                fault->ranges.emplace_back(start, end);
-                total_size_bytes += Common::AlignUp(end - start, 64);
+            gpu_modified_ranges.ForEachInRange(address, range_size, [&](VAddr start_all,
+                                                                        VAddr end_all) {
+                SplitByWriter(start_all, end_all, [&](VAddr start, VAddr end) {
+                SplitWriteback(
+                    start, end, device_addr, size, page_manager,
+                    [&](VAddr s, VAddr e) {
+                        fault->copies.push_back(vk::BufferCopy{
+                            .srcOffset = s - arena_base,
+                            .dstOffset = total_size_bytes,
+                            .size = e - s,
+                        });
+                        fault->ranges.emplace_back(s, e);
+                        total_size_bytes += Common::AlignUp(e - s, 64);
+                    },
+                    [&](VAddr s, VAddr e) { dropped.emplace_back(s, e); });
+                }, [&](VAddr s, VAddr e) { cpu_newer.emplace_back(s, e); });
             });
         });
+    for (const auto& [s, e] : cpu_newer) {
+        // FIX-069: the CPU changed these bytes after the GPU wrote them; they are the CPU's.
+        gpu_modified_ranges.Subtract(s, e - s);
+        ++writebacks_cpu_newer;
+    }
+    for (const auto& [s, e] : dropped) {
+        // On an unwatched page the CPU's bytes are the current ones now; a watched page keeps
+        // its GPU-written bytes until a fault on it flushes them.
+        if (page_manager.IsUnwatched(Common::AlignDown(s, 4_KB))) {
+            gpu_modified_ranges.Subtract(s, e - s);
+        }
+    }
     if (total_size_bytes == 0) {
         // Nothing GPU-written: DownloadMemory would return at once.
         if (is_write) {
@@ -886,6 +1379,11 @@ std::shared_ptr<BufferCache::FaultDownload> BufferCache::BeginFaultFlush(VAddr d
     fault->is_write = is_write;
     fault->window_start = window_start;
     fault->window_end = window_end;
+    if (!dropped.empty()) {
+        // FIX-063: only the faulting pages stop being GPU-written when this flush finishes.
+        fault->window_start = std::max(window_start, Common::AlignDown(device_addr, 4_KB));
+        fault->window_end = std::min(window_end, Common::AlignUp(device_addr + size, 4_KB));
+    }
     fault->download =
         staging_pool.Request(total_size_bytes, VideoCore::MemoryType::HostCached, 0, true);
     for (auto& copy : fault->copies) {
@@ -895,6 +1393,14 @@ std::shared_ptr<BufferCache::FaultDownload> BufferCache::BeginFaultFlush(VAddr d
     fault->snapshots.reserve(fault->copies.size());
     for (const auto& copy : fault->copies) {
         const u8* guest = std::bit_cast<const u8*>(arena_base + copy.srcOffset);
+#ifdef RYTY_GPU
+        // Memory the game released or protected since the GPU wrote it is neither read nor
+        // written back (an empty snapshot skips the copy).
+        if (!Core::RytyMemory::IsGuestReadable(arena_base + copy.srcOffset, copy.size)) {
+            fault->snapshots.emplace_back();
+            continue;
+        }
+#endif
         fault->snapshots.emplace_back(guest, guest + copy.size);
     }
     // A readback recorded before this download must not complete over it.
@@ -914,6 +1420,14 @@ std::shared_ptr<BufferCache::FaultDownload> BufferCache::BeginFaultFlush(VAddr d
             const auto& copy = fault->copies[c];
             const VAddr start = arena_base + copy.srcOffset;
             const u8* src = fault->download.mapped + (copy.dstOffset - fault->download.offset);
+            if (fault->snapshots[c].empty()) {
+                continue;
+            }
+#ifdef RYTY_GPU
+            if (!Core::RytyMemory::IsGuestReadable(start, copy.size)) {
+                continue;
+            }
+#endif
             const u8* snapshot = fault->snapshots[c].data();
             const u8* guest = std::bit_cast<const u8*>(start);
             for (const auto& [s, e] : PartsWithoutNewerWrites(start, start + copy.size,
@@ -999,7 +1513,10 @@ void BufferCache::FinishFaultFlush(FaultDownload& fault) {
     }
 }
 
-void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size) {
+void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size,
+                                 VAddr fault_addr, u64 fault_size) {
+    // FIX-063: GPU-written parts not written back here, on pages still watched.
+    std::vector<std::pair<VAddr, VAddr>> kept_gpu;
     boost::container::small_vector<vk::BufferCopy, 1> copies;
     u64 total_size_bytes = 0;
     const VAddr arena_base = arena->cpu_addr;
@@ -1017,7 +1534,12 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
             constexpr u64 mask = ~(align - 1ULL);
             total_size_bytes += (new_size + align - 1) & mask;
         };
-        gpu_modified_ranges.ForEachInRange(address, size, add_download);
+        gpu_modified_ranges.ForEachInRange(address, size, [&](VAddr start_all, VAddr end_all) {
+            SplitByWriter(start_all, end_all, [&](VAddr start, VAddr end) {
+            SplitWriteback(start, end, fault_addr, fault_size, page_manager, add_download,
+                           [&](VAddr s, VAddr e) { kept_gpu.emplace_back(s, e); }); // FIX-063
+            }, [&](VAddr, VAddr) { ++writebacks_cpu_newer; }); // FIX-069
+        });
         gpu_modified_ranges.Subtract(address, size);
     });
     if (total_size_bytes == 0) {
@@ -1046,6 +1568,12 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
                                 copy.size);
     }
     memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, false);
+    for (const auto& [s, e] : kept_gpu) {
+        if (!page_manager.IsUnwatched(Common::AlignDown(s, 4_KB))) {
+            gpu_modified_ranges.Add(s, e - s);
+            memory_tracker->MarkRegionAsGpuModified(s, e - s);
+        }
+    }
 }
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
@@ -1078,7 +1606,9 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     EnsureResident(arena, first_block, last_block);
     SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
     if (is_written) {
+        SyncUnseenCpuWrites(arena, device_addr, size); // FIX-073
         gpu_modified_ranges.Add(device_addr, size);
+        NoteGpuWriteSeq(device_addr, size); // FIX-069
         NoteGpuWrite(device_addr, size);
         if (size <= 4_KB) {
             if (small_gpu_writers.size() > 65536) {
@@ -1273,7 +1803,7 @@ static void HashPages(size_t count, PageAt&& page_at, std::span<u64> hashes) {
         return;
     }
     for (size_t i = 0; i < count; ++i) {
-        hashes[i] = XXH3_64bits(std::bit_cast<const void*>(page_at(i)), BYTES_PER_PAGE);
+        hashes[i] = Core::HashGuestBytes(page_at(i), BYTES_PER_PAGE);
     }
 }
 
@@ -1302,7 +1832,7 @@ void BufferCache::HashPagesAhead(std::span<const std::pair<VAddr, u64>> ranges, 
         for (const VAddr page : pages) {
             if (memory->IsMappedAddress(page)) {
                 ahead_hashes.Store(page, epoch,
-                                   XXH3_64bits(std::bit_cast<const void*>(page), BYTES_PER_PAGE));
+                                   Core::HashGuestBytes(page, BYTES_PER_PAGE));
             }
         }
     });
@@ -1311,9 +1841,19 @@ void BufferCache::HashPagesAhead(std::span<const std::pair<VAddr, u64>> ranges, 
 
 std::optional<std::pair<const Buffer*, u64>> BufferCache::ObtainBufferAhead(
     VAddr device_addr, u32 size, bool is_written, bool is_texel_buffer,
-    AheadUploads& uploads) {
+    AheadUploads& uploads, bool* overlapped_out) {
     std::scoped_lock lk{mutex};
-    if (size == 0 || texture_cache.AnyImageInRegion(device_addr, size)) {
+    // PERF-079: a range under images is obtained ahead through the arena as well; the recorder
+    // exports the images before using it (ExportImagesOver). In GT Sport's races a third of the
+    // buffers the stage was given lie under images, and each stopped it. -DisablePerf 84 leaves
+    // them to the recorder.
+    static const bool overlaps_ahead = Common::PerfFeatureEnabled(84);
+    bool overlapped = false;
+    if (size != 0 && overlaps_ahead && overlapped_out &&
+        texture_cache.AnyImageInRegion(device_addr, size)) {
+        overlapped = true;
+        *overlapped_out = true;
+    } else if (size == 0 || texture_cache.AnyImageInRegion(device_addr, size)) {
         ++ahead_refusals[1];
         static std::atomic<u32> logged{};
         if (size != 0 && logged.fetch_add(1) < 40) {
@@ -1328,7 +1868,8 @@ std::optional<std::pair<const Buffer*, u64>> BufferCache::ObtainBufferAhead(
     }
     ApplyCompletedReadbacks();
     ++Common::GetWorkCounters().obtain_buffer;
-    if (!is_written && size <= STREAM_THRESHOLD && !IsRegionGpuModified(device_addr, size)) {
+    if (!is_written && size <= STREAM_THRESHOLD && !overlapped &&
+        !IsRegionGpuModified(device_addr, size)) {
         const auto [data, offset] = ahead_stream.Map(size, instance.UniformMinAlignment(), false);
         if (!data) {
             ++ahead_refusals[2];
@@ -1372,6 +1913,7 @@ std::optional<std::pair<const Buffer*, u64>> BufferCache::ObtainBufferAhead(
     ahead_uploads = nullptr;
     if (is_written) {
         gpu_modified_ranges.Add(device_addr, size);
+        NoteGpuWriteSeq(device_addr, size); // FIX-069
         NoteGpuWrite(device_addr, size);
         if (size <= 4_KB) {
             if (small_gpu_writers.size() > 65536) {
@@ -1652,7 +2194,9 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
                     hot_unchanged_streak.erase(page);
                 }
                 hot_uploads.push_back({page, generation, hash});
+                NoteCpuChange(page, BYTES_PER_PAGE); // FIX-069
             } else {
+                NoteCpuChange(page, BYTES_PER_PAGE); // FIX-069
                 std::scoped_lock lk{uploaded_pages_mutex};
                 uploaded_page_contents.Forget(page);
             }
@@ -1668,7 +2212,8 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         memory_tracker->CoolHotPages(page, BYTES_PER_PAGE);
         ++hot_pages_cooled;
         // A CPU write between the check and the protection did not fault; it is caught here.
-        if (XXH3_64bits(std::bit_cast<const void*>(page), BYTES_PER_PAGE) != hash) {
+        if (Core::HashGuestBytes(page, BYTES_PER_PAGE) != hash) {
+            NoteCpuChange(page, BYTES_PER_PAGE); // FIX-069
             memory_tracker->MarkRegionAsCpuModified(page, BYTES_PER_PAGE);
             ++hot_pages_cooled_changed;
         }
@@ -1679,6 +2224,32 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
     if (!copies.empty()) {
         for (const auto& copy : copies) {
             RecordWatchedUploads(copy.dstOffset, copy.dstOffset + copy.size);
+            // FIX-073: the GPU copy takes in these guest bytes.
+            RefreshReadbackPageHashes(copy.dstOffset, copy.size);
+        }
+        // FIX-066: bytes uploaded from guest memory are no longer GPU-only: the GPU copy now
+        // holds the CPU's bytes. They stayed listed as GPU-written, and the next CPU fault on
+        // the page wrote that copy back, which by then was older CPU data than guest memory
+        // held (a page the game rewrote while it was hot and unwatched). GT Sport reuses its
+        // per-frame memory this way; an earlier frame's vertex data came back over a later
+        // frame's draw constants and descriptor tables (the race summary's driver figure
+        // flickered and glowed green). -DisablePerf 90 keeps them listed.
+        static const bool forget_uploaded = Common::PerfFeatureEnabled(90);
+        if (forget_uploaded) {
+            for (const auto& copy : copies) {
+                const VAddr start = copy.dstOffset;
+                const VAddr end = start + copy.size;
+                if (!gpu_modified_ranges.Intersects(start, copy.size)) {
+                    continue;
+                }
+                gpu_modified_ranges.Subtract(start, copy.size);
+                for (VAddr page = Common::AlignDown(start, 4_KB); page < end; page += 4_KB) {
+                    if (!gpu_modified_ranges.Intersects(page, 4_KB)) {
+                        memory_tracker->UnmarkRegionAsGpuModified(page, 4_KB, false);
+                    }
+                }
+                ++hot_page_stats.uploads_over_gpu_bytes;
+            }
         }
         Common::GetWorkCounters().uploads += copies.size();
         Common::GetWorkCounters().upload_bytes += total_size_bytes;
@@ -1781,7 +2352,7 @@ u64 BufferCache::HashGuestPage(VAddr page) const {
     if (read_capture && read_capture->Find(page, &hash)) {
         return hash;
     }
-    return XXH3_64bits(std::bit_cast<const void*>(page), BYTES_PER_PAGE);
+    return Core::HashGuestBytes(page, BYTES_PER_PAGE);
 }
 
 void BufferCache::RecordWatchedUploads(VAddr start, VAddr end) {
@@ -1877,7 +2448,7 @@ std::string BufferCache::DescribeRange(VAddr address, u64 size) {
         const auto it = vertex_page_hashes.find(page >> WatchedPageBits);
         if (it == vertex_page_hashes.end()) {
             ++unwatched;
-        } else if (XXH3_64bits(std::bit_cast<const void*>(page), WatchedPageSize) != it->second) {
+        } else if (Core::HashGuestBytes(page, WatchedPageSize) != it->second) {
             ++changed;
         }
     }
@@ -1940,7 +2511,7 @@ void BufferCache::RefreshReadPages(VAddr address, u64 size, u64 shader_hash, boo
         // mapped when the area containing its start, a mapped one, extends over all of it.
         if (page < mapped_from || page + WatchedPageSize > mapped_until) {
             mapped_from = page;
-            mapped_until = memory->MappedAreaEnd(page);
+            mapped_until = memory->MappedAreaEnd(page, address + size);
         }
         if (page + WatchedPageSize > mapped_until ||
             memory_tracker->IsRegionGpuModified(page, WatchedPageSize)) {
@@ -2010,6 +2581,13 @@ bool BufferCache::SynchronizeMetadata(const Buffer* arena, VAddr device_addr, u3
     return false;
 }
 
+bool BufferCache::ExportImagesOver(VAddr device_addr, u32 size) {
+    std::scoped_lock buffer_lock{mutex};
+    const u64 before = image_exports;
+    SynchronizeMemoryFromImage(device_addr, size);
+    return image_exports != before;
+}
+
 bool BufferCache::SynchronizeMemoryFromImage(VAddr device_addr, u32 size) {
     if (size == 0) {
         return false;
@@ -2020,21 +2598,170 @@ bool BufferCache::SynchronizeMemoryFromImage(VAddr device_addr, u32 size) {
     const u64 generation = texture_cache.RegistryGeneration();
     auto& slot =
         no_image_memo[((device_addr >> 6) ^ (device_addr >> 21) ^ size) % no_image_memo.size()];
+    ++image_sync_stats.calls;
     if (memo && slot.address == device_addr && slot.size == size && slot.generation == generation) {
+        ++image_sync_stats.exact_hits;
         return false;
     }
-    std::vector<ImageId> image_ids;
-    const auto collect = [&](ImageId id, Image&) {
-        if (std::ranges::find(image_ids, id) == image_ids.end()) {
-            image_ids.push_back(id);
+    // PERF-077: the same by 64 KB block. Constant and vertex rings put each draw's data at a new
+    // address, so the exact-range memo above rarely hits; their blocks hold no images.
+    // -DisablePerf 77 turns it off.
+    static const bool block_memo = memo && Common::PerfFeatureEnabled(77);
+    if (block_memo) {
+        constexpr u32 BlockBits = 16;
+        const VAddr first = device_addr >> BlockBits;
+        const VAddr last = (device_addr + size - 1) >> BlockBits;
+        bool all_free = last - first < 16;
+        for (VAddr block = first; all_free && block <= last; ++block) {
+            auto& entry = no_image_blocks[block % no_image_blocks.size()];
+            if (entry.block == block && entry.generation == generation) {
+                continue;
+            }
+            bool any = false;
+            texture_cache.ForEachImageInRegion(block << BlockBits, VAddr{1} << BlockBits,
+                                               [&](ImageId, Image&) { any = true; });
+            if (any) {
+                all_free = false;
+            } else {
+                entry = {block, generation};
+            }
         }
-    };
-    texture_cache.ForEachImageInRegion(device_addr, size, collect);
-    const size_t requested_images = image_ids.size();
+        if (all_free) {
+            ++image_sync_stats.block_hits;
+            slot = {device_addr, size, generation};
+            return false;
+        }
+    }
+    image_sync_stats.full_bytes += size;
+    // PERF-086: a range with nothing to export keeps nothing to export until an image is
+    // registered or unregistered or an image's GpuModified, Dirty or BufferCoherent bit changes.
+    // GT Sport binds a 588 MB buffer over its ~1,100 texture-pool images with many draws, and the
+    // check below read every one of those images each time. -DisablePerf 98 checks every time.
+    static const bool quiet_memo_enabled = memo && Common::PerfFeatureEnabled(98);
+    const u64 export_state = g_image_export_state.load(std::memory_order_relaxed);
+    auto& quiet =
+        quiet_memo[((device_addr >> 8) ^ (device_addr >> 24) ^ size) % quiet_memo.size()];
+    if (quiet_memo_enabled && quiet.address == device_addr && quiet.size == size &&
+        quiet.generation == generation && quiet.export_state == export_state) {
+        // DIAG-070: SHADGT_VERIFY_QUIET=1 checks the images anyway and logs disagreements.
+        static const bool verify_quiet = [] {
+            const char* env = std::getenv("SHADGT_VERIFY_QUIET");
+            return env && env[0] == '1';
+        }();
+        if (verify_quiet) {
+            const auto& ids = overlap_memo[((device_addr >> 8) ^ (device_addr >> 24) ^ size) %
+                                           overlap_memo.size()];
+            std::vector<ImageId> fresh;
+            texture_cache.ForEachImageInRegion(device_addr, size,
+                                               [&](ImageId id, Image&) { fresh.push_back(id); });
+            for (const ImageId id : fresh) {
+                const auto& image = texture_cache.GetImage(id);
+                const ImageFlagBits flags = image.flags;
+                if (True(flags & ImageFlagBits::GpuModified) &&
+                    False(flags & ImageFlagBits::Dirty) &&
+                    False(flags & ImageFlagBits::BufferCoherent)) {
+                    static std::atomic<u32> logged{};
+                    if (logged++ < 40) {
+                        LOG_WARNING(Render_Vulkan,
+                                    "DIAG-070: quiet range {:#x}+{:#x} has image {} at {:#x}+{:#x} "
+                                    "to export (flags {:#x}, memo list {} of {}, state {})",
+                                    device_addr, size, id.index, image.info.guest_address,
+                                    image.info.guest_size, u32(flags),
+                                    std::ranges::find(ids.ids, id) != ids.ids.end() ? "in" : "not in",
+                                    ids.ids.size(), export_state);
+                    }
+                    break;
+                }
+            }
+        }
+        ++image_sync_stats.quiet_hits;
+        ++image_sync_stats.with_images;
+        ++image_sync_stats.nothing_to_export;
+        return true;
+    }
+    // PERF-078: the images over a range stay the same until one is registered or unregistered,
+    // so a repeated range reuses the list of its last walk. GT Sport binds buffers over its
+    // texture pools with every draw (one of 588 MB over 2347 images), and each was walked and
+    // its images searched for duplicates (quadratic) every time. One walk reports an image once,
+    // so its list needs no search. -DisablePerf 78 walks and searches every time.
+    static const bool overlap_memo_enabled = memo && Common::PerfFeatureEnabled(78);
+    auto& overlap =
+        overlap_memo[((device_addr >> 8) ^ (device_addr >> 24) ^ size) % overlap_memo.size()];
+    std::vector<ImageId> walked;
+    const std::vector<ImageId>* first_level = &walked;
+    if (overlap_memo_enabled && overlap.address == device_addr && overlap.size == size &&
+        overlap.generation == generation) {
+        first_level = &overlap.ids;
+        ++image_sync_stats.overlap_hits;
+    } else if (overlap_memo_enabled) {
+        texture_cache.ForEachImageInRegion(device_addr, size,
+                                           [&](ImageId id, Image&) { walked.push_back(id); });
+        if (!walked.empty()) {
+            overlap.address = device_addr;
+            overlap.size = size;
+            overlap.generation = generation;
+            overlap.ids = walked;
+        }
+    } else {
+        texture_cache.ForEachImageInRegion(device_addr, size, [&](ImageId id, Image&) {
+            if (std::ranges::find(walked, id) == walked.end()) {
+                walked.push_back(id);
+            }
+        });
+    }
+    const size_t requested_images = first_level->size();
+    if (size >= (64u << 20)) {
+        ++image_sync_stats.large;
+        image_sync_stats.large_with_images += requested_images != 0;
+        if (image_sync_stats.large <= 3) {
+            image_sync_stats.samples += fmt::format(" {:#x}+{:#x} ({} images)", device_addr, size,
+                                                    requested_images);
+        }
+    }
     if (requested_images == 0) {
+        ++image_sync_stats.full_free;
         slot = {device_addr, size, generation};
         return false;
     }
+    ++image_sync_stats.with_images;
+    // PERF-078: only an image that is current on the GPU and not exported yet can be exported
+    // (PlanImageAliasExports); with none over the range there is nothing to plan.
+    if (overlap_memo_enabled && std::ranges::none_of(*first_level, [&](ImageId id) {
+            const auto flags = texture_cache.GetImage(id).flags;
+            return True(flags & ImageFlagBits::GpuModified) &&
+                   False(flags & ImageFlagBits::Dirty) &&
+                   False(flags & ImageFlagBits::BufferCoherent);
+        })) {
+        ++image_sync_stats.nothing_to_export;
+        quiet = {device_addr, size, generation, export_state};
+        return true;
+    }
+    std::vector<ImageId> image_ids = *first_level;
+    // PERF-085: images already listed are marked by slot index (a hash set of every image over
+    // the range cost about 5% of the recorder in races).
+    if (++listed_stamp == 0) {
+        std::ranges::fill(listed_stamps, 0u);
+        listed_stamp = 1;
+    }
+    const auto mark_listed = [&](ImageId id) {
+        if (id.index >= listed_stamps.size()) {
+            listed_stamps.resize(std::max<size_t>(id.index + 1, listed_stamps.size() * 2), 0u);
+        }
+        u32& stamp = listed_stamps[id.index];
+        if (stamp == listed_stamp) {
+            return false;
+        }
+        stamp = listed_stamp;
+        return true;
+    };
+    for (const auto id : image_ids) {
+        mark_listed(id);
+    }
+    const auto collect = [&](ImageId id, Image&) {
+        if (mark_listed(id)) {
+            image_ids.push_back(id);
+        }
+    };
     // Full exports must also consider aliases outside the requested buffer slice.
     for (size_t i = 0; i < requested_images; ++i) {
         const auto& image = texture_cache.GetImage(image_ids[i]);
@@ -2045,14 +2772,52 @@ bool BufferCache::SynchronizeMemoryFromImage(VAddr device_addr, u32 size) {
     }
     std::vector<ImageAliasFootprint> footprints;
     footprints.reserve(image_ids.size());
+    // FIX-065: an image the GPU drew into a while ago, on memory whose CPU writes nobody watches
+    // (a hot page tracked by hashing), may have had its memory reused by the game since: the
+    // CPU's newer bytes would not mark it Dirty. GT Sport draws vertex data into render targets
+    // in its per-frame memory; exporting such an old target into a buffer bound over it, and
+    // writing that back on the next CPU fault, put old vertex data over a later frame's draw
+    // constants and descriptor tables (the race summary's driver figure flickered and glowed
+    // green). Those are not exported. -DisablePerf 89 exports them as before.
+    static const bool skip_stale_exports = Common::PerfFeatureEnabled(89);
+    constexpr s64 StaleNs = 50'000'000;
+    const s64 now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           std::chrono::steady_clock::now().time_since_epoch())
+                           .count();
+    const auto may_be_stale = [&](const Image& image) {
+        // Only an image that would be exported is checked, on at most 64 of its pages spread
+        // over it (the whole walk cost about 2% of the recorder in races).
+        if (!skip_stale_exports || False(image.flags & ImageFlagBits::GpuModified) ||
+            True(image.flags & ImageFlagBits::Dirty) ||
+            True(image.flags & ImageFlagBits::BufferCoherent) ||
+            now_ns - image.gpu_write_ns < StaleNs) {
+            return false;
+        }
+        const VAddr first = Common::AlignDown(image.info.guest_address, 4_KB);
+        const VAddr end = image.info.guest_address + image.info.guest_size;
+        const u64 pages = (end - first + 4_KB - 1) / 4_KB;
+        const u64 step = std::max<u64>(1, pages / 64);
+        for (u64 i = 0; i < pages; i += step) {
+            if (page_manager.IsUnwatched(first + i * 4_KB)) {
+                return true;
+            }
+        }
+        return page_manager.IsUnwatched(Common::AlignDown(end - 1, 4_KB));
+    };
     for (const auto id : image_ids) {
         const auto& image = texture_cache.GetImage(id);
         const auto& info = image.info;
-        const bool exportable = info.num_samples == 1 && image.backing->num_samples == 1 &&
-                                !info.props.has_stencil && info.guest_size <= UINT32_MAX &&
+        const bool stale = may_be_stale(image);
+        image_sync_stats.stale_skipped += stale;
+        const bool exportable = !stale && info.num_samples == 1 &&
+                                image.backing->num_samples == 1 && !info.props.has_stencil &&
+                                info.guest_size <= UINT32_MAX &&
                                 info.pixel_format == image.backing->image.image_ci.format;
+        // A stale image is treated as overwritten by the CPU: it neither exports nor holds back
+        // newer images over the same memory.
         footprints.push_back(DescribeImageAlias(
-            info.guest_address, info.guest_size, image.flags,
+            info.guest_address, info.guest_size,
+            stale ? image.flags | ImageFlagBits::Dirty : image.flags,
             gpu_modified_ranges.Intersects(info.guest_address, info.guest_size), exportable));
     }
     for (const auto& export_image : PlanImageAliasExports(footprints, device_addr, size)) {
@@ -2090,6 +2855,7 @@ bool BufferCache::SynchronizeMemoryFromImage(VAddr device_addr, u32 size) {
         ApplyCompletedReadbacks();
         memory_tracker->MarkRegionAsGpuModified(export_image.address, export_image.size);
         gpu_modified_ranges.Add(export_image.address, export_image.size);
+        NoteGpuWriteSeq(export_image.address, export_image.size); // FIX-069
         NoteGpuWrite(export_image.address, export_image.size);
         if (large_gpu_writers.size() > 16384) {
             large_gpu_writers.clear();
@@ -2097,6 +2863,7 @@ bool BufferCache::SynchronizeMemoryFromImage(VAddr device_addr, u32 size) {
         large_gpu_writers[export_image.address] =
             GpuWriter{"image export", 0, export_image.address, export_image.size};
         image.flags |= ImageFlagBits::BufferCoherent;
+        ++image_exports;
         if (image_alias_exports_logged < 16) {
             ++image_alias_exports_logged;
             LOG_INFO(
@@ -2143,6 +2910,8 @@ void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
     };
 
     info.AddWait(signal_sema, signal_tick);
+    // PERF-084: the scheduler no longer holds the queue lock around its submit callback.
+    std::scoped_lock queue_lock{Vulkan::Scheduler::submit_mutex};
     auto submit_result = instance.GetGraphicsQueue().bindSparse(sparse_info);
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
 

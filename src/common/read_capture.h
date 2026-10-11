@@ -114,6 +114,14 @@ private:
 /// each job it takes from a captured submission), or null.
 extern thread_local const ReadCapture* t_read_capture;
 
+#ifdef RYTY_GPU
+} // namespace Common
+namespace Core::RytyMemory {
+bool GuardedCopy(void* dest, const void* source, size_t size);
+}
+namespace Common {
+#endif
+
 /// Copies guest memory, taking the bytes from the current thread's capture where it has them.
 inline void CopyGuest(void* dest, const void* source, size_t size) {
     if (const ReadCapture* capture = t_read_capture) [[unlikely]] {
@@ -123,7 +131,15 @@ inline void CopyGuest(void* dest, const void* source, size_t size) {
                       });
         return;
     }
+#ifdef RYTY_GPU
+    // FIX-058: a garbage descriptor can point at memory that is not mapped (GT Sport's
+    // tessellation constants on the race summary); such a copy reads zeros instead of faulting.
+    if (!Core::RytyMemory::GuardedCopy(dest, source, size)) {
+        std::memset(dest, 0, size);
+    }
+#else
     std::memcpy(dest, source, size);
+#endif
 }
 
 } // namespace Common

@@ -155,6 +155,25 @@ struct PageManager::Impl {
         return guarded;
     }
 
+#ifdef RYTY_GPU
+    /// Ryty: the game changed the protection of the range (sceKernelMprotect), which replaced
+    /// the protections tracking set; tracked pages get them back.
+    void ReapplyProtection(VAddr addr, u64 size) {
+        const u64 page_start = addr >> PM_PAGE_BITS;
+        const u64 page_end = Common::DivCeil(addr + size, PM_PAGE_SIZE);
+        for (u64 page = page_start; page != page_end; ++page) {
+            PageState* state = cached_pages.find(page);
+            if (!state) {
+                continue;
+            }
+            std::scoped_lock lk{locks[page]};
+            if (const auto perms = state->Perms(); perms != Core::MemoryPermission::ReadWrite) {
+                Protect(page << PM_PAGE_BITS, PM_PAGE_SIZE, perms);
+            }
+        }
+    }
+#endif
+
     /// PERF-070: every guard on the page goes (an emulator thread must access it).
     void DropGuards(VAddr page_addr) {
         const u64 page = page_addr >> PM_PAGE_BITS;
@@ -193,12 +212,16 @@ struct PageManager::Impl {
         // Iterate requested pages
         const u64 aligned_addr = page_start << PM_PAGE_BITS;
         const u64 aligned_end = page_end << PM_PAGE_BITS;
+#ifdef RYTY_GPU
+        EnsurePages(aligned_addr, aligned_end);
+#else
         if (!rasterizer->IsMapped(aligned_addr, aligned_end - aligned_addr)) {
             LOG_WARNING(Render,
                         "Tracking memory region {:#x} - {:#x} which is not fully GPU mapped.",
                         aligned_addr, aligned_end);
             EnsurePages(aligned_addr, aligned_end);
         }
+#endif
 
         for (u64 page = page_start; page != page_end; ++page) {
             PageState* state = cached_pages.find(page);
@@ -251,6 +274,12 @@ struct PageManager::Impl {
         const u64 base_page = base_addr >> PM_PAGE_BITS;
         const u64 page_start = bounds.start_word * PAGES_PER_WORD + bounds.start_page;
         const u64 page_end = bounds.end_word * PAGES_PER_WORD + bounds.end_page + 1;
+#ifdef RYTY_GPU
+        // Under Ryty, guest memory is mapped without telling the renderer beforehand, so a
+        // region may be tracked before its pages exist here. Tracking skipped such pages while a
+        // later untrack found them, and the watcher count went below zero.
+        EnsurePages((base_page + page_start) << PM_PAGE_BITS, (base_page + page_end) << PM_PAGE_BITS);
+#endif
 
         Core::MemoryPermission perms{};
         u64 range_begin = base_page + page_start;
@@ -640,6 +669,12 @@ bool PageManager::IsUnwatched(VAddr page) const {
     return !state || (state->num_write_watchers == 0 && state->num_read_watchers == 0 &&
                       state->num_guards == 0);
 }
+
+#ifdef RYTY_GPU
+void PageManager::ReapplyProtection(VAddr address, u64 size) {
+    impl->ReapplyProtection(address, size);
+}
+#endif
 
 void PageManager::DropGuards(VAddr page) {
     impl->DropGuards(page);

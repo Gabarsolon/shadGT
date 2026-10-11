@@ -1160,7 +1160,22 @@ void TextureCache::RefreshImage(Image& image) {
     TRACE_HINT(fmt::format("{:x}:{:x}", image.info.guest_address, image.info.guest_size));
 
     if (True(image.flags & ImageFlagBits::MaybeCpuDirty) &&
-        False(image.flags & ImageFlagBits::CpuDirty)) {
+        False(image.flags & ImageFlagBits::CpuDirty) && image.info.guest_size <= 64_KB) {
+        // FIX-050: the whole image. MarkAsMaybeDirty hashed all of it, while this check hashed
+        // only the first 8x8 pixels, which a glyph's are usually blank in. GT Sport keeps glyph
+        // images side by side in a page; a new glyph written into one after a write elsewhere on
+        // the page (the only fault) left the old glyph on screen (shadPS4 shown as "sCadPS4").
+        thread_local std::vector<u8> bytes;
+        bytes.resize(image.info.guest_size);
+        Common::CopyGuest(bytes.data(), std::bit_cast<u8*>(image.info.guest_address), bytes.size());
+        const u64 hash = XXH3_64bits(bytes.data(), bytes.size());
+        if (image.hash == hash) {
+            image.flags &= ~ImageFlagBits::MaybeCpuDirty;
+            return;
+        }
+        image.hash = hash;
+    } else if (True(image.flags & ImageFlagBits::MaybeCpuDirty) &&
+               False(image.flags & ImageFlagBits::CpuDirty)) {
         // The image size should be less than page size to be considered MaybeCpuDirty
         // So this calculation should be very uncommon and reasonably fast
         // For now we'll just check up to 64 first pixels
@@ -1227,6 +1242,8 @@ void TextureCache::RefreshImage(Image& image) {
 
     // Refresh covers every mip and layer from the canonical guest buffer footprint.
     runtime.UploadImage(&image, buffer, image_copies, true);
+    // FIX-050: the next MarkAsMaybeDirty hashes the guest bytes the GPU copy now holds.
+    image.hash = 0;
 }
 
 vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sharp,

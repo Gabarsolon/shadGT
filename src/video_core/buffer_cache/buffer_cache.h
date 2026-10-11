@@ -23,6 +23,7 @@
 #include "common/types.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/fault_manager.h"
+#include "video_core/texture_cache/types.h"
 #include "common/read_capture.h"
 #include "video_core/buffer_cache/page_hash_table.h"
 #include "video_core/buffer_cache/range_set.h"
@@ -146,8 +147,14 @@ public:
     /// recorder: no image over the range, no metadata, the arena resident. Uploads it needs go
     /// to `uploads` for the recorder to record. Nothing (and nothing changed) otherwise; the
     /// recorder then obtains the buffer itself.
+    /// PERF-079: a range under images is obtained too (through the arena); `overlapped` says so,
+    /// and the recorder exports the images before it uses the buffer (ExportImagesOver).
     [[nodiscard]] std::optional<std::pair<const Buffer*, u64>> ObtainBufferAhead(
-        VAddr device_addr, u32 size, bool is_written, bool is_texel_buffer, AheadUploads& uploads);
+        VAddr device_addr, u32 size, bool is_written, bool is_texel_buffer, AheadUploads& uploads,
+        bool* overlapped = nullptr);
+    /// PERF-079 (recorder): exports the images over a range obtained ahead, as ObtainBuffer
+    /// would have first. True when it exported any (the buffer is then obtained again).
+    bool ExportImagesOver(VAddr device_addr, u32 size);
     /// PERF-067 (recorder): records the copies of a draw's prepared uploads not recorded yet
     /// (ahead of the session's draws when PERF-066 is on).
     void RecordAheadUploads(const AheadUploads& uploads);
@@ -180,7 +187,15 @@ public:
         /// PERF-015: a GDS-to-memory copy; invalidated only by writes to its own bytes, and its
         /// bytes are kept out of uploads until its value reaches guest memory.
         bool is_gds = false;
+        /// DIAG-072: the GPU writers of the range and when it was recorded.
+        std::string writer;
+        s64 recorded_ns{};
     };
+    /// DIAG-072 (SHADGT_TRACE_READBACKS=1): recent readbacks written into guest memory over a
+    /// range: when recorded and completed, how many bytes they changed, and their GPU writers.
+    std::string DescribeRecentReadbacks(VAddr address, u64 size);
+    /// DIAG-073: the readback state of a page (hot since, snapshot, CPU bytes changed).
+    std::string DescribeReadbackPage(VAddr address);
     void RecordGdsReadback(VAddr address, u32 gds_offset, u32 size);
     [[nodiscard]] bool HasPendingAsyncReadbacks() const {
         return num_pending_async_readbacks.load() != 0;
@@ -311,6 +326,7 @@ private:
         u32 page_only_faults{};
         u32 split_faults{};
         u32 gds_split_faults{};
+        u32 uploads_over_gpu_bytes{}; // FIX-066
         std::atomic<u32> cpu_overwrote{};
         struct PageFaults {
             u32 faults{};
@@ -337,6 +353,41 @@ private:
         u64 generation{};
     };
     std::vector<NoImageRange> no_image_memo = std::vector<NoImageRange>(65536);
+    /// PERF-077: 64 KB blocks found free of images, with the registry generation of the check.
+    struct NoImageBlock {
+        VAddr block;
+        u64 generation;
+    };
+    std::vector<NoImageBlock> no_image_blocks = std::vector<NoImageBlock>(16384);
+    /// PERF-078: the images over a range, with the registry generation of the walk.
+    struct ImageOverlapMemo {
+        VAddr address;
+        u32 size;
+        u64 generation;
+        std::vector<ImageId> ids;
+    };
+    std::vector<ImageOverlapMemo> overlap_memo = std::vector<ImageOverlapMemo>(4096);
+    /// PERF-086: ranges over images with nothing to export, with the registry generation and
+    /// the image export state (g_image_export_state) of the check.
+    struct QuietRange {
+        VAddr address;
+        u32 size;
+        u64 generation;
+        u64 export_state;
+    };
+    std::vector<QuietRange> quiet_memo = std::vector<QuietRange>(4096);
+    /// PERF-085: images already listed in this export plan, by slot index.
+    std::vector<u32> listed_stamps;
+    u32 listed_stamp{};
+    /// DIAG-048: how SynchronizeMemoryFromImage answers, per 2 s.
+    struct ImageSyncStats {
+        u64 calls, exact_hits, block_hits, full_free, with_images, exported, generation;
+        u64 overlap_hits, nothing_to_export, stale_skipped, quiet_hits;
+        u64 full_bytes, full_pages_with_entries;
+        u64 large, large_with_images;
+        std::string samples;
+    } image_sync_stats{};
+    u64 image_exports{}; // PERF-079: images exported to buffers so far
     std::atomic<u64> hot_pages_unchanged{};
     std::atomic<u64> hot_pages_uploaded{};
     // PERF-064: per hot page, how many checks in a row found it unchanged.
@@ -375,7 +426,8 @@ private:
 
     void EnsureResident(const Buffer* arena, u64 first_block, u64 last_block);
 
-    void DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size);
+    void DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size, VAddr fault_addr,
+                        u64 fault_size);
 
     bool SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size, bool is_written,
                            bool is_texel_buffer);
@@ -397,6 +449,7 @@ private:
     Core::MemoryManager* memory;
     TextureCache& texture_cache;
     std::unique_ptr<MemoryTracker> memory_tracker;
+    PageManager& page_manager; // FIX-063
 
     StreamBuffer stream_buffer;
     // PERF-067: rings the buffer stage fills ahead of the recorder.
@@ -416,6 +469,47 @@ private:
     mutable std::recursive_mutex mutex;
     Buffer gds_buffer;
     RangeSet gpu_modified_ranges;
+    // FIX-069: which of the CPU and the GPU wrote memory last, in one sequence. GPU bytes reach
+    // guest memory only where the GPU wrote after the CPU last changed the page.
+    RangeMap<u64> gpu_write_seqs;
+    std::mutex cpu_change_mutex;
+    std::unordered_map<VAddr, u64> cpu_change_seqs; // per 4 KB page
+    std::atomic<u64> write_seq{1};
+    u64 writebacks_cpu_newer{};
+    void NoteCpuChange(VAddr address, u64 size);
+    void NoteGpuWriteSeq(VAddr address, u64 size);
+    // FIX-073: the guest bytes of each readback page as the GPU copy last took them in (when the
+    // GPU wrote over them, or the renderer wrote GPU data into them). Bytes that differ now are
+    // CPU writes nobody saw (these pages are not write-protected).
+    std::mutex readback_hash_mutex;
+    std::unordered_map<VAddr, std::unique_ptr<std::array<u8, 4096>>> readback_page_snapshots;
+    std::unordered_map<VAddr, s64> hot_page_since_ns; // DIAG-073: when each page became hot
+    std::unordered_set<VAddr> pending_snapshot_pages; // FIX-073: hot, snapshot at next write-back
+    void NoteSnapshotUpdate(VAddr page, const char* reason);
+    std::unordered_map<VAddr, std::pair<s64, const char*>> snapshot_updates; // DIAG-073
+    u64 unseen_cpu_bytes_synced{};
+    void SyncUnseenCpuWrites(const Buffer* arena, VAddr address, u64 size);
+    bool CpuRewroteReadbackRange(VAddr start, VAddr end);
+    struct ReadbackTrace {
+        VAddr address;
+        u32 size;
+        u32 changed_bytes;
+        s64 recorded_ns;
+        s64 completed_ns;
+        std::string writer;
+    };
+    std::mutex readback_trace_mutex;
+    std::deque<ReadbackTrace> readback_trace; // DIAG-072
+    u64 readbacks_cpu_rewrote{};
+    void NoteGpuWriteOverReadbackPages(VAddr address, u64 size);
+
+public:
+    /// FIX-073: a renderer write into guest memory (keeps readback page hashes current).
+    void RefreshReadbackPageHashes(VAddr address, u64 size);
+
+private:
+    template <typename Keep, typename Drop>
+    void SplitByWriter(VAddr start, VAddr end, Keep&& keep, Drop&& drop);
     u32 image_alias_exports_logged{};
     /// DIAG-028: hash of the guest bytes each watched page (4 KB) was last uploaded from.
     std::mutex vertex_pages_mutex;

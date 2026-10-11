@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <bit>
 #include <limits>
+#include <magic_enum/magic_enum.hpp>
 #include "video_core/amdgpu/pixel_format.h"
 #include "video_core/amdgpu/resource.h"
 #include "video_core/renderer_vulkan/vk_common.h"
@@ -22,12 +23,22 @@ enum class ImageDescriptorGeometryError {
     ViewMipLevels,
     SampleCount,
     GuestSizeLimit,
+    ArrayMode,
 };
 
 inline ImageDescriptorGeometryError CheckImageDescriptorGeometry(
     const AmdGpu::Image& image, const vk::PhysicalDeviceLimits& limits) {
     if (!image.Valid()) {
         return ImageDescriptorGeometryError::InvalidType;
+    }
+    // FIX-059: ImageInfo asserts on the linear-general array mode (no real texture uses it); a
+    // garbage T# of GT Sport's grass compute shader 0xaa3822a3 had it and stopped the game in
+    // a race.
+    // GetArrayMode itself stops the emulator on a tile mode it does not know.
+    if (const auto tile_mode = image.GetTileMode();
+        !magic_enum::enum_contains(tile_mode) ||
+        tile_mode == AmdGpu::TileMode::DisplayLinearGeneral) {
+        return ImageDescriptorGeometryError::ArrayMode;
     }
     const u32 layers = image.NumLayers();
     if (layers == 0 || layers > std::numeric_limits<u16>::max()) {

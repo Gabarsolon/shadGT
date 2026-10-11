@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <optional>
+#include <string>
 
 #include <chrono>
 #include <condition_variable>
@@ -237,6 +238,41 @@ public:
             .sequence = ++cmd_buffer_sequence,
         };
     }
+    /// DIAG-061: tessellation constants as they were when the game submitted the draw using them
+    /// (SHADGT_TESS_SUBMIT_CHECK=1).
+    struct TessSubmitRecord {
+        u64 submit{};
+        s64 time_ns{};
+        u32 ls_stride{};
+        bool sane{};
+        bool in_cmd_buffer{};
+    };
+    static std::optional<TessSubmitRecord> FindTessSubmit(VAddr base);
+    /// PERF-082: label writes the buffer stage runs past. The stage notes how far the recorder
+    /// was when it planned a draw; the recorder redoes a planned buffer a label written since
+    /// lies in.
+    u64 LabelsPushed() const {
+        return labels_pushed.load(std::memory_order_acquire);
+    }
+    u64 LabelsDone() const {
+        return labels_done.load(std::memory_order_acquire);
+    }
+    /// Whether a label pushed after `done` and up to `pushed` overlaps the range.
+    bool LabelWrittenOver(u64 done, u64 pushed, VAddr address, u64 size) const;
+    /// DIAG-062: the indirect buffer decoded last differed from its contents at submission.
+    static bool CurrentIbChangedSinceSubmit();
+    /// DIAG-066: how many EOPs were signaled, and which submission the last one ended.
+    static std::string DescribeEops();
+    /// DIAG-063: the indirect buffer the decoder is in (diagnostics only).
+    static std::pair<const u32*, u32> CurrentDecodeIb();
+    static void SetCurrentDecodeIb(const u32* data, u32 dwords);
+    /// DIAG-061: submissions handed over, and the one being decoded now.
+    u64 SubmittedCount() const {
+        return submitted_count.load(std::memory_order_relaxed);
+    }
+    u64 DecodingSubmit() const {
+        return decoding_submit.load(std::memory_order_relaxed);
+    }
     std::pair<u32, u32> CeDeCounters() const {
         return {cblock.ce_count, cblock.de_count};
     }
@@ -329,6 +365,7 @@ private:
     const u32* scan_buffer_end{};
     const u32* scan_resume{};
     bool scan_finished{};
+    bool scan_blocked{}; // FIX-061: stopped at a REWIND the game has not published yet
     // PERF-022: draw packets and nested command buffers the read-ahead has already read in the
     // current submission; each is read once however often a read-ahead passes over it.
     std::unordered_set<const void*> scanned_packets;
@@ -463,6 +500,7 @@ private:
     struct {
         u64 scans;
         double ms;
+        u64 rewinds; // FIX-061
     } pipe_read_ahead_stats{};
     /// Queues the state of the graphics draw being decoded when its pipeline registers
     /// changed, and reads ahead while new pipelines keep appearing.
@@ -530,6 +568,17 @@ private:
     u64 const_dump_sequence{};
     std::array<ConstDumpRecord, 256> recent_cmd_buffers{};
     u64 cmd_buffer_sequence{};
+    std::atomic<u64> submitted_count{}; // DIAG-061
+    // PERF-082
+    struct LabelRecord {
+        std::atomic<u64> seq{};
+        VAddr address{};
+        u64 size{};
+    };
+    std::array<LabelRecord, 4096> label_ring{};
+    std::atomic<u64> labels_pushed{};
+    std::atomic<u64> labels_done{};
+    std::atomic<u64> decoding_submit{};
 
     using CmdBuffer = std::pair<std::span<const u32>, std::span<const u32>>;
     CmdBuffer CopyCmdBuffers(std::span<const u32> dcb, std::span<const u32> ccb);
