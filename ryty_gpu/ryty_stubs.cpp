@@ -101,11 +101,13 @@ std::string MemoryManager::DescribeAddress(VAddr addr) {
     return fmt::format("{:#x} (mapped by Ryty)", addr);
 }
 
+#ifndef RYTY_HAS_CPU_PATCHES // the renderer library builds core/cpu_patches.cpp (FIX-074)
 namespace WindowsGuestRedZoneProtection {
 bool IsStaticPatchingEnabled() noexcept {
     return false;
 }
 } // namespace WindowsGuestRedZoneProtection
+#endif
 
 namespace FileSys {
 bool IsZArchiveFile(const std::filesystem::path&) {

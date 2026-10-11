@@ -2,6 +2,7 @@
 // the window on its own thread, then registers shadGT's Gnm driver and video output.
 
 #include <windows.h>
+#include <tlhelp32.h>
 #include <condition_variable>
 #include <cstdio>
 #include <algorithm>
@@ -10,8 +11,10 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
+#include "common/guest_clock.h"
 #include "common/logging/log.h"
 #include "common/perf_monitor.h"
 #include "common/singleton.h"
@@ -36,6 +39,9 @@
 
 namespace Libraries::SystemService {
 void NoteGameDrew(); // ryty_stubs.cpp: the splash screen ends at the game's first drawn frame
+}
+namespace Vulkan {
+void RytyWatchWrites(std::uint64_t address, std::uint32_t ms, std::string label); // ryty_write_watch.cpp
 }
 
 Frontend::WindowSDL* g_window = nullptr;
@@ -72,9 +78,11 @@ void RunWindowThread() {
     TerminateProcess(GetCurrentProcess(), 0);
 }
 
-// Signals the named event Ryty's save data library waits on before GT Sport's first save mount
-// once the game has drawn its first frame (the boot screen), so loading cannot finish before the
-// boot screen is listening for it.
+// Signals the named event Ryty's save data library waits on before GT Sport's first save access
+// once the game has drawn steadily for half a second (the boot screen is up), so loading cannot
+// finish before the boot screen is listening for it. Before the boot screen nothing draws: the
+// save access is held before the game decides to create a save, so its "Saving" indicator, which
+// would otherwise draw first on a fresh save, has not appeared yet.
 void StartFirstDrawWatcher() {
     char name[64];
     std::snprintf(name, sizeof(name), "Local\\RytyFirstDraw-%lu", GetCurrentProcessId());
@@ -83,11 +91,20 @@ void StartFirstDrawWatcher() {
         return;
     }
     std::thread([event] {
-        while (Common::GetWorkCounters().draws.load(std::memory_order_relaxed) == 0) {
+        auto& draws = Common::GetWorkCounters().draws;
+        while (draws.load(std::memory_order_relaxed) == 0) {
             Sleep(2);
         }
-        SetEvent(event);
         Libraries::SystemService::NoteGameDrew(); // ends the splash screen
+        u64 last = draws.load(std::memory_order_relaxed);
+        for (int drawing = 0; drawing < 5;) {
+            Sleep(100);
+            const u64 now = draws.load(std::memory_order_relaxed);
+            drawing = now != last ? drawing + 1 : 0;
+            last = now;
+        }
+        LOG_INFO(Lib_GnmDriver, "Ryty: the boot screen is drawing; releasing the first save access");
+        SetEvent(event);
     }).detach();
 }
 
@@ -252,6 +269,101 @@ void Ryty::RytyLibraryInitialize() {
     StartInputBridge();
     StartFirstDrawWatcher();
     StartHeapReport();
+    // DIAG-078: SHADGT_LOG_EXCEPTIONS=1 counts every exception raised in GTSport.exe code (first
+    // chance, any handler) by code and exe offset, and logs the counts every 5 seconds.
+    if (const char* env = std::getenv("SHADGT_LOG_EXCEPTIONS"); env && env[0] == '1') {
+        static PVECTORED_EXCEPTION_HANDLER handler = [](EXCEPTION_POINTERS* pointers) -> LONG {
+            static std::mutex mutex;
+            static std::unordered_map<u64, u64> counts;
+            static auto last = std::chrono::steady_clock::now();
+            static const u64 base = reinterpret_cast<u64>(GetModuleHandleA(nullptr));
+            const u64 rip = pointers->ContextRecord->Rip;
+            const u64 code = pointers->ExceptionRecord->ExceptionCode;
+            // SHADGT_LOG_EXCEPTIONS_AT=<from>-<to> (exe offsets): log each exception there.
+            static const std::pair<u64, u64> range = [] {
+                const char* at = std::getenv("SHADGT_LOG_EXCEPTIONS_AT");
+                if (!at || !*at) {
+                    return std::pair<u64, u64>{0, 0};
+                }
+                const std::string text{at};
+                const auto dash = text.find('-');
+                return std::pair<u64, u64>{std::stoull(text.substr(0, dash), nullptr, 16),
+                                           std::stoull(text.substr(dash + 1), nullptr, 16)};
+            }();
+            if (rip - base >= range.first && rip - base < range.second) {
+                std::fprintf(stderr, "[exc] DIAG-078: exception %llx at exe+%llx thread %lu rsp %llx\n",
+                             static_cast<unsigned long long>(code),
+                             static_cast<unsigned long long>(rip - base), GetCurrentThreadId(),
+                             static_cast<unsigned long long>(pointers->ContextRecord->Rsp));
+                std::fflush(stderr);
+            }
+            if (rip < base || rip >= base + 0x4000000) {
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+            std::scoped_lock lock{mutex};
+            ++counts[(code << 32) | (rip - base)];
+            const auto now = std::chrono::steady_clock::now();
+            if (now - last >= std::chrono::seconds(5)) {
+                last = now;
+                std::vector<std::pair<u64, u64>> top(counts.begin(), counts.end());
+                std::ranges::sort(top,
+                                  [](const auto& a, const auto& b) { return a.second > b.second; });
+                std::string line;
+                for (std::size_t i = 0; i < std::min<std::size_t>(top.size(), 2000); ++i) {
+                    line += fmt::format(" {:x}@{:#x}={}", top[i].first >> 32,
+                                        top[i].first & 0xffffffff, top[i].second);
+                }
+                std::fprintf(stderr, "[exc] DIAG-078: exceptions in GTSport.exe (%zu sites):%s\n",
+                             top.size(), line.c_str());
+                std::fflush(stderr);
+            }
+            return EXCEPTION_CONTINUE_SEARCH;
+        };
+        // Registered again every few seconds so it stays ahead of handlers added later.
+        std::thread([] {
+            PVOID registered = nullptr;
+            for (;;) {
+                PVOID next = AddVectoredExceptionHandler(1, handler);
+                if (registered) {
+                    RemoveVectoredExceptionHandler(registered);
+                }
+                registered = next;
+                std::this_thread::sleep_for(std::chrono::seconds(5));
+            }
+        }).detach();
+    }
+    // DIAG-075: SHADGT_WATCH_WRITE=<hex address>:<seconds>:<ms>[;...] logs the writes to a guest
+    // address (thread, code address, value) for ms milliseconds, seconds after the renderer
+    // starts; several watches run one after another.
+    if (const char* watch = std::getenv("SHADGT_WATCH_WRITE"); watch != nullptr && *watch != 0) {
+        std::thread([list = std::string(watch)] {
+            const auto start = std::chrono::steady_clock::now();
+            for (std::size_t pos = 0; pos < list.size();) {
+                const std::size_t end = std::min(list.find(';', pos), list.size());
+                const std::string item = list.substr(pos, end - pos);
+                pos = end + 1;
+                const auto c1 = item.find(':');
+                const auto c2 = item.find(':', c1 + 1);
+                if (c1 == std::string::npos || c2 == std::string::npos) {
+                    continue;
+                }
+                // "x<offset>": an instruction breakpoint at that offset in GTSport.exe.
+                const bool execute = item[0] == 'x';
+                u64 address = std::stoull(item.substr(execute ? 1 : 0, c1 - (execute ? 1 : 0)),
+                                          nullptr, 16);
+                if (execute) {
+                    address += reinterpret_cast<u64>(GetModuleHandleA(nullptr));
+                }
+                const double at = std::stod(item.substr(c1 + 1, c2 - c1 - 1));
+                const u32 ms = static_cast<u32>(std::stoul(item.substr(c2 + 1)));
+                std::this_thread::sleep_until(start + std::chrono::milliseconds(
+                                                          static_cast<long long>(at * 1000)));
+                Vulkan::RytyWatchWrites(address, ms,
+                                        fmt::format("{} {:#x}", execute ? "exec" : "watch", address));
+                std::this_thread::sleep_for(std::chrono::milliseconds(ms + 200));
+            }
+        }).detach();
+    }
     Ryty::SetOverlayDraw(&DrawFpsCounter);
 #ifdef ENABLE_DISCORD_RPC
     if (EmulatorSettings.IsDiscordRPCEnabled()) {
@@ -300,6 +412,17 @@ extern "C" __declspec(dllexport) void RytyGpuMapMemory(u64 address, u64 size) {
     }
 }
 
+void RytyProtectGuestRedZones(); // ryty_red_zone.cpp
+
+// Ryty loads this library before the game's code starts, so the game code can still be patched
+// safely here (FIX-074).
+extern "C" BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
+    if (reason == DLL_PROCESS_ATTACH) {
+        RytyProtectGuestRedZones();
+    }
+    return TRUE;
+}
+
 // The renderer write-protects guest pages it caches on the GPU. Ryty's exception handler offers
 // each guest write fault here first; true means the renderer owned the page, dropped its cached
 // copy and unprotected it, so the write can be retried.
@@ -320,9 +443,44 @@ extern "C" __declspec(dllexport) int RytyGpuHandleWriteFault(void* exception_poi
         return 2;
     }
     if (Core::Signals::Instance()->DispatchAccessViolation(pointers, address)) {
+        // DIAG-077: SHADGT_LOG_FAULTS=1 counts the write faults the renderer handled by the
+        // code address in GTSport.exe that wrote, and logs the most frequent every 5 seconds.
+        static const bool log_faults = [] {
+            const char* env = std::getenv("SHADGT_LOG_FAULTS");
+            return env && env[0] == '1';
+        }();
+        if (log_faults) {
+            static std::mutex mutex;
+            static std::unordered_map<u64, u64> counts;
+            static auto last = std::chrono::steady_clock::now();
+            const u64 base = reinterpret_cast<u64>(GetModuleHandleA(nullptr));
+            const u64 rip = pointers->ContextRecord->Rip;
+            std::scoped_lock lock{mutex};
+            ++counts[rip - base];
+            const auto now = std::chrono::steady_clock::now();
+            if (now - last >= std::chrono::seconds(5)) {
+                last = now;
+                std::vector<std::pair<u64, u64>> top(counts.begin(), counts.end());
+                std::ranges::sort(top, [](const auto& a, const auto& b) { return a.second > b.second; });
+                std::string line;
+                for (std::size_t i = 0; i < std::min<std::size_t>(top.size(), 25); ++i) {
+                    line += fmt::format(" {:#x}={}", top[i].first, top[i].second);
+                }
+                LOG_WARNING(Lib_GnmDriver, "DIAG-077: write faults by exe offset ({} sites):{}",
+                            top.size(), line);
+            }
+        }
         return 1;
     }
     return Core::RytyMemory::InGuardedRead() ? 2 : 0;
+}
+
+// FIX-044 for Ryty: the guest's TSC, which stands still while the GPU command thread compiles
+// shaders or pipelines (common/guest_clock.h). Ryty's libkernel derives the game's monotonic clocks
+// from it, so a compile stall does not look like hundreds of milliseconds of game time (GT Sport's
+// car thumbnail shot then breaks: "file_size > 10 * 1024" when a new car is bought).
+extern "C" __declspec(dllexport) u64 RytyGpuGuestTsc() {
+    return Common::GuestClock::ReadTsc();
 }
 
 // Ryty calls this before the kernel writes guest memory directly (a file read into a guest

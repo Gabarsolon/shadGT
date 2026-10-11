@@ -24,11 +24,13 @@ struct Hit {
     DWORD tid;
     std::uint64_t rip;
     std::uint64_t value;
+    std::uint64_t rcx, rdx, rbx, rsi, rdi, r11, rsp, r12, below_rsp_16, below_rsp_8, r14, r15;
 };
 
 std::atomic<bool> g_active{false};
+std::atomic<bool> g_execute{false}; // an instruction breakpoint instead of a write watch
 std::atomic<std::uint64_t> g_address{0};
-std::array<Hit, 64> g_hits{};
+std::array<Hit, 2048> g_hits{};
 std::atomic<std::uint32_t> g_num_hits{0};
 std::atomic<std::int64_t> g_start_ns{0};
 PVOID g_handler = nullptr;
@@ -52,9 +54,19 @@ LONG CALLBACK OnException(EXCEPTION_POINTERS* pointers) {
         const std::uint64_t address = g_address.load(std::memory_order_relaxed);
         const std::uint32_t index = g_num_hits.fetch_add(1, std::memory_order_relaxed);
         if (index < g_hits.size()) {
-            g_hits[index] = {NowNs(), GetCurrentThreadId(), context->Rip,
-                             *reinterpret_cast<const volatile std::uint64_t*>(address)};
+            g_hits[index] = {NowNs(),      GetCurrentThreadId(),
+                             context->Rip, *reinterpret_cast<const volatile std::uint64_t*>(address),
+                             context->Rcx, context->Rdx,
+                             context->Rbx, context->Rsi,
+                             context->Rdi, context->R11,
+                             context->Rsp, context->R12,
+                             *reinterpret_cast<const volatile std::uint64_t*>(context->Rsp - 16),
+                             *reinterpret_cast<const volatile std::uint64_t*>(context->Rsp - 8),
+                             context->R14, context->R15};
         }
+    }
+    if (g_execute.load(std::memory_order_relaxed)) {
+        context->EFlags |= 0x10000; // RF: resume past the instruction breakpoint
     }
     return EXCEPTION_CONTINUE_EXECUTION;
 }
@@ -86,7 +98,7 @@ void SetBreakpoint(std::uint64_t address) {
                 context.Dr7 &= ~((0xFull << 16) | 3ull);
                 if (address != 0) {
                     context.Dr0 = address;
-                    context.Dr7 |= 1ull | (1ull << 16) | (3ull << 18);
+                    context.Dr7 |= g_execute ? 1ull : (1ull | (1ull << 16) | (3ull << 18));
                 } else {
                     context.Dr0 = 0;
                 }
@@ -148,11 +160,17 @@ void RytyWatchWrites(std::uint64_t address, std::uint32_t ms, std::string label)
     if (!g_handler) {
         g_handler = AddVectoredExceptionHandler(1, OnException);
     }
-    g_address.store(address & ~7ull);
+    // A label starting with "exec" makes it an instruction breakpoint at address (registers are
+    // captured each time that instruction is about to run).
+    g_execute.store(label.starts_with("exec"));
+    if (!g_execute) {
+        address &= ~7ull;
+    }
+    g_address.store(address);
     g_num_hits.store(0);
     g_start_ns.store(NowNs());
-    const std::uint64_t value = *reinterpret_cast<const volatile std::uint64_t*>(address & ~7ull);
-    std::thread([address = address & ~7ull, ms, label = std::move(label), value] {
+    const std::uint64_t value = *reinterpret_cast<const volatile std::uint64_t*>(address);
+    std::thread([address, ms, label = std::move(label), value] {
         SetBreakpoint(address);
         std::this_thread::sleep_for(std::chrono::milliseconds(ms));
         SetBreakpoint(0);
@@ -165,9 +183,29 @@ void RytyWatchWrites(std::uint64_t address, std::uint32_t ms, std::string label)
             };
             // The vertex stream found over GT Sport's frame data: (x, y, z, 0.932, 1.0105, 0.932).
             const bool vertex_like = has(0x3f815729) || has(0x3f6e90f7) || has(0x3f6ea9b5);
-            line += fmt::format(" | +{:.2f} ms thread {} at {} wrote {:016x}{}",
+            line += fmt::format(" | +{:.2f} ms thread {} at {} wrote {:016x}{} (rcx {:x} rdx {:x} "
+                                "rbx {:x} rsi {:x} rdi {:x} r11 {:x} rsp {:x} r12 {:x} "
+                                "[rsp-16] {:016x} [rsp-8] {:016x} r14 {:x} r15 {:x})",
                                 (hit.ns - g_start_ns.load()) / 1e6, ThreadName(hit.tid),
-                                Describe(hit.rip), hit.value, vertex_like ? " VERTEX-LIKE" : "");
+                                Describe(hit.rip), hit.value, vertex_like ? " VERTEX-LIKE" : "",
+                                hit.rcx, hit.rdx, hit.rbx, hit.rsi, hit.rdi, hit.r11, hit.rsp,
+                                hit.r12, hit.below_rsp_16, hit.below_rsp_8, hit.r14, hit.r15);
+        }
+        if (count > 64) {
+            // Long lists go to a file, one hit per line.
+            static int file_index = 0;
+            const std::string path = fmt::format("watch_hits_{}.txt", file_index++);
+            if (FILE* file = std::fopen(path.c_str(), "w")) {
+                std::size_t start = 0;
+                while (start < line.size()) {
+                    const std::size_t next = line.find(" | ", start + 1);
+                    const std::size_t end = next == std::string::npos ? line.size() : next;
+                    std::fprintf(file, "%s\n", line.substr(start, end - start).c_str());
+                    start = end;
+                }
+                std::fclose(file);
+            }
+            line = fmt::format(" (written to {})", path);
         }
         LOG_WARNING(Render_Vulkan, "DIAG-067: {} ({:#x}, was {:016x}): {} writes in {} ms{}",
                     label, address, value, g_num_hits.load(), ms, line);

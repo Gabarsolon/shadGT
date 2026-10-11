@@ -1728,7 +1728,9 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
 }
 
 void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_block) {
-    u32 resident_blocks{};
+    // FIX-075: 64-bit counts. GT Sport's showroom makes a range of 4 GB + 64 KB resident at once;
+    // the 32-bit block loop below never reached its end and wrote past the staging buffer.
+    u64 resident_blocks{};
     IntervalList bind_ranges;
     resident_ranges.ForEachGap(first_block, last_block + 1, [&](u64 start, u64 end) {
         resident_blocks += end - start;
@@ -1737,6 +1739,12 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
 
     if (bind_ranges.Empty()) {
         return;
+    }
+    if ((resident_blocks << block_shift) >= (1ull << 30)) {
+        LOG_WARNING(Render_Vulkan,
+                    "FIX-075: making {} MB resident at once ({:#x}..{:#x} in arena {:#x}+{:#x})",
+                    (resident_blocks << block_shift) >> 20, first_block << block_shift,
+                    (last_block + 1) << block_shift, arena->CpuAddr(), arena->SizeBytes());
     }
 
     const vk::MemoryAllocateInfo alloc_info = {
@@ -1771,7 +1779,7 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
         });
         memory_offset += bind.size;
 
-        for (u32 block = 0; block < bind.size; block += block_size) {
+        for (u64 block = 0; block < bind.size; block += block_size) {
             *(bda_addrs++) = arena->BufferDeviceAddress() + bind.resourceOffset + block;
         }
         const u64 copy_size = (backing.end - backing.start) * sizeof(vk::DeviceAddress);

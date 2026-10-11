@@ -92,7 +92,13 @@ ryty_add_library(ryty_gpu libSceVideoOut
         ryty_gpu/ryty_entry.cpp
         ryty_gpu/ryty_input_bridge.cpp
         ryty_gpu/ryty_write_watch.cpp
+        # FIX-074: shadGT's static red-zone patching, applied to the converted game code.
+        ryty_gpu/ryty_red_zone.cpp
+        src/core/cpu_patches.cpp
+        src/core/loader/dwarf.cpp
 )
+
+target_compile_definitions(ryty_gpu PRIVATE RYTY_HAS_CPU_PATCHES=1)
 
 # shadGT's Discord Rich Presence, in the renderer library only ("Running on ryGT").
 if (ENABLE_DISCORD_RPC)

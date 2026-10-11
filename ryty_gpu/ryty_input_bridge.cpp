@@ -105,11 +105,15 @@ void RunTestScript(std::string script) {
             // What the window shows (the splash screen, overlays), not just the game's image.
             VideoCore::RequestScreenshot(VideoCore::ScreenshotRequest::WithOverlays);
             LOG_INFO(Input, "Ryty test script: window screenshot at {} s", at);
-        } else if (action.starts_with("burst")) {
+        } else if (action.starts_with("burst") || action.starts_with("wburst")) {
             // "burstN": N screenshot requests; one is taken per frame, so N consecutive frames.
-            const int count = action.size() > 5 ? std::stoi(action.substr(5)) : 30;
+            // "wburstN" takes them of the window (splash screen and overlays included).
+            const bool window = action[0] == 'w';
+            const std::string count_text = action.substr(window ? 6 : 5);
+            const int count = count_text.empty() ? 30 : std::stoi(count_text);
             for (int i = 0; i < count; ++i) {
-                VideoCore::RequestScreenshot(VideoCore::ScreenshotRequest::GameOnly);
+                VideoCore::RequestScreenshot(window ? VideoCore::ScreenshotRequest::WithOverlays
+                                                    : VideoCore::ScreenshotRequest::GameOnly);
             }
             LOG_INFO(Input, "Ryty test script: {} screenshots from {} s", count, at);
         } else if (const auto button = ButtonFromName(action); button != 0) {

@@ -5,6 +5,7 @@
 #include <atomic>
 #include <chrono>
 #include <limits>
+#include <mutex>
 #include <unordered_set>
 #include <magic_enum/magic_enum.hpp>
 #include <xxhash.h>
@@ -962,6 +963,36 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         registry_changed = true;
         image_id = slot_images.Insert(instance, runtime, slot_image_views, info);
         RegisterImage(image_id);
+    }
+
+    // DIAG-074: SHADGT_LOG_IMAGES=1 logs which cached image each large lookup resolves to, once
+    // per (lookup, result) pair, to find images sampled through a different image's layout.
+    static const bool log_images = [] {
+        const char* env = std::getenv("SHADGT_LOG_IMAGES");
+        return env && env[0] == '1';
+    }();
+    if (log_images && info.size.width >= 256 && info.size.height >= 8) {
+        static std::mutex log_mutex;
+        static std::unordered_set<u64> logged;
+        const Image& found = slot_images[image_id];
+        const u64 key = info.guest_address ^ (u64(info.size.width) << 40) ^
+                        (u64(info.size.height) << 20) ^ (u64(found.info.size.height) << 52) ^
+                        (u64(desc.type) << 60) ^ u64(found.info.pitch) * 0x9e3779b97f4a7c15ull;
+        std::scoped_lock lock{log_mutex};
+        if (logged.size() < 4000 && logged.insert(key).second) {
+            LOG_WARNING(Render_Vulkan,
+                        "DIAG-074: lookup {:#x} {}x{}x{} pitch {} mips {} layers {} {} tile {} "
+                        "array {} bind {} -> image {} at {:#x} {}x{}x{} pitch {} mips {} {} tile {} "
+                        "view mip {} slice {}",
+                        info.guest_address, info.size.width, info.size.height, info.size.depth,
+                        info.pitch, info.resources.levels, info.resources.layers,
+                        vk::to_string(info.pixel_format), u32(info.tile_mode), u32(info.array_mode),
+                        u32(desc.type), image_id.index, found.info.guest_address,
+                        found.info.size.width, found.info.size.height, found.info.size.depth,
+                        found.info.pitch, found.info.resources.levels,
+                        vk::to_string(found.info.pixel_format), u32(found.info.tile_mode),
+                        view_mip, view_slice);
+        }
     }
 
     // Cropped images share the full image's guest memory. When one was written after the full

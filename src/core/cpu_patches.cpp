@@ -101,7 +101,12 @@ static bool FilterTcbAccess(const ZydisDecodedOperand* operands) {
            dst_op.reg.value <= ZYDIS_REGISTER_R15;
 }
 
-#if defined(_WIN32)
+#if defined(_WIN32) && defined(RYTY_GPU)
+// Ryty's converted executables reach their thread data without FS; the TCB patches are not used.
+static void RetrieveTcbPointer(Xbyak::Reg, Xbyak::CodeGenerator&, ZyanI64) {
+    UNREACHABLE_MSG("TCB patches are not used in the Ryty build");
+}
+#elif defined(_WIN32)
 static void RetrieveTcbPointer(Xbyak::Reg dst, Xbyak::CodeGenerator& c, ZyanI64 offset) {
     // The following logic is based on the Kernel32.dll asm of TlsGetValue
     static constexpr u32 TlsSlotsOffset = 0x1480;
@@ -542,7 +547,7 @@ static const std::unordered_map<ZydisMnemonic, std::vector<PatchInfo>> Patches =
     {ZYDIS_MNEMONIC_MOVNTSS, {{FilterNoSSE4a, ReplaceMOVNTSS, false}}},
     {ZYDIS_MNEMONIC_MOVNTSD, {{FilterNoSSE4a, ReplaceMOVNTSD, false}}},
 
-#if !defined(__APPLE__)
+#if !defined(__APPLE__) && !defined(RYTY_GPU)
     // FS segment patches
     // For most of these, Windows needs a trampoline while other platforms do not.
     {ZYDIS_MNEMONIC_XOR, {{FilterTcbAccess, GenerateTcbExclusiveOr, need_tcb_trampoline}}},
@@ -1657,6 +1662,9 @@ static RedZonePatchResult PatchSegmentStatically(u64 segment_addr, u64 segment_s
         // instruction boundaries are being visited. Short trampoline patches are combined with
         // the relocation pass below.
         for (auto& [address, decoded] : function.instructions) {
+#ifdef RYTY_GPU
+            break; // red-zone protection only
+#endif
             const PatchInfo* matching_patch = FindMatchingPatch(decoded);
             const auto [patched, _] = TryPatch(reinterpret_cast<u8*>(address), module);
             result.inplace_cpu_patch_instruction_count += patched;
@@ -2270,6 +2278,10 @@ static bool PatchesIllegalInstructionHandler(void* context) {
 }
 
 static void PatchesInit() {
+#ifdef RYTY_GPU
+    // The Ryty build only protects red zones ahead of time; Ryty handles the CPU instructions.
+    return;
+#endif
     if (!Patches.empty()) {
         auto* signals = Signals::Instance();
         // Should be called last.
