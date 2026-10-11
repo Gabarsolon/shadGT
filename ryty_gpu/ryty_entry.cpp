@@ -27,6 +27,12 @@
 #include "ryty_gpu/ryty_library.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "core/debug_state.h"
+#include "imgui.h"
+#ifdef ENABLE_DISCORD_RPC
+#include "common/discord_rpc_handler.h"
+#endif
+#include <chrono>
 
 namespace Libraries::SystemService {
 void NoteGameDrew(); // ryty_stubs.cpp: the splash screen ends at the game's first drawn frame
@@ -45,7 +51,8 @@ void RunWindowThread() {
     auto* controllers = Common::Singleton<Input::GameControllers>::Instance();
     static Frontend::WindowSDL window(EmulatorSettings.GetWindowWidth(),
                                       EmulatorSettings.GetWindowHeight(), controllers,
-                                      "Gran Turismo Sport (Ryty)");
+                                      "ryGT - Gran Turismo Sport");
+    window.SetIcon({}); // shadGT's Gran Turismo Sport icon
     {
         std::scoped_lock lock{g_window_mutex};
         g_window = &window;
@@ -82,6 +89,35 @@ void StartFirstDrawWatcher() {
         SetEvent(event);
         Libraries::SystemService::NoteGameDrew(); // ends the splash screen
     }).detach();
+}
+
+// The FPS counter (shadGT's Show FPS Counter setting): the game's frames per second, in small
+// type in the window's top left corner, over the game and the splash screen.
+void DrawFpsCounter() {
+    if (!EmulatorSettings.IsShowFpsCounter()) {
+        return;
+    }
+    using Clock = std::chrono::steady_clock;
+    static Clock::time_point window_start = Clock::now();
+    static u32 window_frames = DebugState.GetFrameNum();
+    static double fps = 0.0;
+    const auto now = Clock::now();
+    const double seconds = std::chrono::duration<double>(now - window_start).count();
+    if (seconds >= 0.5) {
+        const u32 frames = DebugState.GetFrameNum();
+        fps = (frames - window_frames) / seconds;
+        window_frames = frames;
+        window_start = now;
+    }
+    char text[32];
+    std::snprintf(text, sizeof(text), "%.0f FPS", fps);
+    auto* draw = ImGui::GetForegroundDrawList();
+    const ImVec2 origin = ImGui::GetMainViewport()->Pos;
+    const ImVec2 size = ImGui::CalcTextSize(text);
+    const ImVec2 at{origin.x + 8.0f, origin.y + 6.0f};
+    draw->AddRectFilled({at.x - 4.0f, at.y - 2.0f}, {at.x + size.x + 4.0f, at.y + size.y + 2.0f},
+                        IM_COL32(0, 0, 0, 140), 3.0f);
+    draw->AddText(at, IM_COL32(235, 235, 235, 255), text);
 }
 
 // DIAG-047 (SHADGT_HEAP_REPORT=1): every 20 s, the largest heap's busy blocks by size, with the
@@ -216,6 +252,14 @@ void Ryty::RytyLibraryInitialize() {
     StartInputBridge();
     StartFirstDrawWatcher();
     StartHeapReport();
+    Ryty::SetOverlayDraw(&DrawFpsCounter);
+#ifdef ENABLE_DISCORD_RPC
+    if (EmulatorSettings.IsDiscordRPCEnabled()) {
+        auto* rpc = Common::Singleton<DiscordRPCHandler::RPC>::Instance();
+        rpc->init();
+        rpc->setStatusPlaying("Gran Turismo Sport", "CUSA03220");
+    }
+#endif
     {
         std::scoped_lock lock{g_window_mutex};
         g_renderer_ready = true;

@@ -11,4 +11,7 @@ void BindExports();
 /// Common setup for any library: logging to user/log/<log_name>, settings and game info.
 void InitializeCommon(const char* log_name);
 
+/// What the ImGui overlay layer draws each frame (the renderer's FPS counter).
+void SetOverlayDraw(void (*draw)());
+
 } // namespace Ryty

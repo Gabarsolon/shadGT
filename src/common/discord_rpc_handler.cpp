@@ -5,6 +5,12 @@
 
 namespace DiscordRPCHandler {
 
+#ifdef RYTY_GPU
+constexpr const char* RunningOn = "Running on ryGT"; // the Ryty build (RyGT)
+#else
+constexpr const char* RunningOn = "Running on shadGT";
+#endif
+
 void RPC::init() {
     DiscordEventHandlers handlers{};
     Discord_Initialize("1557422166931275906", &handlers, 1, nullptr);
@@ -13,7 +19,7 @@ void RPC::init() {
 
 void RPC::setStatusIdling() {
     DiscordRichPresence rpc{};
-    rpc.details = "Running on shadGT";
+    rpc.details = RunningOn;
     rpc.largeImageKey = "https://raw.githubusercontent.com/mlgprorektm8/shadPS4/main/assets/"
                         "GranTurismoSportIcon.jpg";
     rpc.largeImageText = "Gran Turismo Sport";
@@ -23,7 +29,7 @@ void RPC::setStatusIdling() {
 
 void RPC::setStatusPlaying(const std::string&, const std::string&) {
     DiscordRichPresence rpc{};
-    rpc.details = "Running on shadGT";
+    rpc.details = RunningOn;
     rpc.largeImageKey = "https://raw.githubusercontent.com/mlgprorektm8/shadPS4/main/assets/"
                         "GranTurismoSportIcon.jpg";
     rpc.largeImageText = "Gran Turismo Sport";

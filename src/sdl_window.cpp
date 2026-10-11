@@ -98,7 +98,12 @@ static Uint32 SDLCALL PollControllerLightColour(void* userdata, SDL_TimerID time
 WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controllers_,
                      std::string_view window_title)
     : width{width_}, height{height_}, controllers{*controllers_} {
-    if (!SDL_SetHint(SDL_HINT_APP_NAME, "shadGT")) {
+#ifdef RYTY_GPU
+    constexpr const char* AppName = "ryGT";
+#else
+    constexpr const char* AppName = "shadGT";
+#endif
+    if (!SDL_SetHint(SDL_HINT_APP_NAME, AppName)) {
         UNREACHABLE_MSG("Failed to set SDL window hint: {}", SDL_GetError());
     }
     if (!SDL_Init(SDL_INIT_VIDEO)) {

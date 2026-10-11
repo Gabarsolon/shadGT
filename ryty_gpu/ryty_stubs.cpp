@@ -36,6 +36,15 @@
 #include "imgui/invitation_prompt_layer.h"
 #include "imgui/notifications_layer.h"
 #include "imgui/shadnet_notifications_layer.h"
+#include "ryty_gpu/ryty_library.h"
+
+namespace Ryty {
+static void (*g_overlay_draw)() = nullptr;
+
+void SetOverlayDraw(void (*draw)()) {
+    g_overlay_draw = draw;
+}
+} // namespace Ryty
 
 namespace Core {
 
@@ -109,7 +118,11 @@ std::optional<std::vector<u8>> ReadGameFile(const std::filesystem::path&, std::s
 
 namespace Devtools {
 void Layer::SetupSettings() {}
-void Layer::Draw() {}
+void Layer::Draw() {
+    if (Ryty::g_overlay_draw) {
+        Ryty::g_overlay_draw();
+    }
+}
 bool Layer::ShouldKeepDrawing() {
     return false;
 }

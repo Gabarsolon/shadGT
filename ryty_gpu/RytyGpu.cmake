@@ -94,6 +94,13 @@ ryty_add_library(ryty_gpu libSceVideoOut
         ryty_gpu/ryty_write_watch.cpp
 )
 
+# shadGT's Discord Rich Presence, in the renderer library only ("Running on ryGT").
+if (ENABLE_DISCORD_RPC)
+    target_sources(ryty_gpu PRIVATE src/common/discord_rpc_handler.cpp)
+    target_compile_definitions(ryty_gpu PRIVATE ENABLE_DISCORD_RPC)
+    target_link_libraries(ryty_gpu PRIVATE discord-rpc)
+endif()
+
 ryty_add_library(ryty_ngs2 libSceNgs2
     EXPORT_SOURCES
         core/libraries/ngs2/ngs2.cpp
