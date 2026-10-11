@@ -3,15 +3,20 @@
 
 #include <windows.h>
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <cstdlib>
 #include <fmt/format.h>
 #include <string>
 #include <vector>
 
 #include "common/elf_info.h"
+#include "common/logging/log.h"
 #include "common/native_clock.h"
+#include "core/emulator_settings.h"
 #include "core/cpu_patches.h"
 #include "core/devtools/layer.h"
 #include "core/file_format/npbind.h"
@@ -47,9 +52,16 @@ Emulator::Emulator() : memory{}, controllers{}, linker{} {
     game_info.sdk_ver = 0x05050001;
     game_info.game_folder = std::filesystem::current_path() / "app0";
 
+    const auto sce_sys = game_info.game_folder / "sce_sys";
+
+    // The splash screen the console shows while the game starts (Show Splash setting).
+    if (std::ifstream splash{sce_sys / "pic1.png", std::ios::binary}) {
+        game_info.splash_data.assign(std::istreambuf_iterator<char>{splash},
+                                     std::istreambuf_iterator<char>{});
+    }
+
     // NpTrophy registers a context only for a service label listed here (trophyNN.trp to the
     // NNth communication ID in npbind.dat), as shadGT's loader fills it.
-    const auto sce_sys = game_info.game_folder / "sce_sys";
     NPBindFile npbind;
     if (npbind.Load((sce_sys / "npbind.dat").string())) {
         const auto np_comm_ids = npbind.GetNpCommIds();
@@ -141,10 +153,28 @@ Common::NativeClock* GetClock() {
 } // namespace Libraries::Kernel
 
 namespace Libraries::SystemService {
+// The game's splash screen (sce_sys/pic1.png), with the Show Splash setting. GT Sport asks to hide
+// it right at start (sceSystemServiceHideSplashScreen, which Ryty's libSceSystemService forwards
+// here), long before it draws anything, so the splash stays until the game's first drawn frame
+// too, as the console shows it through the loading.
+static std::atomic<bool> g_splash_hidden{false};
+static std::atomic<bool> g_game_drew{false};
+
 bool IsSplashVisible() {
-    return false;
+    return EmulatorSettings.IsShowSplash() && !(g_splash_hidden.load(std::memory_order_relaxed) &&
+                                                g_game_drew.load(std::memory_order_relaxed));
+}
+
+void NoteGameDrew() {
+    g_game_drew.store(true, std::memory_order_relaxed);
 }
 } // namespace Libraries::SystemService
+
+extern "C" __declspec(dllexport) void RytyGpuHideSplashScreen() {
+    if (!Libraries::SystemService::g_splash_hidden.exchange(true)) {
+        LOG_INFO(Lib_SystemService, "The game hid its splash screen");
+    }
+}
 
 // Keyboard and mouse input reach the game through Ryty's own libraries.
 namespace Libraries::Keyboard {

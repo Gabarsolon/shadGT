@@ -101,6 +101,10 @@ void RunTestScript(std::string script) {
         } else if (action == "shot") {
             VideoCore::RequestScreenshot(VideoCore::ScreenshotRequest::GameOnly);
             LOG_INFO(Input, "Ryty test script: screenshot at {} s", at);
+        } else if (action == "shotwindow") {
+            // What the window shows (the splash screen, overlays), not just the game's image.
+            VideoCore::RequestScreenshot(VideoCore::ScreenshotRequest::WithOverlays);
+            LOG_INFO(Input, "Ryty test script: window screenshot at {} s", at);
         } else if (action.starts_with("burst")) {
             // "burstN": N screenshot requests; one is taken per frame, so N consecutive frames.
             const int count = action.size() > 5 ? std::stoi(action.substr(5)) : 30;

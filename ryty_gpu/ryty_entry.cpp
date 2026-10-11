@@ -28,6 +28,10 @@
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
+namespace Libraries::SystemService {
+void NoteGameDrew(); // ryty_stubs.cpp: the splash screen ends at the game's first drawn frame
+}
+
 Frontend::WindowSDL* g_window = nullptr;
 
 namespace {
@@ -76,6 +80,7 @@ void StartFirstDrawWatcher() {
             Sleep(2);
         }
         SetEvent(event);
+        Libraries::SystemService::NoteGameDrew(); // ends the splash screen
     }).detach();
 }
 
