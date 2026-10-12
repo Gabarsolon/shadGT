@@ -16,6 +16,7 @@
 #include "video_core/texture_cache/texture_cache.h"
 #ifdef RYTY_GPU
 #include "ryty_gpu/ryty_dlss.h"
+#include "ryty_gpu/ryty_fsr3.h"
 #endif
 
 namespace Frontend {
@@ -122,6 +123,7 @@ private:
     HostPasses::FsrPass fsr_pass;
 #ifdef RYTY_GPU
     RytyDlss::Pass dlss_pass; // ryGT: NVIDIA DLSS through the optional plugin, before FSR
+    RytyFsr3::Pass fsr3_pass; // ryGT: AMD FSR 3.1 in place of FSR 1 when fsr3_enabled is on
 #endif
     HostPasses::FsrPass::Settings fsr_settings{};
     HostPasses::PostProcessingPass::Settings pp_settings{};

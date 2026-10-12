@@ -94,6 +94,8 @@ ryty_add_library(ryty_gpu libSceVideoOut
         ryty_gpu/ryty_write_watch.cpp
         # NVIDIA DLSS through the optional plugin dlss\ryGT_dlss.dll (ryty_dlss.h).
         ryty_gpu/ryty_dlss.cpp
+        # AMD FSR 3.1 through amd_fidelityfx_vk.dll (ryty_fsr3.h).
+        ryty_gpu/ryty_fsr3.cpp
         # FIX-074: shadGT's static red-zone patching, applied to the converted game code.
         ryty_gpu/ryty_red_zone.cpp
         src/core/cpu_patches.cpp

@@ -508,6 +508,8 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
     if (RytyDlss::Init(instance.GetInstance(), instance.GetPhysicalDevice(), device)) {
         dlss_pass.Create(device, instance.GetAllocator(), num_images);
     }
+    fsr3_pass.Create(instance.GetInstance(), instance.GetPhysicalDevice(), device,
+                     instance.GetAllocator(), num_images);
 #endif
     pp_pass.Create(device, swapchain.GetSurfaceFormat().format);
 
@@ -774,6 +776,21 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         dlss_view != image_view) {
         image_view = dlss_view;
         scaled = true;
+    }
+    // ryGT: FSR 3.1 replaces FSR 1 when it is on; the RCAS settings carry over (FSR 3.1 turns
+    // RCAS attenuation 0..2 into sharpness 1..0).
+    if (!scaled && fsr_settings.enable) {
+        const float sharpness =
+            fsr_settings.use_rcas ? 1.0f - fsr_settings.rcas_attenuation / 2.0f : -1.0f;
+        if (const auto fsr3_view =
+                fsr3_pass.Render(pass_cmdbuf, image.GetImage(), image_view, view_info.format,
+                                 image_size, {frame->width, frame->height}, sharpness,
+                                 attribute.attrib.pixel_format ==
+                                     Libraries::VideoOut::PixelFormat::A2R10G10B10Bt2020Pq);
+            fsr3_view != image_view) {
+            image_view = fsr3_view;
+            scaled = true;
+        }
     }
 #endif
     if (!scaled) {
