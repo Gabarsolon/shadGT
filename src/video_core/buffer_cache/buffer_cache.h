@@ -478,6 +478,7 @@ private:
     u64 writebacks_cpu_newer{};
     void NoteCpuChange(VAddr address, u64 size);
     u64 NextWriteSeq();
+    bool FreshGpuWrite(VAddr start, VAddr end);
     void NoteGpuWriteSeq(VAddr address, u64 size);
     // FIX-073: the guest bytes of each readback page as the GPU copy last took them in (when the
     // GPU wrote over them, or the renderer wrote GPU data into them). Bytes that differ now are

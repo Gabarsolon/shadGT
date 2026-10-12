@@ -1029,6 +1029,24 @@ u64 BufferCache::NextWriteSeq() {
     }
 }
 
+// FIX-076: whether the GPU wrote this range less than 50 ms ago (results a frame's effects read
+// back), with GT Sport's particle effects on.
+bool BufferCache::FreshGpuWrite(VAddr start, VAddr end) {
+    static const bool enabled =
+        WriterOrderEnabled() && Common::PerfFeatureEnabled(100) &&
+        EmulatorSettings.IsParticleEffects();
+    if (!enabled) {
+        return false;
+    }
+    u64 oldest = ~u64{0};
+    bool any = false;
+    gpu_write_seqs.ForEachInRange(start, end - start, [&](VAddr, VAddr, u64 seq) {
+        oldest = std::min(oldest, seq);
+        any = true;
+    });
+    return any && NextWriteSeq() - oldest < 50'000'000;
+}
+
 void BufferCache::NoteCpuChange(VAddr address, u64 size) {
     if (!WriterOrderEnabled()) {
         return;
@@ -1305,7 +1323,8 @@ void BufferCache::SplitByWriter(VAddr start, VAddr end, Keep&& keep, Drop&& drop
 static void SplitWriteback(VAddr start, VAddr end, VAddr fault_addr, u64 fault_size,
                            const PageManager& pages,
                            const std::function<void(VAddr, VAddr)>& keep,
-                           const std::function<void(VAddr, VAddr)>& drop) {
+                           const std::function<void(VAddr, VAddr)>& drop,
+                           const std::function<bool(VAddr, VAddr)>& fresh = {}) {
     static const bool enabled = Common::PerfFeatureEnabled(86);
     // -DisablePerf 87 also writes back pages still watched, as in the first version.
     static const bool faulting_pages_only = Common::PerfFeatureEnabled(87);
@@ -1322,8 +1341,11 @@ static void SplitWriteback(VAddr start, VAddr end, VAddr fault_addr, u64 fault_s
         // Only the pages being faulted on: GPU-written ranges elsewhere in the window can be
         // whole bound buffers whose GPU copy is older game data (GT Sport binds buffers of
         // hundreds of MB), and they get their own fault when the game touches them.
+        // FIX-076: also pages whose GPU results are fresh (the effects' smoke reads them on
+        // other pages of the window without faulting there).
         const bool kept = (page >= fault_first && page < fault_end) ||
-                          (!faulting_pages_only && !pages.IsUnwatched(page));
+                          (!faulting_pages_only && !pages.IsUnwatched(page)) ||
+                          (fresh && fresh(s, std::min<VAddr>(end, page + 4_KB)));
         if (s == start) {
             run_kept = kept;
         } else if (kept != run_kept) {
@@ -1378,7 +1400,8 @@ std::shared_ptr<BufferCache::FaultDownload> BufferCache::BeginFaultFlush(VAddr d
                         fault->ranges.emplace_back(s, e);
                         total_size_bytes += Common::AlignUp(e - s, 64);
                     },
-                    [&](VAddr s, VAddr e) { dropped.emplace_back(s, e); });
+                    [&](VAddr s, VAddr e) { dropped.emplace_back(s, e); },
+                    [this](VAddr s, VAddr e) { return FreshGpuWrite(s, e); });
                 }, [&](VAddr s, VAddr e) { cpu_newer.emplace_back(s, e); }, true);
             });
         });
@@ -1564,7 +1587,8 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
         gpu_modified_ranges.ForEachInRange(address, size, [&](VAddr start_all, VAddr end_all) {
             SplitByWriter(start_all, end_all, [&](VAddr start, VAddr end) {
             SplitWriteback(start, end, fault_addr, fault_size, page_manager, add_download,
-                           [&](VAddr s, VAddr e) { kept_gpu.emplace_back(s, e); }); // FIX-063
+                           [&](VAddr s, VAddr e) { kept_gpu.emplace_back(s, e); }, // FIX-063
+                           [this](VAddr s, VAddr e) { return FreshGpuWrite(s, e); });
             }, [&](VAddr, VAddr) { ++writebacks_cpu_newer; }); // FIX-069
         });
         gpu_modified_ranges.Subtract(address, size);
