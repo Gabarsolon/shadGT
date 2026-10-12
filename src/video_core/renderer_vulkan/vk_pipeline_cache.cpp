@@ -465,9 +465,15 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
             LOG_WARNING(Render_Vulkan,
                         "PERF-032: shader translations are loaded from the store on first use");
             // PERF-038: opt-in (SHADGT_PREWARM=1): the stored pipelines are built in the
-            // background while the game runs, most recently used first. -DisablePerf 52.
+            // background while the game runs, most recently used first. -DisablePerf 52. ryGT
+            // turns it on unless SHADGT_PREWARM=0, so GTSport.exe runs without a launcher.
             const char* prewarm = std::getenv("SHADGT_PREWARM");
-            if (prewarm && prewarm[0] == '1' && Common::PerfFeatureEnabled(52)) {
+#ifdef RYTY_GPU
+            const bool prewarm_on = !prewarm || prewarm[0] != '0';
+#else
+            const bool prewarm_on = prewarm && prewarm[0] == '1';
+#endif
+            if (prewarm_on && Common::PerfFeatureEnabled(52)) {
                 if (!instance.IsVertexInputDynamicState()) {
                     LOG_WARNING(Render_Vulkan, "PERF-038: background pipeline builds need dynamic "
                                                "vertex input; not available here");

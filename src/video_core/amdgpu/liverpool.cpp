@@ -310,12 +310,17 @@ Liverpool::~Liverpool() {
     draw_pipe.reset();
 }
 
-// PERF-031: the draw pipe is opt-in (SHADGT_DRAW_PIPE=1) while it is measured;
-// -DisablePerf 46 keeps it off regardless.
+// PERF-031: the draw pipe is opt-in (SHADGT_DRAW_PIPE=1) while it is measured; ryGT turns it on
+// unless SHADGT_DRAW_PIPE=0, so GTSport.exe runs without a launcher. -DisablePerf 46 keeps it off.
 static bool DrawPipeRequested() {
     static const bool requested = [] {
         const char* env = std::getenv("SHADGT_DRAW_PIPE");
-        return env && env[0] == '1' && Common::PerfFeatureEnabled(46);
+#ifdef RYTY_GPU
+        const bool on = !env || env[0] != '0';
+#else
+        const bool on = env && env[0] == '1';
+#endif
+        return on && Common::PerfFeatureEnabled(46);
     }();
     return requested;
 }

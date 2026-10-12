@@ -418,6 +418,11 @@ void RytyProtectGuestRedZones(); // ryty_red_zone.cpp
 // safely here (FIX-074).
 extern "C" BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
+        // ryGT: overlay layers (OBS, Steam) hook Vulkan and have hung the game on exit. The
+        // Vulkan loader reads this when the renderer creates its instance, later.
+        if (GetEnvironmentVariableW(L"VK_LOADER_LAYERS_DISABLE", nullptr, 0) == 0) {
+            SetEnvironmentVariableW(L"VK_LOADER_LAYERS_DISABLE", L"~implicit~");
+        }
         RytyProtectGuestRedZones();
     }
     return TRUE;
