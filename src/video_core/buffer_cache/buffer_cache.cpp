@@ -1014,11 +1014,26 @@ static bool WriterOrderEnabled() {
     return enabled;
 }
 
+// FIX-076: the sequence is the steady clock in nanoseconds (kept increasing), so a CPU change
+// and a GPU write can also be compared in time (see SplitByWriter).
+u64 BufferCache::NextWriteSeq() {
+    const u64 now = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now().time_since_epoch())
+                                         .count());
+    u64 prev = write_seq.load(std::memory_order_relaxed);
+    while (true) {
+        const u64 next = std::max(prev + 1, now);
+        if (write_seq.compare_exchange_weak(prev, next, std::memory_order_relaxed)) {
+            return next;
+        }
+    }
+}
+
 void BufferCache::NoteCpuChange(VAddr address, u64 size) {
     if (!WriterOrderEnabled()) {
         return;
     }
-    const u64 seq = write_seq.fetch_add(1, std::memory_order_relaxed);
+    const u64 seq = NextWriteSeq();
     const VAddr end = address + std::max<u64>(size, 1);
     std::scoped_lock lk{cpu_change_mutex};
     if (cpu_change_seqs.size() > (1u << 21)) {
@@ -1033,7 +1048,7 @@ void BufferCache::NoteGpuWriteSeq(VAddr address, u64 size) {
     if (!WriterOrderEnabled() || size == 0) {
         return;
     }
-    const u64 seq = write_seq.fetch_add(1, std::memory_order_relaxed);
+    const u64 seq = NextWriteSeq();
     gpu_write_seqs.Subtract(address, size);
     gpu_write_seqs.Add(address, size, seq);
     NoteGpuWriteOverReadbackPages(address, size); // FIX-073
@@ -1227,7 +1242,8 @@ void BufferCache::RefreshReadbackPageHashes(VAddr address, u64 size) {
 }
 
 template <typename Keep, typename Drop>
-void BufferCache::SplitByWriter(VAddr start, VAddr end, Keep&& keep, Drop&& drop) {
+void BufferCache::SplitByWriter(VAddr start, VAddr end, Keep&& keep, Drop&& drop,
+                                bool keep_fresh) {
     if (!WriterOrderEnabled()) {
         keep(start, end);
         return;
@@ -1246,7 +1262,18 @@ void BufferCache::SplitByWriter(VAddr start, VAddr end, Keep&& keep, Drop&& drop
                 gpu = std::min(gpu, seq);
                 any = true;
             });
-            cpu_newer = !any || it->second > gpu;
+            // FIX-076: GT Sport's effects (tire smoke, sparks) read GPU results that share a page
+            // with bytes the CPU writes within the same frame; FIX-069 kept the CPU's page and
+            // the effects never saw their results, so they were never drawn. The CPU's page wins
+            // only when its change came at least FreshGpuNs after the GPU write (the race
+            // summary's stale data came frames later). -DisablePerf 100 drops them as before.
+            // Only CPU accesses (fault write-backs) keep fresh GPU results; hot-page readbacks,
+            // which run ahead of any access, still drop them (they cost frames as before).
+            static const bool fresh_enabled =
+                Common::PerfFeatureEnabled(100) && EmulatorSettings.IsParticleEffects();
+            constexpr u64 FreshGpuNs = 50'000'000;
+            cpu_newer = !any || (it->second > gpu && (!keep_fresh || !fresh_enabled ||
+                                                      it->second - gpu >= FreshGpuNs));
         }
         if (s == start) {
             run_cpu = cpu_newer;
@@ -1352,7 +1379,7 @@ std::shared_ptr<BufferCache::FaultDownload> BufferCache::BeginFaultFlush(VAddr d
                         total_size_bytes += Common::AlignUp(e - s, 64);
                     },
                     [&](VAddr s, VAddr e) { dropped.emplace_back(s, e); });
-                }, [&](VAddr s, VAddr e) { cpu_newer.emplace_back(s, e); });
+                }, [&](VAddr s, VAddr e) { cpu_newer.emplace_back(s, e); }, true);
             });
         });
     for (const auto& [s, e] : cpu_newer) {

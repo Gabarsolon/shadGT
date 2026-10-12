@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <map>
 #include <deque>
 #include <fstream>
 #include <optional>
@@ -1199,6 +1200,90 @@ void Rasterizer::TraceImageDependencies(VideoCore::ImageId source_id) {
     LOG_WARNING(Render_Vulkan, "DIAG-044: dumped {} of those images to {}", dumped, dir.string());
 }
 
+namespace {
+// DIAG-080 (SHADGT_LOG_DRAW_SET=1): every second, the vertex/pixel shader pairs drawn, with how
+// many of their draws were recorded and how many were dropped (no pipeline yet, or resources not
+// bound), written to user/log/draw_set.txt. For finding effects that never reach the screen.
+struct DrawSetEntry {
+    u32 drawn{};
+    u32 no_pipeline{};
+    u32 no_resources{};
+    u32 indirect{};
+    u32 prim{}, instances{}, indices{}, width{}, height{}, format{}, blend{}, targets{};
+};
+struct DrawShape {
+    u32 prim{}, instances{}, indices{}, width{}, height{}, format{}, blend{}, targets{};
+};
+thread_local DrawShape t_draw_shape{};
+std::mutex g_draw_set_mutex;
+std::map<std::pair<u64, u64>, DrawSetEntry> g_draw_set;
+std::chrono::steady_clock::time_point g_draw_set_start{};
+FILE* g_draw_set_file{};
+
+bool DrawSetEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("SHADGT_LOG_DRAW_SET");
+        return env && env[0] == '1';
+    }();
+    return enabled;
+}
+
+void NoteDrawKey(std::pair<u64, u64> key, int outcome);
+
+void NoteDrawSet(const std::array<const Shader::Info*, MaxShaderStages>& infos, int outcome) {
+    const auto hash = [&](Shader::SwStage stage) {
+        const auto* info = infos[static_cast<u32>(stage)];
+        return info ? info->pgm_hash : 0;
+    };
+    NoteDrawKey(std::make_pair(hash(Shader::SwStage::Vertex), hash(Shader::SwStage::Fragment)),
+                outcome);
+}
+
+// Dispatches are listed with 0xc0c0c0c0 as the vertex shader and the compute shader second.
+void NoteDispatch(const ComputePipeline* pipeline, int outcome) {
+    const u64 cs = pipeline ? pipeline->GetStage(Shader::SwStage::Compute).pgm_hash : 0;
+    NoteDrawKey(std::make_pair(u64{0xc0c0c0c0}, cs), outcome);
+}
+
+void NoteDrawKey(std::pair<u64, u64> key, int outcome) {
+    std::scoped_lock lock{g_draw_set_mutex};
+    const auto now = std::chrono::steady_clock::now();
+    if (g_draw_set_start == std::chrono::steady_clock::time_point{}) {
+        g_draw_set_start = now;
+        g_draw_set_file = std::fopen("user/log/draw_set.txt", "w");
+    }
+    static auto window = now;
+    if (now - window >= std::chrono::seconds{1} && g_draw_set_file) {
+        const double t = std::chrono::duration<double>(now - g_draw_set_start).count();
+        for (const auto& [pair, e] : g_draw_set) {
+            std::fprintf(g_draw_set_file, "%.0f %016llx %016llx %u %u %u %u\n", t,
+                         static_cast<unsigned long long>(pair.first),
+                         static_cast<unsigned long long>(pair.second), e.drawn, e.no_pipeline,
+                         e.no_resources, e.indirect);
+            std::fprintf(g_draw_set_file, "  shape %u %u %u %ux%u fmt %u blend %u targets %u\n",
+                         e.prim, e.instances, e.indices, e.width, e.height, e.format, e.blend,
+                         e.targets);
+        }
+        std::fflush(g_draw_set_file);
+        g_draw_set.clear();
+        window = now;
+    }
+    auto& e = g_draw_set[key];
+    e.prim = t_draw_shape.prim;
+    e.instances = std::max(e.instances, t_draw_shape.instances);
+    e.indices = std::max(e.indices, t_draw_shape.indices);
+    e.width = t_draw_shape.width;
+    e.height = t_draw_shape.height;
+    e.format = t_draw_shape.format;
+    e.blend = t_draw_shape.blend;
+    e.targets = t_draw_shape.targets;
+    if (outcome == 0) ++e.drawn;
+    else if (outcome == 1) ++e.no_pipeline;
+    else if (outcome == 3) ++e.indirect;
+    else ++e.no_resources;
+}
+} // namespace
+
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     RENDERER_TRACE;
     ++Common::GetWorkCounters().draws;
@@ -1213,6 +1298,24 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     }
 
     const auto& regs = liverpool->DrawRegs();
+    if (DrawSetEnabled()) {
+        auto& shape = t_draw_shape;
+        shape = {};
+        shape.prim = u32(regs.primitive_type);
+        shape.instances = regs.num_instances.NumInstances();
+        shape.indices = regs.num_indices;
+        for (u32 i = 0; i < AmdGpu::NUM_COLOR_BUFFERS; ++i) {
+            if (regs.color_buffers[i]) {
+                if (shape.targets == 0) {
+                    shape.width = regs.color_buffers[i].Pitch();
+                    shape.height = regs.color_buffers[i].Height();
+                    shape.format = u32(regs.color_buffers[i].GetDataFmt());
+                    shape.blend = regs.blend_control[i].enable;
+                }
+                ++shape.targets;
+            }
+        }
+    }
     const GraphicsPipeline* pipeline{};
     bool quad_triangles = false;
     u32 num_quad_indices = 0;
@@ -1232,6 +1335,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
             },
             !quad_list);
         if (!pipeline) {
+            if (DrawSetEnabled()) NoteDrawSet(pipeline_cache.SelectedInfos(), 1);
             return;
         }
     }
@@ -1250,7 +1354,14 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         }
     }
     if (!BindResources(pipeline)) {
+        if (DrawSetEnabled()) NoteDrawSet(pipeline_cache.SelectedInfos(), 2);
         return;
+    }
+    if (DrawSetEnabled()) {
+        const auto& stages = pipeline->GetStages();
+        const auto* vs = stages[u32(Shader::SwStage::Vertex)];
+        const auto* fs = stages[u32(Shader::SwStage::Fragment)];
+        NoteDrawKey(std::make_pair(vs ? vs->pgm_hash : 0, fs ? fs->pgm_hash : 0), 0);
     }
     RenderState state;
     {
@@ -1451,8 +1562,10 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     };
     const GraphicsPipeline* pipeline = AcquireGraphicsPipeline(params, false);
     if (!pipeline) {
+        if (DrawSetEnabled()) NoteDrawSet(pipeline_cache.SelectedInfos(), 1);
         return;
     }
+    if (DrawSetEnabled()) NoteDrawSet(pipeline_cache.SelectedInfos(), 3);
 
     PrepareRenderState(pipeline);
     BindVertexBuffers(pipeline);
@@ -1528,17 +1641,21 @@ void Rasterizer::DispatchDirect() {
     // PERF-055: selected on the command thread when it decoded the dispatch.
     const ComputePipeline* pipeline = AcquireComputePipeline();
     if (!pipeline) {
+        if (DrawSetEnabled()) NoteDispatch(nullptr, 1);
         return;
     }
 
     const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
     if (ExecuteShaderHLE(cs, liverpool->DrawRegs(), cs_program, *this)) {
+        if (DrawSetEnabled()) NoteDispatch(pipeline, 3);
         return;
     }
 
     if (!BindResources(pipeline)) {
+        if (DrawSetEnabled()) NoteDispatch(pipeline, 2);
         return;
     }
+    if (DrawSetEnabled()) NoteDispatch(pipeline, 0);
 
     if (needs_barrier) {
         runtime.FlushBarriers();
@@ -2016,6 +2133,37 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
     VertexInputs<AmdGpu::Buffer> guest_buffers;
     pipeline->GetVertexInputs(attributes, bindings, divisors, guest_buffers,
                               regs.vgt_instance_step_rate_0, regs.vgt_instance_step_rate_1);
+
+    // DIAG-081 (SHADGT_TRACE_GS_INPUTS=N): the vertex inputs of the first N geometry-shader
+    // draws after 150 s: each V# and the first floats at its address.
+    if (static const int trace_gs = [] {
+            const char* env = std::getenv("SHADGT_TRACE_GS_INPUTS");
+            return env ? std::atoi(env) : 0;
+        }();
+        trace_gs > 0 && pipeline->GetStages()[u32(Shader::SwStage::Geometry)] != nullptr) {
+        static const auto start = std::chrono::steady_clock::now();
+        static std::atomic<int> traced{};
+        if (std::chrono::steady_clock::now() - start > std::chrono::seconds{150} &&
+            traced < trace_gs) {
+            ++traced;
+            std::string text;
+            for (const auto& b : guest_buffers) {
+                std::array<float, 8> f{};
+                Common::CopyGuest(f.data(), reinterpret_cast<const void*>(b.base_address),
+                                  sizeof(f));
+                text += fmt::format(" [{:#x} size {:#x} stride {} fmt {}/{}: {} {} {} {} {} {} {} {}]",
+                                    u64(b.base_address), b.GetSize(), b.GetStride(),
+                                    u32(b.GetDataFmt()), u32(b.GetNumberFmt()), f[0], f[1],
+                                    f[2], f[3], f[4], f[5], f[6], f[7]);
+            }
+            LOG_WARNING(Render_Vulkan, "DIAG-081: gs draw es {:#x} gs {:#x} prim {} indices {} "
+                        "inst {}: {} buffers{}",
+                        pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash,
+                        pipeline->GetStage(Shader::SwStage::Geometry).pgm_hash,
+                        u32(regs.primitive_type), regs.num_indices,
+                        regs.num_instances.NumInstances(), guest_buffers.size(), text);
+        }
+    }
 
     if (instance.IsVertexInputDynamicState()) {
         // Update current vertex inputs.

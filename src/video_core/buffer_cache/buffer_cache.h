@@ -477,6 +477,7 @@ private:
     std::atomic<u64> write_seq{1};
     u64 writebacks_cpu_newer{};
     void NoteCpuChange(VAddr address, u64 size);
+    u64 NextWriteSeq();
     void NoteGpuWriteSeq(VAddr address, u64 size);
     // FIX-073: the guest bytes of each readback page as the GPU copy last took them in (when the
     // GPU wrote over them, or the renderer wrote GPU data into them). Bytes that differ now are
@@ -509,7 +510,7 @@ public:
 
 private:
     template <typename Keep, typename Drop>
-    void SplitByWriter(VAddr start, VAddr end, Keep&& keep, Drop&& drop);
+    void SplitByWriter(VAddr start, VAddr end, Keep&& keep, Drop&& drop, bool keep_fresh = false);
     u32 image_alias_exports_logged{};
     /// DIAG-028: hash of the guest bytes each watched page (4 KB) was last uploaded from.
     std::mutex vertex_pages_mutex;
