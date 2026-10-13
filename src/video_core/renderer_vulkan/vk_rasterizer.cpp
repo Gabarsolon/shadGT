@@ -3214,6 +3214,24 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             // decoded.
             const VideoCore::TextureCache::ImageDesc checked{tsharp, image_desc};
             const auto& info = checked.info;
+            // FIX-081: GT Sport's grass compute shader 0xaa3822a3 reads the T# at flattened
+            // offset 109 from data that is mostly floats when the texture is not used (addresses
+            // like 0x3f80000000 and 0xbf80000000 are the bits of 1.0f and -1.0f). Creating and
+            // detiling those images reset the GPU ("device lost") in races, past every geometry
+            // check. From that slot only an image the game already made (a render target, a
+            // texture another draw uploaded) is used; anything else becomes a null image.
+            if (stage.pgm_hash == 0xaa3822a3 && image_desc.sharp_fetch.offsets[0] == 109 &&
+                !texture_cache.AnyImageInRegion(info.guest_address, 1)) {
+                static std::atomic<u32> skipped{};
+                if (const u32 n = ++skipped; n <= 10 || n % 5000 == 0) {
+                    LOG_WARNING(Render_Vulkan,
+                                "FIX-081: grass T# {} at {:#x} is not an existing image; bound "
+                                "as a null image",
+                                n, info.guest_address);
+                }
+                bind_null_image();
+                continue;
+            }
             if (!IsMappedStart(info.guest_address)) {
                 static std::atomic<u32> rejected{};
                 if (const u32 n = ++rejected; n <= 20 || n % 1000 == 0) {
