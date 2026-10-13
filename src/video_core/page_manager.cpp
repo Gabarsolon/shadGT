@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
+#include <mutex>
 #include <utility>
 #include "common/adaptive_mutex.h"
 #include "common/assert.h"
@@ -36,6 +38,7 @@
 #include <sys/syscall.h>
 #else
 #include "common/spin_lock.h"
+#include "ryty_gpu/ryty_diag.h"
 #endif
 
 namespace VideoCore {
@@ -506,12 +509,23 @@ struct SignalImpl : public PageManager::Impl {
         constexpr auto priority = std::numeric_limits<u32>::min();
         Core::Signals::Instance()->RegisterAccessViolationHandler(GuestFaultSignalHandler,
                                                                   priority);
+#ifdef _WIN32
+        // FIX-079: the trap after a write-through store; ahead of every other handler.
+        g_write_through_rasterizer = rasterizer_;
+        AddVectoredExceptionHandler(1, WriteThroughStep);
+#endif
     }
 
     void Protect(VAddr address, size_t size, Core::MemoryPermission perms) override {
         RENDERER_TRACE;
+#ifdef _WIN32
+        // FIX-079: not while a write-through store has a page open (its protection is put back
+        // as it was when the store has run).
+        std::scoped_lock wt_lock{WriteThroughLock()};
+#endif
         ++Common::GetWorkCounters().protects;
         Common::GetWorkCounters().protect_bytes += size;
+        RYDIAG_SCOPE(Protect, address);
         auto* memory = Core::Memory::Instance();
         auto& impl = memory->GetAddressSpace();
         ASSERT_MSG(perms != Core::MemoryPermission::Write,
@@ -585,6 +599,96 @@ struct SignalImpl : public PageManager::Impl {
         return size;
     }
 
+#ifdef _WIN32
+    /// FIX-079: a write fault whose store touches no GPU-written byte of the page runs with the
+    /// page open for that one instruction (trap flag), then the page is protected again and the
+    /// bytes it changed go to the GPU copy. Nothing waits for the GPU.
+    struct WriteThroughState {
+        bool active{};
+        VAddr page{};
+        DWORD old_protect{};
+        VAddr store{};
+        u64 store_size{};
+        std::array<u8, 4096> before{};
+    };
+    static WriteThroughState& WriteThrough() {
+        static thread_local WriteThroughState state;
+        return state;
+    }
+
+    static bool TryWriteThrough(void* context, VAddr addr) {
+        auto& state = WriteThrough();
+        if (state.active) {
+            return false;
+        }
+        // One explicit memory operand, the destination: no second access can fault meanwhile.
+        ZydisDecodedInstruction instruction;
+        ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+        if (!ZYAN_SUCCESS(Common::Decoder::Instance()->decodeInstruction(
+                instruction, operands, Common::GetRip(context)))) {
+            return false;
+        }
+        u32 memory_operands = 0;
+        for (u32 i = 0; i < instruction.operand_count; ++i) {
+            memory_operands += operands[i].type == ZYDIS_OPERAND_TYPE_MEMORY ? 1 : 0;
+        }
+        const u64 size = ExactWriteSize(context, addr);
+        if (memory_operands != 1 || size == 0 || !rasterizer->CanWriteThrough(addr, size)) {
+            return false;
+        }
+        const VAddr page = PageManager::GetPageAddr(addr);
+        auto& lock = WriteThroughLock();
+        lock.lock();
+        MEMORY_BASIC_INFORMATION mbi{};
+        const bool readable =
+            VirtualQuery(reinterpret_cast<void*>(page), &mbi, sizeof(mbi)) == sizeof(mbi) &&
+            (mbi.Protect == PAGE_READONLY || mbi.Protect == PAGE_EXECUTE_READ);
+        DWORD old_protect = 0;
+        if (!readable ||
+            !VirtualProtect(reinterpret_cast<void*>(page), 4096,
+                            mbi.Protect == PAGE_READONLY ? PAGE_READWRITE : PAGE_EXECUTE_READWRITE,
+                            &old_protect)) {
+            lock.unlock();
+            return false;
+        }
+        std::memcpy(state.before.data(), reinterpret_cast<const void*>(page), 4096);
+        state.active = true;
+        state.page = page;
+        state.old_protect = old_protect;
+        state.store = addr;
+        state.store_size = size;
+        // (The signal context is the EXCEPTION_POINTERS.)
+        static_cast<EXCEPTION_POINTERS*>(context)->ContextRecord->EFlags |= 0x100; // trap after the store
+        return true;
+    }
+
+    static LONG CALLBACK WriteThroughStep(EXCEPTION_POINTERS* pointers) {
+        if (pointers->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP) {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        auto& state = WriteThrough();
+        if (!state.active) {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        DWORD unused = 0;
+        VirtualProtect(reinterpret_cast<void*>(state.page), 4096, state.old_protect, &unused);
+        pointers->ContextRecord->EFlags &= ~0x100u;
+        state.active = false;
+        WriteThroughLock().unlock();
+        if (g_write_through_rasterizer) {
+            g_write_through_rasterizer->FinishWriteThrough(state.page, state.before, state.store,
+                                                           state.store_size);
+        }
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    static std::recursive_mutex& WriteThroughLock() {
+        static std::recursive_mutex lock;
+        return lock;
+    }
+    static inline Vulkan::Rasterizer* g_write_through_rasterizer{};
+#endif
+
     static bool GuestFaultSignalHandler(void* context, void* fault_address) {
         const auto addr = reinterpret_cast<VAddr>(fault_address);
         const auto size = std::min<u64>(8, PageManager::GetNextPageAddr(addr) - addr);
@@ -623,6 +727,14 @@ struct SignalImpl : public PageManager::Impl {
         if (assume_locks) {
             rasterizer->OnGpuThreadFault();
         }
+#ifdef _WIN32
+        if (!is_gpu_thread && Common::IsWriteError(context) && TryWriteThrough(context, addr)) {
+            return true; // FIX-079
+        }
+#endif
+        // The faulting instruction, with bit 63 set for a write.
+        RYDIAG_SCOPE(WriteFault, reinterpret_cast<u64>(Common::GetRip(context)) |
+                                     (u64(Common::IsWriteError(context)) << 63));
         if (Common::IsWriteError(context)) {
             return rasterizer->InvalidateMemory(addr, size, assume_locks,
                                                 ExactWriteSize(context, addr));

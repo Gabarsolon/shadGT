@@ -146,6 +146,10 @@ public:
     /// it runs as soon as the caches are free instead of behind all decoded work
     /// (-DisablePerf 62 queues it like any command). DIAG-050 times the wait.
     void SendFaultCommand(Common::UniqueFunction<void>&& func);
+    /// FIX-079: queues fault work for the recorder ahead of its queued draws, without waiting;
+    /// false (nothing queued) without the draw pipe's urgent queue.
+    bool SendFaultCommandAsync(Common::UniqueFunction<void>&& func);
+    bool CanSendFaultCommandAsync() const;
 
     /// PERF-054: a fault on the command thread is flushed like a game thread's (urgent work on
     /// the recorder) instead of draining every decoded job first, unless the command thread owns
@@ -298,6 +302,14 @@ public:
     /// null without the draw pipe.
     ReadAheadStates* PipeReadAheadStates() const {
         return read_ahead_states.get();
+    }
+    /// FIX-078: on the command thread with the draw pipe, reads the commands ahead now and
+    /// queues the draw states found, so the shaders of the draws after one that needs new ones
+    /// are translated while it waits for its own.
+    void ReadAheadNow() {
+        if (read_ahead_states && std::this_thread::get_id() == gpu_id) {
+            PipeReadAhead();
+        }
     }
     /// PERF-020: called on the command thread when a graphics command buffer starts, with the
     /// read-ahead positioned at its first packet.

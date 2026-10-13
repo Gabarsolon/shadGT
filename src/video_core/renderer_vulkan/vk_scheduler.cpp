@@ -17,6 +17,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "common/nvtx.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "ryty_gpu/ryty_diag.h"
 
 namespace Vulkan {
 
@@ -27,6 +28,7 @@ static void RecordGpuWait(const std::source_location& loc, std::chrono::steady_c
     auto& counters = Common::GetWorkCounters();
     ++counters.gpu_waits;
     counters.gpu_wait_us += u64(std::chrono::duration_cast<std::chrono::microseconds>(d).count());
+    RyDiag::RecordElapsed(RyDiag::Zone::GpuWait, d, loc.line());
     static std::mutex mutex;
     static std::map<std::string, std::pair<u32, double>> sites;
     static auto window_start = std::chrono::steady_clock::now();
@@ -422,6 +424,7 @@ void Scheduler::CloseSession() {
 
 void Scheduler::SubmitExecution(SubmitInfo& info) {
     Common::PhaseTimer submit_timer{Common::Phase::Submit};
+    RYDIAG_SCOPE(Submit);
     // PERF-084: the queue lock is taken only around queue calls (the submit callback's sparse
     // binds take it themselves), so the command thread can submit while the recorder works.
     const u64 signal_value = work_semaphore.NextTick();

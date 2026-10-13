@@ -24,6 +24,7 @@ enum class ImageDescriptorGeometryError {
     SampleCount,
     GuestSizeLimit,
     ArrayMode,
+    CubeNotSquare,
 };
 
 inline ImageDescriptorGeometryError CheckImageDescriptorGeometry(
@@ -50,6 +51,12 @@ inline ImageDescriptorGeometryError CheckImageDescriptorGeometry(
     }
     const u32 width = image.width + 1;
     const u32 height = image.height + 1;
+    // FIX-080: a cube's faces are square (Vulkan requires it of cube views). A garbage T# of the
+    // grass compute shader 0xaa3822a3 (a 1x15873 cube at 0x3f80000000, the bits of 1.0f) passed
+    // every check above, and the GPU driver reset on the draw ("device lost") in a race.
+    if (image.GetType() == AmdGpu::ImageType::Cube && width != height) {
+        return ImageDescriptorGeometryError::CubeNotSquare;
+    }
     const bool volume = image.GetBaseType() == AmdGpu::ImageType::Color3D;
     const u32 depth = volume ? image.depth + 1 : 1;
     if (volume) {

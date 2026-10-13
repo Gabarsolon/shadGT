@@ -39,6 +39,7 @@
 #include "video_core/buffer_cache/region_definitions.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "ryty_gpu/ryty_diag.h"
 
 namespace AmdGpu {
 
@@ -136,6 +137,7 @@ static void RecordFrontendWait(FrontendWait kind, uintptr_t address,
     const double ms = std::chrono::duration<double, std::milli>(now - start).count();
     ++Common::GetWorkCounters().frontend_waits;
     Common::GetWorkCounters().frontend_wait_us += u64(ms * 1000.0);
+    RyDiag::RecordElapsed(RyDiag::Zone::CommandWait, now - start, address);
     auto& total = totals[size_t(kind)];
     ++total.first;
     total.second += ms;
@@ -1133,6 +1135,19 @@ void Liverpool::SendFaultCommand(Common::UniqueFunction<void>&& func) {
     u64 max = fault_flush_max_us.load(std::memory_order_relaxed);
     while (us > max && !fault_flush_max_us.compare_exchange_weak(max, us)) {
     }
+}
+
+bool Liverpool::CanSendFaultCommandAsync() const {
+    static const bool urgent = Common::PerfFeatureEnabled(62);
+    return draw_pipe != nullptr && urgent;
+}
+
+bool Liverpool::SendFaultCommandAsync(Common::UniqueFunction<void>&& func) {
+    if (!CanSendFaultCommandAsync()) {
+        return false;
+    }
+    draw_pipe->PushUrgent(std::move(func));
+    return true;
 }
 
 bool Liverpool::CommandThreadFaultIsUrgent() {

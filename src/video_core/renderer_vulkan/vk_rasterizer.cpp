@@ -155,15 +155,32 @@ bool Rasterizer::SelectsPipelinesAhead() const {
     return enabled && liverpool->Pipelined();
 }
 
+void Rasterizer::SeedStage(SelectedStage& selected, const Shader::Info* info) {
+    // FIX-077: the recorder's ShadowOf copied a new info under the lookup lock, which the
+    // command thread holds while it builds pipelines or waits for one; the recorder sat in the
+    // lock (most of its time in GT Sport's hitches) with earlier draws still to record.
+    static const bool enabled = Common::PerfFeatureEnabled(101);
+    if (!enabled) {
+        return;
+    }
+    auto& seeded = seeded_infos[info];
+    if (seeded != info->identity) {
+        seeded = info->identity;
+        selected.seed = std::make_shared<const Shader::Info>(*info);
+    }
+}
+
 void Rasterizer::CopySelectedStages(std::array<SelectedStage, Shader::MaxStageTypes>& out) {
     const auto& infos = pipeline_cache.SelectedInfos();
     for (u32 stage = 0; stage < Shader::MaxStageTypes; ++stage) {
         auto& selected = out[stage];
         const Shader::Info* info = stage < infos.size() ? infos[stage] : nullptr;
         selected.present = info != nullptr;
+        selected.seed.reset();
         if (!info) {
             continue;
         }
+        SeedStage(selected, info);
         selected.pgm_base = info->pgm_base;
         selected.num_user_data = static_cast<u32>(info->user_data.size());
         ASSERT(selected.num_user_data <= selected.user_data.size());
@@ -224,9 +241,11 @@ void Rasterizer::CopyComputeStage(std::array<SelectedStage, Shader::MaxStageType
     const Shader::Info* info = infos[0];
     auto& selected = out[u32(Shader::SwStage::Compute)];
     selected.present = info != nullptr;
+    selected.seed.reset();
     if (!info) {
         return;
     }
+    SeedStage(selected, info);
     selected.pgm_base = info->pgm_base;
     selected.num_user_data = static_cast<u32>(info->user_data.size());
     ASSERT(selected.num_user_data <= selected.user_data.size());
@@ -269,7 +288,12 @@ const ComputePipeline* Rasterizer::AcquireComputePipeline() {
             ++select_stats.verified;
             const ComputePipeline* own;
             {
-                std::scoped_lock lk{pipeline_cache.LookupMutex()};
+                // FIX-077: a check, not needed to draw: skipped while the command thread holds
+                // the lock (it may be building a pipeline) instead of waiting for it.
+                std::unique_lock lk{pipeline_cache.LookupMutex(), std::try_to_lock};
+                if (!lk.owns_lock()) {
+                    return pipeline;
+                }
                 own = pipeline_cache.GetComputePipeline();
             }
             if (own == pipeline) {
@@ -676,7 +700,8 @@ std::optional<std::pair<const VideoCore::Buffer*, u64>> Rasterizer::TakePlannedB
     return std::pair<const VideoCore::Buffer*, u64>{entry.buffer, entry.offset};
 }
 
-Rasterizer::ShadowInfo& Rasterizer::ShadowOf(const Shader::Info* canonical) {
+Rasterizer::ShadowInfo& Rasterizer::ShadowOf(const Shader::Info* canonical,
+                                              const Shader::Info* seed) {
     // PERF-065: most draws use the infos of the draws before them; the map is looked up once.
     auto& cached = shadow_lookup[(reinterpret_cast<uintptr_t>(canonical) >> 6) %
                                  shadow_lookup.size()];
@@ -686,6 +711,12 @@ Rasterizer::ShadowInfo& Rasterizer::ShadowOf(const Shader::Info* canonical) {
     auto& shadow = *cached.second;
     // A cached info's identity never changes; a different one means the address was reused.
     if (!shadow.info || shadow.identity != canonical->identity) {
+        // FIX-077: the command thread's copy, when it made one for this info.
+        if (seed && seed->identity == canonical->identity) {
+            shadow.info = std::make_unique<Shader::Info>(*seed);
+            shadow.identity = seed->identity;
+            return shadow;
+        }
         // The command thread rewrites the cached info's per-draw fields under the lock.
         std::scoped_lock lk{pipeline_cache.LookupMutex()};
         shadow.info = std::make_unique<Shader::Info>(*canonical);
@@ -707,7 +738,7 @@ bool Rasterizer::InstallDrawStages(const Pipeline* pipeline,
             }
             continue;
         }
-        auto& shadow = ShadowOf(canonical[stage]);
+        auto& shadow = ShadowOf(canonical[stage], selected.seed.get());
         auto& info = *shadow.info;
         std::copy_n(selected.user_data.begin(), selected.num_user_data, shadow.user_data.begin());
         info.user_data = std::span<const u32>{shadow.user_data.data(), selected.num_user_data};
@@ -798,7 +829,11 @@ const GraphicsPipeline* Rasterizer::AcquireGraphicsPipeline(const DrawIndirectPa
             std::array<SelectedStage, Shader::MaxStageTypes> own{};
             const GraphicsPipeline* own_pipeline;
             {
-                std::scoped_lock lk{pipeline_cache.LookupMutex()};
+                // FIX-077: skipped while the command thread holds the lock, as for compute.
+                std::unique_lock lk{pipeline_cache.LookupMutex(), std::try_to_lock};
+                if (!lk.owns_lock()) {
+                    return pipeline;
+                }
                 own_pipeline = pipeline_cache.GetGraphicsPipeline(params);
                 if (own_pipeline) {
                     CopySelectedStages(own);
@@ -3777,6 +3812,19 @@ void Rasterizer::WaitForEarlyFences(VAddr page) {
 
 void Rasterizer::WaitForGuard(VAddr page) {
     liverpool->WaitForGuard(page);
+}
+
+bool Rasterizer::CanWriteThrough(VAddr addr, u64 size) {
+    const VAddr page = Common::AlignDown(addr, VAddr{4096});
+    if (texture_cache.AnyImageInRegion(page, 4096)) {
+        return false;
+    }
+    return buffer_cache.CanWriteThrough(addr, size);
+}
+
+void Rasterizer::FinishWriteThrough(VAddr page, std::span<const u8> before, VAddr store,
+                                    u64 store_size) {
+    buffer_cache.FinishWriteThrough(page, before, store, store_size);
 }
 
 bool Rasterizer::ReadMemory(VAddr addr, u64 size, bool assume_locks) {

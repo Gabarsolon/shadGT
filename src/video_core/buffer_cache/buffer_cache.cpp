@@ -44,6 +44,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #include "core/guest_hash.h"
+#include "ryty_gpu/ryty_diag.h"
 #endif
 
 namespace VideoCore {
@@ -566,6 +567,14 @@ void BufferCache::LogHotPageStats() {
     }
     ahead_hits = 0;
     ahead_misses = 0;
+    if (const u64 stores = write_through_stores.exchange(0); stores != 0) {
+        LOG_WARNING(Render_Vulkan,
+                    "FIX-079: {} CPU stores written through GPU-written pages in 2.0 s ({} bytes, "
+                    "{} of them GPU bytes another thread wrote meanwhile), {} left to the drain "
+                    "(pages stored to often)",
+                    stores, write_through_bytes.exchange(0), write_through_gpu_bytes.exchange(0),
+                    write_through_refused.exchange(0));
+    }
     if (const u64 flushes = async_fault_flushes.exchange(0); flushes != 0) {
         const u64 wait_us = async_fault_wait_us.exchange(0);
         LOG_WARNING(Render_Vulkan,
@@ -897,6 +906,7 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_lock
 
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool assume_locks,
                              u64 exact_write_size) {
+    RYDIAG_SCOPE(FaultFlush, device_addr);
     const auto flush_request = [this, device_addr, size, is_write, exact_write_size] {
         std::scoped_lock buffer_lock{mutex}; // PERF-067
         const u32 first_block = device_addr >> block_shift;
@@ -985,6 +995,7 @@ void BufferCache::WaitForFaultWritebacks(u64 tick) {
     if (num_fault_downloads.load(std::memory_order_acquire) == 0) {
         return;
     }
+    RYDIAG_SCOPE(ReadbackWait, tick);
     std::vector<std::shared_ptr<FaultDownload>> older;
     {
         std::scoped_lock lk{fault_downloads_mutex};
@@ -2464,6 +2475,125 @@ void BufferCache::InlineGuestWrite(VAddr address, std::span<const u8> data) {
     // Pending CPU writes around the bytes first, so they do not later land over them.
     SynchronizeMemory(arena, address, u32(size), false, false);
     runtime.InlineData(arena, arena->Offset(address), data);
+}
+
+bool BufferCache::CanWriteThrough(VAddr address, u64 size) {
+    // FIX-079: a CPU store to a page that also holds GPU-written bytes, but none of them (nearly
+    // all of GT Sport's write faults: per-object records sitting beside GPU results), waited
+    // for the GPU to finish all its queued work so the page's GPU bytes could be downloaded
+    // first (about 1 ms on average, up to 100 ms; 54 s in an 8-minute session). The store goes
+    // through instead: its bytes are copied to the GPU copy, and the page stays watched and
+    // GPU-written, so reads of its GPU bytes and its readbacks work as before.
+    // -DisablePerf 103 turns it off.
+    // Opt-in (SHADGT_WRITE_THROUGH=1) since Lance's release sessions froze with it: the game
+    // stopped drawing during a scene change, while memory was being unmapped and remapped.
+    static const bool enabled = [] {
+        const char* env = std::getenv("SHADGT_WRITE_THROUGH");
+        return env && env[0] == '1' && Common::PerfFeatureEnabled(103);
+    }();
+    if (!enabled || !liverpool || !liverpool->CanSendFaultCommandAsync()) {
+        return false;
+    }
+    constexpr u64 PageSize = 4_KB;
+    const VAddr page = Common::AlignDown(address, PageSize);
+    if (size == 0 || address + size > page + PageSize) {
+        return false;
+    }
+    {
+        // A page stored to many times in a short while is drained once, as before, and then
+        // written freely (each write-through costs a fault and a step).
+        std::scoped_lock lk{write_through_mutex};
+        const auto now = std::chrono::steady_clock::now();
+        if (now - write_through_window > std::chrono::milliseconds{16}) {
+            write_through_window = now;
+            write_through_counts.clear();
+        }
+        if (++write_through_counts[page] > 24) {
+            ++write_through_refused;
+            return false;
+        }
+    }
+    std::scoped_lock buffer_lock{mutex};
+    // Stores over GPU-written bytes are left to the drain: letting them through (the page then
+    // stayed watched, so each later store faulted too) flooded the recorder with tiny uploads
+    // and the race fell to 12 FPS.
+    if (!gpu_modified_ranges.Intersects(page, PageSize) ||
+        gpu_modified_ranges.Intersects(address, size) || HasGpuImageAlias(page, PageSize) ||
+        !memory->IsValidMapping(page, PageSize)) {
+        return false;
+    }
+    return true;
+}
+
+void BufferCache::FinishWriteThrough(VAddr page, std::span<const u8> before, VAddr store,
+                                     u64 store_size) {
+    constexpr u64 PageSize = 4_KB;
+    const auto* now = std::bit_cast<const u8*>(page);
+    const u64 store_begin = store - page;
+    const u64 store_end = store_begin + store_size;
+    const auto changed = [&](u64 i) {
+        return now[i] != before[i] || (i >= store_begin && i < store_end);
+    };
+    struct Run {
+        VAddr address;
+        std::vector<u8> bytes;
+    };
+    std::vector<Run> runs;
+    for (u64 i = 0; i < PageSize;) {
+        if (!changed(i)) {
+            ++i;
+            continue;
+        }
+        u64 end = i + 1;
+        while (end < PageSize && changed(end)) {
+            ++end;
+        }
+        runs.push_back({page + i, std::vector<u8>(now + i, now + end)});
+        i = end;
+    }
+    {
+        std::scoped_lock buffer_lock{mutex};
+        for (const auto& run : runs) {
+            // The store's bytes, and any another thread wrote while the page was open: the
+            // CPU's are the newer ones there.
+            if (gpu_modified_ranges.Intersects(run.address, run.bytes.size())) {
+                gpu_modified_ranges.Subtract(run.address, run.bytes.size());
+                write_through_gpu_bytes += run.bytes.size();
+            }
+        }
+    }
+    for (const auto& run : runs) {
+        NoteCpuChange(run.address, run.bytes.size()); // FIX-069
+        write_through_bytes += run.bytes.size();
+    }
+    ++write_through_stores;
+    liverpool->SendFaultCommandAsync([this, runs = std::move(runs)] {
+        for (const auto& run : runs) {
+            WriteThroughUpload(run.address, run.bytes);
+        }
+    });
+}
+
+void BufferCache::WriteThroughUpload(VAddr address, std::span<const u8> data) {
+    std::scoped_lock buffer_lock{mutex}; // PERF-067
+    // As InlineGuestWrite: earlier uploads of these bytes are recorded first, so they do not
+    // land over them later.
+    RecordPendingAheadUploads(0, ~u64{0} >> 1);
+    const u64 size = data.size();
+    const u64 first_block = address >> block_shift;
+    const u64 last_block = (address + size - 1) >> block_shift;
+    const auto* arena = GetArena(first_block, last_block);
+    EnsureResident(arena, first_block, last_block);
+    SynchronizeMemory(arena, address, u32(size), false, false);
+    const auto staging = staging_pool.Request(size, MemoryType::HostUncached);
+    std::memcpy(staging.mapped, data.data(), size);
+    staging.Flush();
+    const vk::BufferCopy copy = {
+        .srcOffset = staging.offset,
+        .dstOffset = address - arena->cpu_addr,
+        .size = size,
+    };
+    runtime.CopyBuffer(staging.buffer, arena, std::span{&copy, 1});
 }
 
 std::string BufferCache::DescribeGpuWriters(VAddr address, u64 size) {

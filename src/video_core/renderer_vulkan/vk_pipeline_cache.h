@@ -299,6 +299,71 @@ private:
     } prewarm_stats;
     std::jthread prewarm_reader;
     Common::SpinMutex lookup_mutex; // PERF-047, PERF-060
+
+    /// FIX-078: a shader the read-ahead found with no matching translation is translated on a
+    /// worker thread; the draw that needs it takes the result (or waits for it) instead of
+    /// translating it on the command thread, one shader after another, under the lookup lock.
+    struct TranslateJob {
+        explicit TranslateJob(const Shader::RuntimeInfo& runtime_info_)
+            : runtime_info{runtime_info_} {}
+        Shader::HwStage hw_stage;
+        Shader::SwStage sw_stage;
+        u64 hash;
+        std::array<u32, Shader::ShaderParams::NumShaderUserData> user_data;
+        std::span<const u32> code;
+        Shader::RuntimeInfo runtime_info;
+        Shader::Backend::Bindings start;
+        std::unique_ptr<Shader::Info> info;
+        std::vector<u32> spv;
+        vk::ShaderModule module{};
+        double translate_ms{};
+        /// Set when harvested: its specialization, and when it became ready.
+        Shader::StageSpecialization spec;
+        std::chrono::steady_clock::time_point ready_since{};
+        std::atomic<bool> done{};
+        std::mutex mutex;
+        std::condition_variable cv;
+    };
+    class TranslateWorkers;
+    bool AsyncTranslation() const;
+    /// FIX-078 (lookup lock held): moves the finished translations of a program to its ready
+    /// list, first waiting for its unfinished ones when `wait`.
+    void HarvestTranslations(u64 hash, bool wait);
+    /// FIX-078 (lookup lock held): a ready translation made for the inputs of this lookup. A draw
+    /// (`insert`) adds it as a permutation; the read-ahead only learns it exists. Translations
+    /// no draw matches (made from read-ahead states that were never drawn) are dropped later.
+    bool TakeReadyTranslation(Shader::HwStage hw_stage, Shader::SwStage sw_stage, u64 hash,
+                              Program& program, const Shader::ShaderParams& params,
+                              const Shader::RuntimeInfo& runtime_info,
+                              const Shader::Backend::Bindings& binding, bool insert);
+    /// FIX-078 (lookup lock held): queues a translation; false when one with the same inputs is
+    /// already queued.
+    bool QueueTranslation(Shader::HwStage hw_stage, Shader::SwStage sw_stage,
+                          const Shader::ShaderParams& params,
+                          const Shader::RuntimeInfo& runtime_info,
+                          const Shader::Backend::Bindings& start);
+    tsl::robin_map<u64, std::vector<std::shared_ptr<TranslateJob>>> translate_jobs;
+    tsl::robin_map<u64, std::vector<std::shared_ptr<TranslateJob>>> ready_translations;
+    /// FIX-078: a stage of the key being made was queued; the later stages are not (their start
+    /// bindings follow from its translation).
+    bool stage_deferred{};
+    /// FIX-078: while set, a draw's own missing translations are queued (all its stages at
+    /// once) instead of made here one by one; `deferred_miss` tells that one was.
+    bool defer_misses{};
+    bool deferred_miss{};
+    struct {
+        u64 queued{};
+        u64 used{};
+        u64 expired{};
+        u64 duplicate{};
+        u64 failed{};
+        u64 waited{};
+        double wait_ms{};
+        double translate_ms{};
+        std::chrono::steady_clock::time_point since{};
+    } translate_stats;
+    std::unique_ptr<TranslateWorkers> translate_workers;
+
     // Last member, so the workers stop before anything they use is destroyed.
     std::unique_ptr<PipelineBuildWorkers> build_workers;
 };

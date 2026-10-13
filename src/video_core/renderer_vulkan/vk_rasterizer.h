@@ -64,6 +64,9 @@ public:
         u32 num_user_data{};
         std::array<u32, Shader::NUM_USER_DATA_REGS> user_data{};
         std::vector<u32> flattened;
+        /// FIX-077: a copy of the cache's info, made under the lookup lock the first time the
+        /// command thread selects it, so the recorder makes its shadow without taking the lock.
+        std::shared_ptr<const Shader::Info> seed;
     };
     struct SelectedPipeline {
         const GraphicsPipeline* pipeline{};
@@ -213,6 +216,9 @@ public:
     bool InvalidateMemory(VAddr addr, u64 size, bool assume_locks = false,
                           u64 exact_write_size = 0);
     bool ReadMemory(VAddr addr, u64 size, bool assume_locks = false);
+    /// FIX-079: see BufferCache::CanWriteThrough; never over images.
+    bool CanWriteThrough(VAddr addr, u64 size);
+    void FinishWriteThrough(VAddr page, std::span<const u8> before, VAddr store, u64 store_size);
     bool IsMapped(VAddr addr, u64 size);
     void MapMemory(VAddr addr, u64 size);
     void RegisterMemory(VAddr addr, u64 size);
@@ -365,6 +371,8 @@ private:
     std::unordered_map<const Shader::Info*, ShadowInfo> shadow_infos;
     // PERF-065: the last shadow found for a canonical info, direct-mapped by its address.
     std::array<std::pair<const Shader::Info*, ShadowInfo*>, 512> shadow_lookup{};
+    // FIX-077 (under the lookup lock): the identity each cache info was last seeded with.
+    std::unordered_map<const Shader::Info*, u64> seeded_infos;
     SelectedPipeline* selected_pipeline{};
     struct {
         u64 ahead;
@@ -410,13 +418,14 @@ private:
     bool InstallDrawStages(const Pipeline* pipeline,
                            std::array<SelectedStage, Shader::MaxStageTypes>& stages,
                            bool validate);
-    ShadowInfo& ShadowOf(const Shader::Info* canonical);
+    ShadowInfo& ShadowOf(const Shader::Info* canonical, const Shader::Info* seed);
     /// The user data of the infos the pipeline cache just selected (under its lock).
     /// PERF-055: the compute stage of the pipeline just looked up, in its pipeline slot.
     void CopyComputeStage(std::array<SelectedStage, Shader::MaxStageTypes>& out);
     /// PERF-055: the dispatch's compute pipeline, as selected ahead or looked up here.
     const ComputePipeline* AcquireComputePipeline();
     void CopySelectedStages(std::array<SelectedStage, Shader::MaxStageTypes>& out);
+    void SeedStage(SelectedStage& selected, const Shader::Info* info);
     // FIX-046: bumped on every unmap (any thread); the decoded T#s are checked again after it.
     std::atomic<u64> tsharp_epoch{};
     u64 decoded_epoch{};

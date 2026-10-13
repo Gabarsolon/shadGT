@@ -46,6 +46,7 @@
 #include <imgui.h>
 #include <stb_image_write.h>
 #include <vk_mem_alloc.h>
+#include "ryty_gpu/ryty_diag.h"
 
 namespace Vulkan {
 
@@ -1137,6 +1138,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
 
     // Present to swapchain.
     {
+        RYDIAG_SCOPE(Present);
         std::scoped_lock submit_lock{Scheduler::submit_mutex};
         if (!swapchain.Present()) {
             swapchain.Recreate(window.GetWidth(), window.GetHeight());
@@ -1147,6 +1149,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     if (!is_reusing_frame && is_game_frame) {
         DebugState.IncFlipFrameNum();
         Common::NoteGameFrame();
+        RyDiag::FrameShown();
     }
 }
 
@@ -1162,6 +1165,7 @@ Frame* Presenter::GetRenderFrame() {
     const auto record_wait = [&] {
         const auto now = std::chrono::steady_clock::now();
         const double ms = std::chrono::duration<double, std::milli>(now - wait_start).count();
+        RyDiag::RecordElapsed(RyDiag::Zone::PresentWait, now - wait_start);
         if (stats.window == std::chrono::steady_clock::time_point{}) {
             stats.window = now;
         }

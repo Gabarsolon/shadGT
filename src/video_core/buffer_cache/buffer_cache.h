@@ -240,6 +240,13 @@ public:
     /// changing how the memory is tracked (guest memory receives the same bytes later).
     void InlineGuestWrite(VAddr address, std::span<const u8> data);
 
+    /// FIX-079 (faulting thread): whether a CPU store of `size` bytes at `address` may write
+    /// through a page that holds GPU-written bytes instead of draining the GPU.
+    bool CanWriteThrough(VAddr address, u64 size);
+    /// FIX-079 (faulting thread, after the store): the page's bytes that changed since `before`
+    /// are sent to the GPU copy in order; the page stays watched and GPU-written.
+    void FinishWriteThrough(VAddr page, std::span<const u8> before, VAddr store, u64 store_size);
+
     /// DIAG-030: page states of a range (GPU-written, CPU-modified, hot, changed since its
     /// upload) and the recorded GPU writers overlapping it.
     std::string DescribeRange(VAddr address, u64 size);
@@ -469,6 +476,15 @@ private:
     mutable std::recursive_mutex mutex;
     Buffer gds_buffer;
     RangeSet gpu_modified_ranges;
+    /// FIX-079: the bytes a write-through store changed, copied to the arena on the recorder.
+    void WriteThroughUpload(VAddr address, std::span<const u8> data);
+    std::mutex write_through_mutex;
+    std::unordered_map<VAddr, u32> write_through_counts;
+    std::chrono::steady_clock::time_point write_through_window{};
+    std::atomic<u64> write_through_stores{};
+    std::atomic<u64> write_through_bytes{};
+    std::atomic<u64> write_through_refused{};
+    std::atomic<u64> write_through_gpu_bytes{};
     // FIX-069: which of the CPU and the GPU wrote memory last, in one sequence. GPU bytes reach
     // guest memory only where the GPU wrote after the CPU last changed the page.
     RangeMap<u64> gpu_write_seqs;

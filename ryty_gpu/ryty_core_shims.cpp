@@ -2,6 +2,7 @@
 // guest's memory, kernel and event queues belong to Ryty's libkernel and libc, so these forward to
 // them or to Windows directly.
 
+#include "ryty_gpu/ryty_diag.h"
 #include <windows.h>
 #include <intrin.h>
 #include <algorithm>
@@ -1042,6 +1043,8 @@ bool EqueueInternal::AddEvent(EqueueEvent& event) {
 }
 
 bool EqueueInternal::TriggerEvent(u64 ident, s16 filter, void* trigger_data) {
+    RyDiag::Mark(RyDiag::Zone::GpuEventSent,
+                 (u64(u16(filter)) << 48) | (ident & 0xFFFFFFFFFFFFull));
     static const auto trigger =
         RytyFunction<TriggerEventFn>("libkernel.prx", "RytyEqueueTriggerEvent_nid_no_patch");
     return trigger != nullptr && trigger(m_handle, ident, filter, trigger_data) == 0;

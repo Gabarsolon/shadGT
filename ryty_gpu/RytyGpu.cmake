@@ -92,6 +92,8 @@ ryty_add_library(ryty_gpu libSceVideoOut
         ryty_gpu/ryty_entry.cpp
         ryty_gpu/ryty_input_bridge.cpp
         ryty_gpu/ryty_write_watch.cpp
+        # Stutter diagnostics (RYGT_DIAG=1), ryty_diag.h.
+        ryty_gpu/ryty_diag.cpp
         # NVIDIA DLSS through the optional plugin dlss\ryGT_dlss.dll (ryty_dlss.h).
         ryty_gpu/ryty_dlss.cpp
         # AMD FSR 3.1 through amd_fidelityfx_vk.dll (ryty_fsr3.h).
@@ -102,7 +104,7 @@ ryty_add_library(ryty_gpu libSceVideoOut
         src/core/loader/dwarf.cpp
 )
 
-target_compile_definitions(ryty_gpu PRIVATE RYTY_HAS_CPU_PATCHES=1)
+target_compile_definitions(ryty_gpu PRIVATE RYTY_HAS_CPU_PATCHES=1 RYTY_DIAG=1)
 
 # shadGT's Discord Rich Presence, in the renderer library only ("Running on ryGT").
 if (ENABLE_DISCORD_RPC)

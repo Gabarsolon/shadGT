@@ -44,8 +44,100 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "ryty_gpu/ryty_diag.h"
 
+namespace Shader::Optimization {
+extern thread_local std::span<const u32> g_diag_compiling_code;
+extern thread_local u64 g_diag_compiling_hash;
+} // namespace Shader::Optimization
 namespace Vulkan {
+
+class PipelineCache::TranslateWorkers {
+public:
+    TranslateWorkers(const Shader::Profile& profile_, vk::Device device_, u32 count)
+        : profile{profile_}, device{device_} {
+        for (u32 i = 0; i < count; ++i) {
+            threads.emplace_back([this, i](std::stop_token stop) { Run(stop, i); });
+        }
+    }
+    ~TranslateWorkers() {
+        for (auto& thread : threads) {
+            thread.request_stop();
+        }
+        cv.notify_all();
+    }
+
+    void Queue(std::shared_ptr<TranslateJob> job) {
+        {
+            std::scoped_lock lk{mutex};
+            queue.push_back(std::move(job));
+        }
+        cv.notify_one();
+    }
+
+private:
+    void Run(std::stop_token stop, u32 index) {
+        Common::SetCurrentThreadName(fmt::format("shadGT:ShaderTranslate{}", index).c_str());
+        Shader::Pools pools;
+        while (!stop.stop_requested()) {
+            std::shared_ptr<TranslateJob> job;
+            {
+                std::unique_lock lk{mutex};
+                cv.wait(lk, stop, [this] { return !queue.empty(); });
+                if (queue.empty()) {
+                    continue;
+                }
+                job = std::move(queue.front());
+                queue.pop_front();
+            }
+            Translate(*job, pools);
+            {
+                std::scoped_lock lk{job->mutex};
+                job->done = true;
+            }
+            job->cv.notify_all();
+        }
+    }
+
+    void Translate(TranslateJob& job, Shader::Pools& pools) {
+        const Shader::ShaderParams params{
+            .user_data = std::span<const u32, Shader::ShaderParams::NumShaderUserData>{job.user_data},
+            .code = job.code,
+            .hash = job.hash,
+        };
+        auto info = std::make_unique<Shader::Info>(job.hw_stage, job.sw_stage, params);
+        auto runtime_info = job.runtime_info;
+        auto binding = job.start;
+        const auto start = std::chrono::steady_clock::now();
+        Shader::Optimization::g_diag_compiling_code = job.code;
+        Shader::Optimization::g_diag_compiling_hash = job.hash;
+        try {
+            Common::RecoverableScope recoverable;
+            const auto program = Shader::TranslateProgram(job.code, pools, *info, runtime_info,
+                                                          profile);
+            job.spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, program, binding);
+        } catch (const Common::RecoverableFailure&) {
+            // Translated again on the command thread when needed, which reports the failure.
+            return;
+        }
+        if (!Common::PerfFeatureEnabled(44)) {
+            info->resource_usage_known = false;
+        }
+        job.module = CompileSPV(job.spv, device);
+        job.info = std::move(info);
+        job.translate_ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+                .count();
+    }
+
+    const Shader::Profile& profile;
+    vk::Device device;
+    std::mutex mutex;
+    std::condition_variable_any cv;
+    std::deque<std::shared_ptr<TranslateJob>> queue;
+    std::vector<std::jthread> threads;
+};
+
 
 static bool SaneTessConstants(const Shader::Info& hull, const AmdGpu::Liverpool* liverpool,
                               bool read_ahead); // FIX-058
@@ -486,6 +578,13 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
             }
         }
     }
+    // FIX-078: a quarter of the hardware threads (at least 2) translate read-ahead shaders.
+    if (Common::PerfFeatureEnabled(102)) {
+        const u32 count = std::max(2u, std::thread::hardware_concurrency() / 4);
+        translate_workers =
+            std::make_unique<TranslateWorkers>(profile, instance.GetDevice(), count);
+        translate_stats.since = std::chrono::steady_clock::now();
+    }
 }
 
 PipelineCache::~PipelineCache() {
@@ -925,7 +1024,29 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     InstallPrewarmed();
     draw_indirect_params = params;
     ++draws_since_scan;
-    if (!RefreshGraphicsKey()) {
+    // FIX-078: missing translations of this draw's stages are queued together first; then the
+    // draws after it are read and their shaders queued too, and the key is made again, waiting
+    // for the workers' results (the slowest one, not their sum).
+    defer_misses = AsyncTranslation();
+    deferred_miss = false;
+    bool key_valid = RefreshGraphicsKey();
+    // One stage is queued per pass (a stage's start bindings follow from the stages before it);
+    // the read-ahead runs once, after the first.
+    for (u32 pass = 0; !key_valid && deferred_miss && pass < 6; ++pass) {
+        if (pass == 0) {
+            liverpool->ReadAheadNow();
+            BuildQueuedStates(params, false);
+            draw_indirect_params = params;
+        }
+        deferred_miss = false;
+        key_valid = RefreshGraphicsKey();
+    }
+    defer_misses = false;
+    if (!key_valid && deferred_miss) {
+        deferred_miss = false;
+        key_valid = RefreshGraphicsKey();
+    }
+    if (!key_valid) {
         return nullptr;
     }
     if (graphics_key.num_color_attachments > AmdGpu::NUM_COLOR_BUFFERS) {
@@ -1143,6 +1264,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
             ++Common::GetWorkCounters().pipeline_waits;
             Common::GetWorkCounters().pipeline_wait_us += u64(
                 std::chrono::duration_cast<std::chrono::microseconds>(now - wait_start).count());
+            RyDiag::RecordElapsed(RyDiag::Zone::PipelineWait, now - wait_start, pipeline_hash);
             LOG_WARNING(Render_Vulkan,
                         "Pipeline {:#x} {}: built {:.1f} ms after it was queued, draw waited "
                         "{:.1f} ms",
@@ -1154,6 +1276,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
             it.value() = std::move(build->pipeline);
         } else {
             Common::Nvtx::Scope nvtx{"build pipeline here"}; // DIAG-056
+            RYDIAG_SCOPE(PipelineBuild, pipeline_hash);
             it.value() = std::make_unique<GraphicsPipeline>(
                 instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
                 runtime_infos, fetch_shader, modules, sdata);
@@ -1187,6 +1310,7 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
 
         ComputePipeline::SerializationSupport sdata{};
         ++Common::GetWorkCounters().pipelines_compiled;
+        RYDIAG_SCOPE(PipelineBuild, pipeline_hash);
         it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
                                                        *pipeline_cache, compute_key, *infos[0],
                                                        modules[0], sdata);
@@ -1399,6 +1523,7 @@ bool PipelineCache::RefreshGraphicsStages() {
     const auto& regs = Regs();
     auto& key = graphics_key;
     fetch_shader = nullptr;
+    stage_deferred = false; // FIX-078
 
     // FIX-027: a shader program register pointing outside guest memory (GT Sport's dealership had
     // a pixel shader at 0x100) crashed the emulator reading the program. Skip such a draw, like
@@ -1595,6 +1720,7 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     // precompiled shaders, so the game never sees this time pass.
     Common::GuestClock::CompilePause hold;
     ++Common::GetWorkCounters().shaders_compiled;
+    RYDIAG_SCOPE(ShaderCompile, info.pgm_hash);
     last_spv_hash = 0;
     LOG_INFO(Render_Vulkan, "Compiling {} shader {:#x} {}", info.hw_stage, info.pgm_hash,
              perm_idx != 0 ? "(permutation)" : "");
@@ -2443,6 +2569,157 @@ static bool SaneTessConstants(const Shader::Info& hull, const AmdGpu::Liverpool*
     return sane;
 }
 
+bool PipelineCache::AsyncTranslation() const {
+    // FIX-078: -DisablePerf 102 translates on the command thread as before. Dumped, collected or
+    // patched shaders need their permutation index while they are translated.
+    static const bool enabled = Common::PerfFeatureEnabled(102) &&
+                                !EmulatorSettings.IsDumpShaders() &&
+                                !EmulatorSettings.IsShaderCollect() &&
+                                !EmulatorSettings.IsPatchShaders();
+    return enabled && translate_workers != nullptr;
+}
+
+bool PipelineCache::QueueTranslation(HwStage hw_stage, SwStage sw_stage,
+                                     const Shader::ShaderParams& params,
+                                     const Shader::RuntimeInfo& runtime_info,
+                                     const Shader::Backend::Bindings& start) {
+    auto& jobs = translate_jobs[params.hash];
+    for (const auto& job : jobs) {
+        if (job->hw_stage == hw_stage && job->runtime_info == runtime_info && job->start == start) {
+            ++translate_stats.duplicate;
+            return false;
+        }
+    }
+    auto job = std::make_shared<TranslateJob>(runtime_info);
+    job->hw_stage = hw_stage;
+    job->sw_stage = sw_stage;
+    job->hash = params.hash;
+    std::ranges::copy(params.user_data, job->user_data.begin());
+    job->code = params.code;
+    job->start = start;
+    jobs.push_back(job);
+    ++translate_stats.queued;
+    translate_workers->Queue(std::move(job));
+    return true;
+}
+
+bool PipelineCache::TakeReadyTranslation(HwStage hw_stage, SwStage sw_stage, u64 hash,
+                                         Program& program,
+                                         const Shader::ShaderParams& params,
+                                         const Shader::RuntimeInfo& runtime_info,
+                                         const Shader::Backend::Bindings& binding, bool insert) {
+    const auto it = ready_translations.find(hash);
+    if (it == ready_translations.end()) {
+        return false;
+    }
+    auto& ready = it.value();
+    for (auto job_it = ready.begin(); job_it != ready.end(); ++job_it) {
+        auto& job = *job_it;
+        // Matched the way GetProgram matches a permutation: its specialization for this lookup.
+        auto& info = *job->info;
+        info.pgm_base = params.Base();
+        info.user_data = params.user_data;
+        info.RefreshFlatBuf();
+        if (job->hw_stage != hw_stage || job->sw_stage != sw_stage ||
+            Shader::StageSpecialization(info, runtime_info, profile, binding) != job->spec) {
+            continue;
+        }
+        if (!insert) {
+            return true;
+        }
+        size_t perm_idx = program.modules.size();
+        if (const auto end = stored_perm_end.find(hash); end != stored_perm_end.end()) {
+            perm_idx = std::max(perm_idx, end->second);
+        }
+        const u64 perm_hash = HashCombine(hash, perm_idx);
+        RegisterShaderMeta(info, job->spec.fetch_shader_data, job->spec, perm_hash, perm_idx);
+        const u64 spv_hash = XXH3_64bits(job->spv.data(), job->spv.size() * sizeof(u32));
+        Vulkan::SetObjectName(instance.GetDevice(), job->module,
+                              GetShaderName(job->hw_stage, hash, perm_idx));
+        program.InsertPermut(job->module, std::move(job->spec), std::move(job->info), perm_idx);
+        program.modules[perm_idx].spv_hash = spv_hash;
+        RegisterShaderBinary(std::move(job->spv), hash, perm_idx);
+        ++Common::GetWorkCounters().shaders_compiled;
+        ++translate_stats.used;
+        ready.erase(job_it);
+        if (ready.empty()) {
+            ready_translations.erase(it);
+        }
+        return true;
+    }
+    return false;
+}
+
+void PipelineCache::HarvestTranslations(u64 hash, bool wait) {
+    const auto it = translate_jobs.find(hash);
+    if (it == translate_jobs.end()) {
+        return;
+    }
+    auto& jobs = it.value();
+    if (wait) {
+        const auto wait_start = std::chrono::steady_clock::now();
+        bool waited = false;
+        for (const auto& job : jobs) {
+            if (!job->done) {
+                // As CompileModule: the game never sees a PS4 wait for a shader.
+                Common::GuestClock::CompilePause hold;
+                RYDIAG_SCOPE(ShaderCompile, hash);
+                std::unique_lock lk{job->mutex};
+                job->cv.wait(lk, [&] { return job->done.load(); });
+                waited = true;
+            }
+        }
+        if (waited) {
+            ++translate_stats.waited;
+            translate_stats.wait_ms += std::chrono::duration<double, std::milli>(
+                                           std::chrono::steady_clock::now() - wait_start)
+                                           .count();
+        }
+    }
+    auto& ready = ready_translations[hash];
+    const auto now = std::chrono::steady_clock::now();
+    std::erase_if(jobs, [&](const std::shared_ptr<TranslateJob>& job) {
+        if (!job->done) {
+            return false;
+        }
+        if (!job->info || !job->module) {
+            ++translate_stats.failed;
+            return true;
+        }
+        translate_stats.translate_ms += job->translate_ms;
+        job->spec = Shader::StageSpecialization(*job->info, job->runtime_info, profile, job->start);
+        job->ready_since = now;
+        ready.push_back(job);
+        return true;
+    });
+    if (jobs.empty()) {
+        translate_jobs.erase(it);
+    }
+    // Translations no draw took within 30 s came from states that were not drawn.
+    std::erase_if(ready, [&](const std::shared_ptr<TranslateJob>& job) {
+        if (now - job->ready_since < std::chrono::seconds{30} && ready.size() <= 32) {
+            return false;
+        }
+        instance.GetDevice().destroyShaderModule(job->module);
+        ++translate_stats.expired;
+        return true;
+    });
+    auto& stats = translate_stats;
+    if (now - stats.since >= std::chrono::seconds{2}) {
+        if (stats.queued + stats.used != 0) {
+            LOG_WARNING(Render_Vulkan,
+                        "FIX-078 shader translation in {:.1f} s: {} queued, {} used by draws "
+                        "({:.1f} ms of translation done off this thread), {} never drawn, {} "
+                        "duplicates, {} failed; {} draws waited for one ({:.1f} ms)",
+                        std::chrono::duration<double>(now - stats.since).count(), stats.queued,
+                        stats.used, stats.translate_ms, stats.expired, stats.duplicate,
+                        stats.failed, stats.waited, stats.wait_ms);
+        }
+        stats = {};
+        stats.since = now;
+    }
+}
+
 PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_stage,
                                                 const Shader::ShaderParams& params,
                                                 Shader::Backend::Bindings& binding) {
@@ -2500,6 +2777,9 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     }
 
     auto& program = it_pgm.value();
+    // FIX-078: translations made on the workers become permutations; a draw (not a read-ahead)
+    // first waits for any still running, as one of them is likely the permutation it needs.
+    HarvestTranslations(params.hash, regs_override == nullptr);
     std::optional<Common::PhaseTimer> match_timer{std::in_place, Common::Phase::ProgramMatch};
     // Diagnostic for runaway permutations: why each existing permutation was rejected.
     std::string mismatch_reasons;
@@ -2600,6 +2880,32 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
         return std::make_tuple(&info, permutation.module, HashCombine(params.hash, perm_idx));
     }
     match_timer.reset();
+
+    if (AsyncTranslation()) {
+        // FIX-078: a translation the workers made for these inputs.
+        const bool read_ahead = regs_override != nullptr;
+        if (TakeReadyTranslation(hw_stage, sw_stage, params.hash, *program, params, runtime_info,
+                                 binding,
+                                 !read_ahead)) {
+            if (read_ahead) {
+                return std::make_tuple(nullptr, vk::ShaderModule{}, u64{0});
+            }
+            return GetProgram(hw_stage, sw_stage, params, binding);
+        }
+        if (read_ahead || defer_misses) {
+            // A shader an upcoming draw needs (or this draw, which looks again once the next
+            // draws' shaders are queued too); translated on a worker while this thread reads
+            // on. No key without it: the state is skipped for now.
+            if (!stage_deferred) {
+                stage_deferred = true;
+                QueueTranslation(hw_stage, sw_stage, params, runtime_info, binding);
+            }
+            if (!read_ahead) {
+                deferred_miss = true;
+            }
+            return std::make_tuple(nullptr, vk::ShaderModule{}, u64{0});
+        }
+    }
 
     // PERF-013: runtime permutations used to take the next free slot of this session, which
     // depends on which stored permutations were preloaded. A slot already used in the stored
