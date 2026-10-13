@@ -11,6 +11,10 @@ SPDX-License-Identifier: GPL-2.0-or-later
   <sub>Gran Turismo Sport on PC, built on the shadPS4 emulator</sub>
 </h1>
 
+# This Project is Archived now, use RyGT if you wish to play Gran Turismo Sport. 
+
+Please see: https://github.com/mlgprorektm8/RyGT
+
 # About
 
 shadGT is a Windows-only fork of the [shadPS4](https://github.com/shadps4-emu/shadPS4)
