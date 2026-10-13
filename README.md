@@ -1,3 +1,7 @@
+# This Project is Archived now, use RyGT if you wish to play Gran Turismo Sport. 
+
+Please see: https://github.com/mlgprorektm8/RyGT
+
 <!--
 SPDX-FileCopyrightText: 2026 shadPS4 Emulator Project
 SPDX-License-Identifier: GPL-2.0-or-later
@@ -11,9 +15,7 @@ SPDX-License-Identifier: GPL-2.0-or-later
   <sub>Gran Turismo Sport on PC, built on the shadPS4 emulator</sub>
 </h1>
 
-# This Project is Archived now, use RyGT if you wish to play Gran Turismo Sport. 
 
-Please see: https://github.com/mlgprorektm8/RyGT
 
 # About
 
