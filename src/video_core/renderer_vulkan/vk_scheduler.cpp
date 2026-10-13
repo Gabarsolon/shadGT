@@ -161,6 +161,7 @@ vk::CommandBuffer Scheduler::DirectCommandBuffer() {
 
 void Scheduler::CommandThread(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadGT:VkCommands");
+    Common::PreferPerformanceCores(); // PERF-088
     auto& commands = *ring;
     u64 position = commands.Replayed();
     u64 window_commands = 0;

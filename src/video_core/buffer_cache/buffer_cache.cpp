@@ -179,6 +179,17 @@ static bool ReadbackHashEnabled() {
 static constexpr size_t GDS_BUFFER_SIZE = 64_KB;
 static constexpr size_t STREAM_BUFFER_SIZE = 128_MB;
 
+// PERF-094: the stream ring (small read-only buffers copied for each draw) is in system memory,
+// which the GPU reads over PCIe, instead of video memory the recorder writes over PCIe. Each copy
+// took 1,620 cycles in video memory and 950 in system memory (GT Sport race, RTX 4070 Ti, about
+// 200,000 copies per second), with the same GPU load. Idea from the shadPS4-eltutz fork's
+// findings ("ring host-direct"). SHADGT_STREAM_HOST=0 or -DisablePerf 111 keeps video memory.
+static MemoryType StreamRingType() {
+    const char* env = std::getenv("SHADGT_STREAM_HOST");
+    const bool host = !(env && env[0] == '0') && Common::PerfFeatureEnabled(111);
+    return host ? MemoryType::HostUncached : MemoryType::Stream;
+}
+
 static constexpr auto ARENA_USAGE =
     vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst |
     vk::BufferUsageFlagBits::eUniformBuffer | vk::BufferUsageFlagBits::eStorageBuffer |
@@ -206,7 +217,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       staging_pool{runtime_.GetStagingPool()}, liverpool{liverpool_},
       memory{Core::Memory::Instance()}, texture_cache{texture_cache_},
       memory_tracker{std::make_unique<MemoryTracker>(tracker)}, page_manager{tracker},
-      stream_buffer{instance, scheduler, MemoryType::Stream, STREAM_BUFFER_SIZE},
+      stream_buffer{instance, scheduler, StreamRingType(), STREAM_BUFFER_SIZE},
       ahead_stream{instance, scheduler, MemoryType::Stream, STREAM_BUFFER_SIZE},
       ahead_staging{instance, scheduler, MemoryType::HostUncached, STREAM_BUFFER_SIZE},
       gds_buffer{instance, 0, GDS_BUFFER_SIZE, MemoryType::Stream, "GDS Buffer"},
@@ -559,6 +570,12 @@ void BufferCache::LogHotPageStats() {
     hot_pages_cooled_changed = 0;
     prehashed_hits = 0;
     prehashed_misses = 0;
+    if (stage_prehash_hits + stage_prehash_misses != 0) {
+        LOG_WARNING(Render_Vulkan, "PERF-087: hot pages hashed by the buffer stage before the "
+                    "lock: {} used, {} hashed under it", stage_prehash_hits, stage_prehash_misses);
+        stage_prehash_hits = 0;
+        stage_prehash_misses = 0;
+    }
     if (ahead_hits + ahead_misses != 0) {
         LOG_WARNING(Render_Vulkan,
                     "PERF-062: hot-page hashes taken by the command thread: {} used, {} hashed "
@@ -1855,6 +1872,9 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
 
 // PERF-046: hashes count pages (page_at(i) gives each address) into hashes, on several
 // threads from 128 pages (512 KB) on; -DisablePerf 58 hashes them on this thread.
+// PERF-087: hashes of hot pages the buffer stage took for the obtain it runs (ascending).
+static thread_local std::vector<std::pair<VAddr, u64>> t_stage_prehash;
+
 template <typename PageAt>
 static void HashPages(size_t count, PageAt&& page_at, std::span<u64> hashes) {
     static constexpr size_t ParallelFrom = 128;
@@ -1912,6 +1932,36 @@ void BufferCache::HashPagesAhead(std::span<const std::pair<VAddr, u64>> ranges, 
 std::optional<std::pair<const Buffer*, u64>> BufferCache::ObtainBufferAhead(
     VAddr device_addr, u32 size, bool is_written, bool is_texel_buffer,
     AheadUploads& uploads, bool* overlapped_out) {
+    // PERF-087: the hot pages this obtain will check are hashed before the lock is taken; the
+    // recorder waited on the lock while the stage hashed them under it. A page the CPU writes
+    // after this hash is no different from one it writes after a hash taken under the lock.
+    // -DisablePerf 106 hashes them under the lock.
+    static const bool prehash = Common::PerfFeatureEnabled(106);
+    auto& prehashed = t_stage_prehash;
+    prehashed.clear();
+    if (prehash && size >= BYTES_PER_PAGE && !is_written) {
+        boost::container::small_vector<VAddr, 32> pages;
+        memory_tracker->ForEachHotPageToCheck(device_addr, size, [&](VAddr page) {
+            if (page >= device_addr && page + BYTES_PER_PAGE <= device_addr + size &&
+                pages.size() < 4096) {
+                pages.push_back(page);
+            }
+        });
+        if (!pages.empty()) {
+            memory->WithMappingsStable([&] {
+                for (const VAddr page : pages) {
+                    if (memory->IsMappedAddress(page)) {
+                        prehashed.emplace_back(page, Core::HashGuestBytes(page, BYTES_PER_PAGE));
+                    }
+                }
+            });
+        }
+    }
+    struct ClearPrehash {
+        ~ClearPrehash() {
+            t_stage_prehash.clear();
+        }
+    } clear_prehash;
     std::scoped_lock lk{mutex};
     // PERF-079: a range under images is obtained ahead through the arena as well; the recorder
     // exports the images before using it (ExportImagesOver). In GT Sport's races a third of the
@@ -2164,7 +2214,25 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         range_end.push_back(hot.size());
     }
     hot_hashes.resize(hot.size());
-    if (read_capture && !hot.empty()) {
+    if (!t_stage_prehash.empty() && !hot.empty()) {
+        // PERF-087: hashed by the buffer stage before it took the lock (ascending pages).
+        auto& misses = scratch.misses;
+        misses.clear();
+        for (size_t i = 0; i < hot.size(); ++i) {
+            const auto it = std::ranges::lower_bound(t_stage_prehash, hot[i].first, {},
+                                                     &std::pair<VAddr, u64>::first);
+            if (it != t_stage_prehash.end() && it->first == hot[i].first) {
+                hot_hashes[i] = it->second;
+            } else {
+                misses.push_back(i);
+            }
+        }
+        stage_prehash_hits += hot.size() - misses.size();
+        stage_prehash_misses += misses.size();
+        for (const size_t i : misses) {
+            hot_hashes[i] = Core::HashGuestBytes(hot[i].first, BYTES_PER_PAGE);
+        }
+    } else if (read_capture && !hot.empty()) {
         // PERF-063: pages captured at decode come with their hash; the rest are hashed here.
         auto& misses = scratch.misses;
         misses.clear();

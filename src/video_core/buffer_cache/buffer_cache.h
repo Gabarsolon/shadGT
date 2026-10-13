@@ -308,6 +308,8 @@ private:
         u64 size;
     };
     std::unordered_map<VAddr, GpuWriter> small_gpu_writers;
+    u64 stage_prehash_hits{};   // PERF-087
+    u64 stage_prehash_misses{};
     /// DIAG-029: GPU writes larger than 4 KB, by start address.
     std::map<VAddr, GpuWriter> large_gpu_writers;
     u64 big_quad_draws_logged{};

@@ -3,7 +3,9 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <ctime>
+#include <vector>
 #include <string>
 #include <thread>
 #include <fmt/format.h>
@@ -84,6 +86,89 @@ void SetCurrentThreadRealtime(const std::chrono::nanoseconds period_ns) {
 
 #ifdef _WIN32
 
+namespace {
+// PERF-088: the CPU sets and their efficiency classes (the highest class is the fast cores).
+struct CoreClasses {
+    std::vector<ULONG> fast_ids;
+    std::vector<s8> fast_by_index; // by group * 64 + logical processor index: 1 fast, 0 slow
+    bool hybrid = false;
+};
+const CoreClasses& GetCoreClasses() {
+    static const CoreClasses classes = [] {
+        CoreClasses result;
+        ULONG length = 0;
+        GetSystemCpuSetInformation(nullptr, 0, &length, GetCurrentProcess(), 0);
+        std::vector<u8> buffer(length);
+        auto* info = reinterpret_cast<SYSTEM_CPU_SET_INFORMATION*>(buffer.data());
+        if (length == 0 ||
+            !GetSystemCpuSetInformation(info, length, &length, GetCurrentProcess(), 0)) {
+            return result;
+        }
+        BYTE lowest = 255, highest = 0;
+        for (ULONG offset = 0; offset < length;) {
+            const auto& entry = *reinterpret_cast<SYSTEM_CPU_SET_INFORMATION*>(buffer.data() + offset);
+            if (entry.Type == CpuSetInformation) {
+                lowest = std::min(lowest, entry.CpuSet.EfficiencyClass);
+                highest = std::max(highest, entry.CpuSet.EfficiencyClass);
+            }
+            offset += entry.Size;
+        }
+        result.hybrid = lowest != highest;
+        for (ULONG offset = 0; offset < length;) {
+            const auto& entry = *reinterpret_cast<SYSTEM_CPU_SET_INFORMATION*>(buffer.data() + offset);
+            if (entry.Type == CpuSetInformation) {
+                const bool fast = entry.CpuSet.EfficiencyClass == highest;
+                if (fast) {
+                    result.fast_ids.push_back(entry.CpuSet.Id);
+                }
+                const size_t index = size_t(entry.CpuSet.Group) * 64 +
+                                     entry.CpuSet.LogicalProcessorIndex;
+                if (result.fast_by_index.size() <= index) {
+                    result.fast_by_index.resize(index + 1, -1);
+                }
+                result.fast_by_index[index] = fast ? 1 : 0;
+            }
+            offset += entry.Size;
+        }
+        LOG_INFO(Common, "PERF-088: {} CPU, {} fast logical processors",
+                 result.hybrid ? "hybrid" : "uniform", result.fast_ids.size());
+        return result;
+    }();
+    return classes;
+}
+} // namespace
+
+void PreferPerformanceCores() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("SHADGT_FAST_CORES");
+        return !(env && env[0] == '0');
+    }();
+    const auto& classes = GetCoreClasses();
+    if (!enabled || !classes.hybrid || classes.fast_ids.empty()) {
+        return;
+    }
+    // Not throttled as a background thread either (EcoQoS sends those to the slow cores).
+    THREAD_POWER_THROTTLING_STATE throttling{};
+    throttling.Version = THREAD_POWER_THROTTLING_CURRENT_VERSION;
+    throttling.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
+    throttling.StateMask = 0;
+    SetThreadInformation(GetCurrentThread(), ThreadPowerThrottling, &throttling,
+                         sizeof(throttling));
+    SetThreadSelectedCpuSets(GetCurrentThread(), classes.fast_ids.data(),
+                             static_cast<ULONG>(classes.fast_ids.size()));
+}
+
+int CurrentCoreIsFast() {
+    const auto& classes = GetCoreClasses();
+    if (!classes.hybrid) {
+        return -1;
+    }
+    PROCESSOR_NUMBER number;
+    GetCurrentProcessorNumberEx(&number);
+    const size_t index = size_t(number.Group) * 64 + number.Number;
+    return index < classes.fast_by_index.size() ? classes.fast_by_index[index] : -1;
+}
+
 void SetCurrentThreadPriority(ThreadPriority new_priority) {
     auto handle = GetCurrentThread();
     int windows_priority = 0;
@@ -131,6 +216,12 @@ bool AccurateSleep(const std::chrono::nanoseconds duration, std::chrono::nanosec
 }
 
 #else
+
+void PreferPerformanceCores() {}
+
+int CurrentCoreIsFast() {
+    return -1;
+}
 
 void SetCurrentThreadPriority(ThreadPriority new_priority) {
     pthread_t this_thread = pthread_self();

@@ -627,9 +627,19 @@ bool Rasterizer::PrepareBuffersAhead(const SelectedPipeline& selected, BufferPla
             return false; // Its read pages are checked again before each use (FIX-017).
         }
         const FlatView view{sel.flattened, sel.pgm_base};
+        // FIX-083: a buffer the draw writes is left to the recorder, and the stage waits until
+        // the recorder has recorded the draw. Obtained ahead, the write was registered while
+        // earlier draws were still to be recorded: those then read the range from the GPU copy
+        // without the CPU's newer bytes, and a CPU fault there wrote the GPU copy back over
+        // them (cockpit shadows flickered). -DisablePerf 105 plans written buffers again.
+        static const bool written_to_recorder = Common::PerfFeatureEnabled(105);
         for (const auto& desc : info->buffers) {
             if (desc.IsSpecial()) {
                 continue;
+            }
+            if (written_to_recorder && desc.is_written) {
+                ++plan_refusals[3];
+                return false;
             }
             if (!desc.sharp_fetch.FitsIn(sel.flattened.size())) {
                 ++plan_refusals[1];
@@ -789,11 +799,11 @@ const GraphicsPipeline* Rasterizer::AcquireGraphicsPipeline(const DrawIndirectPa
                         "PERF-067 buffer stage in 2.0 s: {} shader buffers obtained ahead and "
                         "used, {} obtained again here (an image appeared over them), {} plans "
                         "left for a different binding; plans stopped: watched shader {}, sharp "
-                        "{}, buffer {} (texel read {}, image {}, stream ring {}, arena {}, "
+                        "{}, written {}, buffer {} (texel read {}, image {}, stream ring {}, arena {}, "
                         "residency {}, staging {})",
                         plan_stats.used, plan_stats.redone, plan_stats.mismatched,
                         plan_refusals[0].exchange(0), plan_refusals[1].exchange(0),
-                        plan_refusals[2].exchange(0), buffer_cache.ahead_refusals[0].exchange(0),
+                        plan_refusals[3].exchange(0), plan_refusals[2].exchange(0), buffer_cache.ahead_refusals[0].exchange(0),
                         buffer_cache.ahead_refusals[1].exchange(0),
                         buffer_cache.ahead_refusals[2].exchange(0),
                         buffer_cache.ahead_refusals[3].exchange(0),

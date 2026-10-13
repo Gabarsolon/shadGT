@@ -413,6 +413,7 @@ extern "C" __declspec(dllexport) void RytyGpuMapMemory(u64 address, u64 size) {
 }
 
 void RytyProtectGuestRedZones(); // ryty_red_zone.cpp
+void RytyApplyGamePatches();     // ryty_game_patch.cpp (GTS-001)
 
 // Ryty loads this library before the game's code starts, so the game code can still be patched
 // safely here (FIX-074).
@@ -424,6 +425,7 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
             SetEnvironmentVariableW(L"VK_LOADER_LAYERS_DISABLE", L"~implicit~");
         }
         RytyProtectGuestRedZones();
+        RytyApplyGamePatches();
     }
     return TRUE;
 }

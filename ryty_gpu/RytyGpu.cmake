@@ -100,6 +100,7 @@ ryty_add_library(ryty_gpu libSceVideoOut
         ryty_gpu/ryty_fsr3.cpp
         # FIX-074: shadGT's static red-zone patching, applied to the converted game code.
         ryty_gpu/ryty_red_zone.cpp
+        ryty_gpu/ryty_game_patch.cpp
         src/core/cpu_patches.cpp
         src/core/loader/dwarf.cpp
 )

@@ -207,6 +207,23 @@ public:
         });
     }
 
+    /// PERF-087: calls func(page offset) for each hot page in the range that the next upload
+    /// of the range would check (CPU-modified, not yet uploaded in the current epoch).
+    void ForEachHotPageToCheck(u64 offset, u64 size, auto&& func) {
+        std::scoped_lock lk{mutex};
+        const bool same_epoch = uploaded_epoch == g_upload_epoch.load(std::memory_order_acquire);
+        auto& state = GetRegionBits<Type::CPU>();
+        IterateWords(GetBounds(offset, size), [&](u64 index, u64 mask) {
+            u64 bits = hot[index] & state[index] & mask;
+            if (same_epoch) {
+                bits &= ~uploaded[index];
+            }
+            for (; bits != 0; bits &= bits - 1) {
+                func((index * PAGES_PER_WORD + std::countr_zero(bits)) * BYTES_PER_PAGE);
+            }
+        });
+    }
+
     /// FIX-017: true when a page of the range is a PERF-012 hot page.
     bool IsRegionHot(u64 offset, u64 size) {
         std::scoped_lock lk{mutex};

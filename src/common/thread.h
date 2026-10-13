@@ -24,6 +24,14 @@ void SetCurrentThreadPriority(ThreadPriority new_priority);
 
 void SetCurrentThreadName(const char* name);
 
+/// PERF-088: on a CPU with fast and slow cores (Intel 12th gen and later), keeps the calling
+/// thread on the fast ones (SHADGT_FAST_CORES=0 turns it off). No effect on other CPUs.
+void PreferPerformanceCores();
+
+/// PERF-088: 1 when the calling thread runs on a fast core of such a CPU, 0 on a slow one,
+/// -1 when the CPU has only one kind.
+int CurrentCoreIsFast();
+
 void SetThreadName(void* thread, const char* name);
 
 bool AccurateSleep(std::chrono::nanoseconds duration, std::chrono::nanoseconds* remaining,

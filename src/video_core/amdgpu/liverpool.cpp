@@ -1080,8 +1080,12 @@ void Liverpool::ReportDrawPipe() {
     if (draw_pipe->HasStage()) {
         LOG_WARNING(Render,
                     "PERF-067 buffer stage in {:.1f} s: {} draws prepared ahead, {} waits for the "
-                    "recorder to catch up ({} at barrier jobs)",
-                    seconds, stats.stage_prepared, stats.stage_syncs, stats.stage_barriers);
+                    "recorder to catch up ({} at barrier jobs); DIAG-084 stage time: idle {} ms, "
+                    "preparing {} ms, held back by the lead limit {} ms, waiting after barriers "
+                    "{} ms",
+                    seconds, stats.stage_prepared, stats.stage_syncs, stats.stage_barriers,
+                    stats.stage_idle_us / 1000, stats.stage_prepare_us / 1000,
+                    stats.stage_lead_us / 1000, stats.stage_sync_us / 1000);
     }
     waits_moved = 0;
 }
@@ -1198,6 +1202,7 @@ void Liverpool::ProcessCommands() {
 
 void Liverpool::Process(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadGT:GpuCommandProcessor");
+    Common::PreferPerformanceCores(); // PERF-088
     Common::GuestClock::MarkGpuCommandThread(); // FIX-044
     Common::SamplingProfiler::RegisterCurrentThread("GpuCommandProcessor"); // DIAG-048
     gpu_id = std::this_thread::get_id();

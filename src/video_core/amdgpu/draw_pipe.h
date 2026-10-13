@@ -113,6 +113,11 @@ public:
         u64 stage_prepared; // PERF-067
         u64 stage_syncs;
         u64 stage_barriers;
+        // DIAG-084: where the stage's time went (us).
+        u64 stage_idle_us;     // waiting for jobs from the command thread
+        u64 stage_prepare_us;  // preparing buffers
+        u64 stage_lead_us;     // waiting because it was MaxLead jobs ahead
+        u64 stage_sync_us;     // waiting for the recorder after a barrier or refused plan
     };
     /// The counters since the previous call (resets them).
     Stats TakeStats();
@@ -136,6 +141,10 @@ private:
     std::atomic<u64> stage_syncs{};
     std::atomic<u64> stage_prepared{};
     std::atomic<u64> stage_barriers{};
+    std::atomic<u64> stage_idle_us{};
+    std::atomic<u64> stage_prepare_us{};
+    std::atomic<u64> stage_lead_us{};
+    std::atomic<u64> stage_sync_us{};
     static inline thread_local const char* push_tag = nullptr; // DIAG-069
     std::unordered_map<const char*, u64> barrier_tags;         // under stage_mutex
     std::chrono::steady_clock::time_point barrier_tags_since{};

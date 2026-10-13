@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
 #include <chrono>
 
 #include <immintrin.h>
@@ -137,14 +138,17 @@ void DrawPipe::WaitFinished(u64 jobs) {
 
 void DrawPipe::RunStage(std::stop_token stop) {
     Common::SetCurrentThreadName("shadGT:GpuBufferStage");
+    Common::PreferPerformanceCores(); // PERF-088
     // The stage keeps at most this many jobs ahead of the recorder: what it prepares is
     // committed to rings that are reused once the GPU passes the tick they were taken in.
     constexpr u64 MaxLead = 256;
     while (true) {
         StageJob job;
         {
+            const auto idle_start = std::chrono::steady_clock::now();
             std::unique_lock lk{stage_mutex};
             stage_cv.wait(lk, stop, [this] { return !stage_queue.empty(); });
+            stage_idle_us.fetch_add(MicrosecondsSince(idle_start), std::memory_order_relaxed);
             if (stage_queue.empty()) {
                 return; // stopped
             }
@@ -152,7 +156,9 @@ void DrawPipe::RunStage(std::stop_token stop) {
             stage_queue.pop_front();
         }
         if (forwarded > MaxLead) {
+            const auto lead_start = std::chrono::steady_clock::now();
             WaitFinished(forwarded - MaxLead);
+            stage_lead_us.fetch_add(MicrosecondsSince(lead_start), std::memory_order_relaxed);
         }
         bool sync = job.kind == JobKind::Barrier;
         if (sync) {
@@ -160,7 +166,9 @@ void DrawPipe::RunStage(std::stop_token stop) {
         }
         if (job.prepare) {
             Common::Nvtx::Scope nvtx{"buffer stage"}; // DIAG-056
+            const auto prepare_start = std::chrono::steady_clock::now();
             sync |= !job.prepare();
+            stage_prepare_us.fetch_add(MicrosecondsSince(prepare_start), std::memory_order_relaxed);
             stage_prepared.fetch_add(1, std::memory_order_relaxed);
         }
         Forward(std::move(job.run));
@@ -168,7 +176,9 @@ void DrawPipe::RunStage(std::stop_token stop) {
         if (sync) {
             // The jobs after this one see what it changes only once the recorder ran it.
             stage_syncs.fetch_add(1, std::memory_order_relaxed);
+            const auto sync_start = std::chrono::steady_clock::now();
             WaitFinished(forwarded);
+            stage_sync_us.fetch_add(MicrosecondsSince(sync_start), std::memory_order_relaxed);
         }
     }
 }
@@ -252,6 +262,10 @@ DrawPipe::Stats DrawPipe::TakeStats() {
     taken.stage_prepared = stage_prepared.exchange(0);
     taken.stage_syncs = stage_syncs.exchange(0);
     taken.stage_barriers = stage_barriers.exchange(0);
+    taken.stage_idle_us = stage_idle_us.exchange(0);
+    taken.stage_prepare_us = stage_prepare_us.exchange(0);
+    taken.stage_lead_us = stage_lead_us.exchange(0);
+    taken.stage_sync_us = stage_sync_us.exchange(0);
     stats = {};
     return taken;
 }
@@ -260,7 +274,11 @@ void DrawPipe::Run(std::stop_token stop) {
     if (thread_init) {
         thread_init();
     }
+    Common::PreferPerformanceCores(); // PERF-088
     recorder_id.store(std::this_thread::get_id(), std::memory_order_release);
+    // PERF-088: on which kind of core the recorder ran its jobs, every 10 s.
+    std::array<u64, 2> core_jobs{};
+    auto core_since = std::chrono::steady_clock::now();
 
     std::deque<Work> batch;
     while (true) {
@@ -295,6 +313,9 @@ void DrawPipe::Run(std::stop_token stop) {
             batch.pop_front();
             work();
             ++ran;
+            if (const int fast = Common::CurrentCoreIsFast(); fast >= 0) {
+                ++core_jobs[fast];
+            }
             const u64 done = finished_jobs.fetch_add(1) + 1;
             if (const u64 target = stage_wait_target.load();
                 target != 0 && done >= target) {
@@ -302,6 +323,13 @@ void DrawPipe::Run(std::stop_token stop) {
                 stage_wait_cv.notify_all();
             }
             RunUrgent();
+        }
+        if (const auto now = std::chrono::steady_clock::now();
+            now - core_since >= std::chrono::seconds{10} && core_jobs[0] + core_jobs[1] != 0) {
+            LOG_WARNING(Render, "PERF-088: recorder jobs in 10 s: {} on fast cores, {} on slow cores",
+                        core_jobs[1], core_jobs[0]);
+            core_jobs = {};
+            core_since = now;
         }
         std::scoped_lock lk{mutex};
         finished += ran;
