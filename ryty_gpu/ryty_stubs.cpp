@@ -1,6 +1,8 @@
 // Emulator-core pieces the renderer and window reference but that have no role when Ryty runs the
 // game: the emulator object, guest signal dispatch, CPU patching, game archives and the overlays.
 
+#include <cstdio>
+#include "core/libraries/kernel/kernel.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include <windows.h>
 #include <algorithm>
@@ -165,6 +167,17 @@ Common::NativeClock* GetClock() {
     return &clock;
 }
 } // namespace Dev
+
+// ryGT: for the on-screen keyboard dialog (its panel size depends on the firmware version).
+s32 PS4_SYSV_ABI sceKernelGetSystemSwVersion(SwVersionStruct* ret) {
+    if (ret != nullptr) {
+        constexpr u32 firmware = 0x09000000;
+        ret->hex_representation = firmware;
+        std::snprintf(ret->text_representation, 28, "%2x.%03x.%03x", firmware >> 0x18,
+                      firmware >> 0xc & 0xfff, firmware & 0xfff);
+    }
+    return 0;
+}
 
 } // namespace Libraries::Kernel
 

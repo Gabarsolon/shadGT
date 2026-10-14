@@ -75,7 +75,16 @@ ryty_add_library(ryty_gpu libSceVideoOut
     EXPORT_SOURCES
         core/libraries/gnmdriver/gnmdriver.cpp
         core/libraries/videoout/video_out.cpp
+        core/libraries/ime/ime_dialog.cpp
+        core/libraries/ime/ime.cpp
     SOURCES
+        # ryGT: shadGT's on-screen keyboard dialog (libSceImeDialog), drawn with ImGui.
+        src/core/libraries/ime/ime_dialog.cpp
+        src/core/libraries/ime/ime_dialog_ui.cpp
+        src/core/libraries/ime/ime.cpp
+        src/core/libraries/ime/ime_ui.cpp
+        src/core/libraries/ime/ime_kb_layout.cpp
+        src/core/libraries/ime/ime_ui_shared.cpp
         ${SHADER_RECOMPILER}
         ${VIDEO_CORE}
         ${GNM_LIB}

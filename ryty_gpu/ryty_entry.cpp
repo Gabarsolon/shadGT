@@ -21,6 +21,8 @@
 #include "core/emulator_settings.h"
 #include "core/user_settings.h"
 #include "core/libraries/gnmdriver/gnmdriver.h"
+#include "core/libraries/ime/ime.h"
+#include "core/libraries/ime/ime_dialog.h"
 #include "core/libraries/videoout/video_out.h"
 #include "core/memory.h"
 #include "core/signals.h"
@@ -387,6 +389,9 @@ void Ryty::RytyLibraryInitialize() {
     Core::Loader::SymbolsResolver resolver;
     Libraries::GnmDriver::RegisterLib(&resolver);
     Libraries::VideoOut::RegisterLib(&resolver);
+    // ryGT: shadGT's on-screen keyboard (inline keyboard and keyboard dialog).
+    Libraries::Ime::RegisterLib(&resolver);
+    Libraries::ImeDialog::RegisterLib(&resolver);
     BindExports();
     StartInputBridge();
     StartFirstDrawWatcher();

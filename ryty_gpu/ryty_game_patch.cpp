@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <cwctype>
 #include <iterator>
 #include <mutex>
 #include <string>
@@ -325,10 +326,26 @@ constexpr u64 kKeyValueLookup = 0xbae080;     // bool lookup(store, const char* 
 using KeyValueLookupFn = bool(PS4_SYSV_ABI*)(void*, const char*, s64*);
 KeyValueLookupFn g_key_value_lookup = nullptr;
 
+// GTS-004: every special paint (matte, chrome, colour-shift and maker colours, bought with mileage
+// points from the shut-down servers). The inventory (inventory.ad) asks KeyValue for
+// unlock_sp_paint_<id>; those answer 1. Off by default (Lance: the paints don't show on the car);
+// RYGT_PAINTS=1 turns it on.
+bool g_unlock_lewis = false;
+bool g_unlock_paints = false;
+
 bool PS4_SYSV_ABI KeyValueLookupHook(void* store, const char* key, s64* value) {
     const bool found = g_key_value_lookup(store, key, value);
-    if (key && (std::strcmp(key, "unlock_dlc_gm_LewisHamilton") == 0 ||
-                std::strcmp(key, "dlc_gm_validLewisHamilton") == 0)) {
+    if (key && g_unlock_lewis && (std::strcmp(key, "unlock_dlc_gm_LewisHamilton") == 0 ||
+                                  std::strcmp(key, "dlc_gm_validLewisHamilton") == 0)) {
+        *value = 1;
+        return true;
+    }
+    if (key && g_unlock_paints && std::strncmp(key, "unlock_sp_paint", 15) == 0) {
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            std::fprintf(stderr, "[patch] GTS-004 special paints unlocked (first key %s)\n", key);
+        }
         *value = 1;
         return true;
     }
@@ -365,7 +382,10 @@ bool RedirectCall(u8* base, u8* stub, u64 call_rva, u64 target_rva, void* hook, 
 
 void InstallLewisChallenge(u8* base) {
     const char* env = std::getenv("RYGT_LEWIS");
-    if (env && env[0] == '0') {
+    const char* paints = std::getenv("RYGT_PAINTS");
+    g_unlock_lewis = !(env && env[0] == '0');
+    g_unlock_paints = paints && paints[0] == '1'; // off: they unlock but don't show on the car
+    if (!g_unlock_lewis && !g_unlock_paints) {
         return;
     }
     u8* stub = AllocNear(base);
@@ -404,6 +424,90 @@ constexpr u64 kStreamRefillCalls[] = {0x17626ef, 0x170f88e, 0x1762a38};
 using FileReadFn = s64(PS4_SYSV_ABI*)(void*, GuestIoVec*);
 FileReadFn g_file_read = nullptr;
 
+// GTS-005: whole-script replacements. A file in <exe dir>\patches\scripts replaces the game script
+// whose symbol table starts the same way (its own path names, which a patched script keeps). It is served chunk by chunk as the game reads the original, so it may not be larger
+// than the original (adcpatch pads it with zeros to the original size).
+struct ScriptReplacement {
+    std::string name;
+    std::vector<u8> data;
+};
+std::vector<ScriptReplacement> g_script_replacements;
+std::mutex g_replacement_mutex;
+std::vector<std::pair<void*, std::pair<const ScriptReplacement*, size_t>>> g_active_replacements;
+
+// The bytes after the "ADCH012" header and the symbol count (which grows when a patch adds names):
+// the start of the symbol table, i.e. the script's own path names.
+const u8* ScriptKey(const u8* data, size_t size) {
+    if (size < 8 + 4 + 120 || std::memcmp(data, "ADCH012", 8) != 0) {
+        return nullptr;
+    }
+    size_t extra = 0;
+    for (u8 b = data[8]; b & 0x80; b <<= 1) {
+        ++extra;
+    }
+    return data + 8 + 1 + extra;
+}
+
+void ServeReplacement(void* file, u8* begin, s64 read) {
+    std::scoped_lock lock{g_replacement_mutex};
+    auto it = std::find_if(g_active_replacements.begin(), g_active_replacements.end(),
+                           [file](const auto& entry) { return entry.first == file; });
+    if (it == g_active_replacements.end()) {
+        const u8* key = ScriptKey(begin, static_cast<size_t>(read));
+        for (const auto& replacement : g_script_replacements) {
+            const u8* own = ScriptKey(replacement.data.data(), replacement.data.size());
+            if (key && own && std::memcmp(key, own, 120) == 0) {
+                g_active_replacements.push_back({file, {&replacement, 0}});
+                it = std::prev(g_active_replacements.end());
+                std::fprintf(stderr, "[patch] GTS-005 serving %s\n", replacement.name.c_str());
+                break;
+            }
+        }
+        if (it == g_active_replacements.end()) {
+            return;
+        }
+    }
+    auto& [replacement, offset] = it->second;
+    const size_t available = offset < replacement->data.size() ? replacement->data.size() - offset : 0;
+    const size_t count = std::min<size_t>(available, static_cast<size_t>(read));
+    std::memcpy(begin, replacement->data.data() + offset, count);
+    std::memset(begin + count, 0, static_cast<size_t>(read) - count);
+    offset += static_cast<size_t>(read);
+    if (offset >= replacement->data.size()) {
+        g_active_replacements.erase(it);
+    }
+}
+
+void LoadScriptReplacements() {
+    char exe[MAX_PATH] = {};
+    GetModuleFileNameA(nullptr, exe, MAX_PATH);
+    std::string dir{exe};
+    dir = dir.substr(0, dir.find_last_of("\\/") + 1) + "patches\\scripts\\";
+    WIN32_FIND_DATAA found{};
+    HANDLE find = FindFirstFileA((dir + "*.ADC").c_str(), &found);
+    if (find == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    do {
+        FILE* f = std::fopen((dir + found.cFileName).c_str(), "rb");
+        if (!f) {
+            continue;
+        }
+        ScriptReplacement replacement{found.cFileName, {}};
+        std::fseek(f, 0, SEEK_END);
+        replacement.data.resize(static_cast<size_t>(std::ftell(f)));
+        std::fseek(f, 0, SEEK_SET);
+        const size_t got = std::fread(replacement.data.data(), 1, replacement.data.size(), f);
+        std::fclose(f);
+        if (got == replacement.data.size() && got >= 128) {
+            std::fprintf(stderr, "[patch] GTS-005 script replacement %s (%zu bytes)\n",
+                         found.cFileName, got);
+            g_script_replacements.push_back(std::move(replacement));
+        }
+    } while (FindNextFileA(find, &found));
+    FindClose(find);
+}
+
 s64 PS4_SYSV_ABI StreamRefillHook(void* file, GuestIoVec* iov) {
     const s64 read = g_file_read(file, iov);
     if (read <= 0 || !iov || !iov->base) {
@@ -411,6 +515,18 @@ s64 PS4_SYSV_ABI StreamRefillHook(void* file, GuestIoVec* iov) {
     }
     u8* const begin = iov->base;
     u8* const end = begin + read;
+    if (!g_script_replacements.empty()) {
+        ServeReplacement(file, begin, read);
+    }
+    static const bool log_scripts = std::getenv("RYGT_LOG_SCRIPTS") != nullptr;
+    if (log_scripts) {
+        // DIAG-107: the start of each script chunk read (first 48 printable bytes).
+        std::string text;
+        for (s64 i = 0; i < std::min<s64>(read, 160) && text.size() < 120; ++i) {
+            text += (begin[i] >= 32 && begin[i] < 127) ? static_cast<char>(begin[i]) : '.';
+        }
+        std::fprintf(stderr, "[scripts] file %p read %lld: %s\n", file, static_cast<long long>(read), text.c_str());
+    }
     for (const auto& patch : g_script_patches) {
         u8* found = std::search(begin, end, patch.original.begin(), patch.original.end());
         if (found != end) {
@@ -433,7 +549,10 @@ void InstallScriptPatches(u8* base) {
                       "0000407001000094020000260300000076777800000000940200001d8142940200000601000000"),
              25, ParseHex("811302000000")});
     }
-    if (g_script_patches.empty()) {
+    if (!(std::getenv("RYGT_SCRIPTS") && std::getenv("RYGT_SCRIPTS")[0] == '0')) {
+        LoadScriptReplacements();
+    }
+    if (g_script_patches.empty() && g_script_replacements.empty()) {
         return;
     }
     u8* stubs = AllocNear(base);
@@ -509,10 +628,104 @@ void InstallMiscHooks(u8* base) {
 
 } // namespace
 
+// DIAG-106: the game's text-entry routine (eboot 0xf34700, this, pad slot) opens the keyboard
+// dialog or the inline keyboard. It refuses when the slot is above 3, a keyboard is already open
+// ([this+0xf4]) or the slot's user id (pad table 0x31a6bc0, 0x550 bytes per slot, +0x40) is -1.
+// Its two calls are logged with those values and the result.
+constexpr u64 kOpenTextEntry = 0xf34700;
+constexpr u64 kOpenTextEntryCalls[] = {0xe8be5e, 0xfbff0d};
+constexpr u64 kPadTable = 0x31a6bc0;
+using OpenTextEntryFn = s32(PS4_SYSV_ABI*)(u8*, s32);
+OpenTextEntryFn g_open_text_entry = nullptr;
+u8* g_game_base = nullptr;
+
+s32 PS4_SYSV_ABI OpenTextEntryHook(u8* self, s32 slot) {
+    const u8* table = g_game_base + kPadTable + kTextRvaShift;
+    s32 users[4];
+    for (int i = 0; i < 4; ++i) {
+        std::memcpy(&users[i], table + i * 0x550 + 0x40, 4);
+    }
+    s32 open_state = 0;
+    std::memcpy(&open_state, self + 0xf4, 4);
+    const s32 result = g_open_text_entry(self, slot);
+    std::fprintf(stderr,
+                 "[ime] text entry: slot %d, users %d %d %d %d, open state %d, dialog mode %d -> %d\n",
+                 slot, users[0], users[1], users[2], users[3], open_state, self[0x108], result);
+    return result;
+}
+
+void InstallTextEntryDiag(u8* base) {
+    g_game_base = base;
+    u8* stubs = AllocNear(base);
+    if (!stubs) {
+        return;
+    }
+    g_open_text_entry = reinterpret_cast<OpenTextEntryFn>(base + kOpenTextEntry + kTextRvaShift);
+    for (size_t i = 0; i < std::size(kOpenTextEntryCalls); ++i) {
+        RedirectCall(base, stubs + i * 16, kOpenTextEntryCalls[i], kOpenTextEntry,
+                     reinterpret_cast<void*>(&OpenTextEntryHook), "DIAG-106 text entry");
+    }
+}
+
+// GTS-006: custom decals offline. <exe dir>\decals\*.svg are copied to /APP_CACHE/decals (the
+// game's <exe dir>\temp0\decals) as "<id>_<name>.svg"; the patched GRIM script lists them as the
+// user's decals and copies each into the decal cache under that id. The id is a hash of the file
+// name, so a decal keeps its id (and liveries that use it keep working) across runs.
+void SyncDecals() {
+    wchar_t exe[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    std::wstring dir{exe};
+    dir = dir.substr(0, dir.find_last_of(L"\\/") + 1);
+    const std::wstring src = dir + L"decals\\";
+    const std::wstring dst = dir + L"temp0\\decals\\";
+    CreateDirectoryW(src.c_str(), nullptr);
+    CreateDirectoryW((dir + L"temp0").c_str(), nullptr);
+    CreateDirectoryW(dst.c_str(), nullptr);
+    WIN32_FIND_DATAW found{};
+    HANDLE find = FindFirstFileW((dst + L"*.svg").c_str(), &found);
+    if (find != INVALID_HANDLE_VALUE) {
+        do {
+            DeleteFileW((dst + found.cFileName).c_str());
+        } while (FindNextFileW(find, &found));
+        FindClose(find);
+    }
+    find = FindFirstFileW((src + L"*.svg").c_str(), &found);
+    if (find == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    int count = 0;
+    do {
+        if (found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            continue;
+        }
+        const std::wstring file{found.cFileName};
+        u32 hash = 2166136261u;
+        std::string title;
+        for (wchar_t c : file.substr(0, file.size() - 4)) {
+            const wchar_t lower = towlower(c);
+            hash = (hash ^ static_cast<u32>(lower)) * 16777619u;
+            title += (c < 128 && (iswalnum(c) || c == L' ' || c == L'-' || c == L'_'))
+                         ? static_cast<char>(c) : '_';
+        }
+        const u32 id = 2000000000u + hash % 100000000u;
+        const std::string name = std::to_string(id) + "_" + title + ".svg";
+        if (CopyFileW((src + file).c_str(), (dst + std::wstring(name.begin(), name.end())).c_str(),
+                      FALSE)) {
+            ++count;
+        }
+    } while (FindNextFileW(find, &found));
+    FindClose(find);
+    std::fprintf(stderr, "[patch] GTS-006 %d custom decal(s) from decals\\\n", count);
+}
+
 void RytyApplyGamePatches() {
     InstallMiscHooks(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallLewisChallenge(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallScriptPatches(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
+    InstallTextEntryDiag(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
+    if (!(std::getenv("RYGT_DECALS") && std::getenv("RYGT_DECALS")[0] == '0')) {
+        SyncDecals();
+    }
     auto* base = reinterpret_cast<u8*>(GetModuleHandleA(nullptr));
     char buffer[4096];
     const DWORD length = GetEnvironmentVariableA("RYGT_PATCH", buffer, sizeof(buffer));
