@@ -313,6 +313,71 @@ u8* AllocNear(u8* base) {
     return nullptr;
 }
 
+// GTS-002: the Lewis Hamilton Time Trial Challenge. v1.69 is Polyphony's end-of-service build: its
+// main menu (gtmode.ad, setupDisplay) shows the mode only when the player's inventory says the free
+// add-on was downloaded, i.e. when the KeyValue ints unlock_dlc_gm_LewisHamilton and
+// dlc_gm_validLewisHamilton are 1. The servers that set them are gone, but all ten events, Lewis's
+// ghosts and voice-overs are in the game's files. The KeyValue lookup that MKeyValue::getInt calls
+// answers 1 for those two keys; every other key is untouched. RYGT_LEWIS=0 turns this off.
+constexpr u64 kKeyValueGetIntCall = 0x212204; // call of the lookup inside MKeyValue::getInt
+constexpr u64 kKeyValueLookup = 0xbae080;     // bool lookup(store, const char* key, s64* value)
+
+using KeyValueLookupFn = bool(PS4_SYSV_ABI*)(void*, const char*, s64*);
+KeyValueLookupFn g_key_value_lookup = nullptr;
+
+bool PS4_SYSV_ABI KeyValueLookupHook(void* store, const char* key, s64* value) {
+    const bool found = g_key_value_lookup(store, key, value);
+    if (key && (std::strcmp(key, "unlock_dlc_gm_LewisHamilton") == 0 ||
+                std::strcmp(key, "dlc_gm_validLewisHamilton") == 0)) {
+        *value = 1;
+        return true;
+    }
+    return found;
+}
+
+// Points the rel32 call at `call_rva` (which must call `target_rva`) at `hook` through a stub.
+bool RedirectCall(u8* base, u8* stub, u64 call_rva, u64 target_rva, void* hook, const char* name) {
+    u8* call = base + call_rva + kTextRvaShift;
+    s32 rel = 0;
+    std::memcpy(&rel, call + 1, 4);
+    if (call[0] != 0xe8 || call + 5 + rel != base + target_rva + kTextRvaShift) {
+        std::fprintf(stderr, "[patch] %s: call at %#llx differs, not applied\n", name,
+                     static_cast<unsigned long long>(call_rva));
+        return false;
+    }
+    const u8 jump[6] = {0xff, 0x25, 0, 0, 0, 0}; // jmp qword ptr [rip]
+    std::memcpy(stub, jump, 6);
+    std::memcpy(stub + 6, &hook, 8);
+    FlushInstructionCache(GetCurrentProcess(), stub, 16);
+    const s32 new_rel = static_cast<s32>(stub - (call + 5));
+    DWORD old_protect = 0;
+    if (!VirtualProtect(call, 5, PAGE_EXECUTE_READWRITE, &old_protect)) {
+        return false;
+    }
+    std::memcpy(call + 1, &new_rel, 4);
+    DWORD ignored = 0;
+    VirtualProtect(call, 5, old_protect, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), call, 5);
+    std::fprintf(stderr, "[patch] %s applied at %#llx\n", name,
+                 static_cast<unsigned long long>(call_rva));
+    return true;
+}
+
+void InstallLewisChallenge(u8* base) {
+    const char* env = std::getenv("RYGT_LEWIS");
+    if (env && env[0] == '0') {
+        return;
+    }
+    u8* stub = AllocNear(base);
+    if (!stub) {
+        std::fprintf(stderr, "[patch] GTS-002: no memory near the game's code for the hook\n");
+        return;
+    }
+    g_key_value_lookup = reinterpret_cast<KeyValueLookupFn>(base + kKeyValueLookup + kTextRvaShift);
+    RedirectCall(base, stub, kKeyValueGetIntCall, kKeyValueLookup,
+                 reinterpret_cast<void*>(&KeyValueLookupHook), "GTS-002 Lewis Hamilton Challenge");
+}
+
 void InstallMiscHooks(u8* base) {
     const char* diag = std::getenv("RYGT_ENV_DIAG");
     const char* scale = std::getenv("RYGT_ENV_SCALE");
@@ -376,6 +441,7 @@ void InstallMiscHooks(u8* base) {
 
 void RytyApplyGamePatches() {
     InstallMiscHooks(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
+    InstallLewisChallenge(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     auto* base = reinterpret_cast<u8*>(GetModuleHandleA(nullptr));
     char buffer[4096];
     const DWORD length = GetEnvironmentVariableA("RYGT_PATCH", buffer, sizeof(buffer));
