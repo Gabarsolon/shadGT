@@ -107,6 +107,11 @@ bool IsPaused();
 /// Marks the calling thread as the GPU command thread, whose compile waits hold the clocks.
 void MarkGpuCommandThread();
 
+/// PERF-102: holds the guest clocks from any thread until ReleaseHold (the shader precompile
+/// on the splash screen). No-op when FIX-044 is off.
+void TakeHold();
+void ReleaseHold();
+
 /// Holds the guest clocks for its lifetime when created on the GPU command thread.
 class CompilePause {
 public:

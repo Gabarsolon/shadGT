@@ -63,6 +63,16 @@ struct DrawIndirectParams {
     bool tessellate_quads{};
 };
 
+/// PERF-098: progress of building the stored pipelines (the precompile shown over the splash).
+struct PrecompileProgress {
+    u64 total;   ///< stored pipelines found
+    u64 done;    ///< built, already present or unusable
+    bool active; ///< still going
+};
+PrecompileProgress GetPrecompileProgress();
+/// PERF-102: the game waits on the splash screen for the precompile.
+bool PrecompileHoldsGame();
+
 class PipelineCache {
 public:
     explicit PipelineCache(const Instance& instance, Scheduler& scheduler,
@@ -100,6 +110,11 @@ public:
         return profile;
     }
 
+    /// PERF-098: on the command thread while it has no commands: takes prepared stored
+    /// pipelines and queues their builds (all of them as fast as the workers go while the
+    /// splash screen shows).
+    void IdlePrewarm(bool splash);
+
 private:
     bool RefreshGraphicsKey();
     /// Registers the pipeline keys are built from: the current ones, or during read-ahead the
@@ -129,7 +144,7 @@ private:
     void QueueBackgroundBuild(const std::shared_ptr<PipelineBuild>& build);
     /// PERF-038: on this thread, between draws: takes stored pipelines the reader thread
     /// prepared and queues their background builds.
-    void InstallPrewarmed();
+    void InstallPrewarmed(bool force = false);
     struct PrewarmRecord;
     bool InstallPrewarmRecord(PrewarmRecord& record);
     void PrewarmRead(std::stop_token stop);

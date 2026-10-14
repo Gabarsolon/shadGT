@@ -67,4 +67,8 @@ private:
     bool failed{};
 };
 
+/// vkGetDeviceProcAddr for AMD's backend: extension names fall back to core functions, debug
+/// labels do nothing (also used by frame generation).
+PFN_vkGetDeviceProcAddr DeviceProcAddrShim();
+
 } // namespace Vulkan::RytyFsr3

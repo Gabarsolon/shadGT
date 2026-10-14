@@ -78,6 +78,7 @@ public:
 private:
     void Run(std::stop_token stop, u32 index) {
         Common::SetCurrentThreadName(fmt::format("shadGT:ShaderTranslate{}", index).c_str());
+        Common::PreferEfficiencyCores(); // PERF-097
         Shader::Pools pools;
         while (!stop.stop_requested()) {
             std::shared_ptr<TranslateJob> job;
@@ -145,12 +146,40 @@ static bool SaneTessConstants(const Shader::Info& hull, const AmdGpu::Liverpool*
 void RytyWatchWrites(std::uint64_t address, std::uint32_t ms, std::string label); // DIAG-067
 #endif
 
+// PERF-098: precompile progress.
+static std::atomic<u64> g_precompile_total{};
+static std::atomic<u64> g_precompile_done{};
+static std::atomic<bool> g_precompile_reading{};
+
+// PERF-102: while the precompile runs at start, the game waits on the splash screen (its clocks
+// held, so it sees no time pass), as if the splash screen were frozen until it is done.
+static std::atomic<bool> g_precompile_hold{};
+
+bool PrecompileHoldsGame() {
+    return g_precompile_hold.load(std::memory_order_relaxed);
+}
+
+static void ReleasePrecompileHold() {
+    if (g_precompile_hold.exchange(false)) {
+        Common::GuestClock::ReleaseHold();
+        LOG_WARNING(Render_Vulkan, "PERF-102: precompile done; the game continues");
+    }
+}
+
+PrecompileProgress GetPrecompileProgress() {
+    const u64 total = g_precompile_total.load(std::memory_order_relaxed);
+    const u64 done = std::min(total, g_precompile_done.load(std::memory_order_relaxed));
+    return {total, done, total != 0 && done < total};
+}
+
 // PERF-019: worker threads that build graphics pipelines ahead of the draws that need them.
 // PERF-038: stored pipelines are built in the background on a few of them, at low priority.
 class PipelineCache::PipelineBuildWorkers {
 public:
-    PipelineBuildWorkers() : queue{std::max(1u, NumWorkers() / 4)} {
-        for (u32 i = 0; i < NumWorkers(); ++i) {
+    PipelineBuildWorkers() : queue{std::max(1u, NumWorkers() / 4), AllCores()} {
+        // PERF-102: a worker for every core, the ones past NumWorkers() only for the precompile
+        // on the splash screen (the queue's boost).
+        for (u32 i = 0; i < AllCores(); ++i) {
             threads.emplace_back([this](std::stop_token stop) { Work(stop); });
         }
     }
@@ -170,11 +199,21 @@ public:
     void PauseBackground(BuildQueue::Clock::time_point until) {
         queue.PauseBackground(until);
     }
+    void SetBoost(bool on) {
+        queue.SetBoost(on);
+    }
     size_t BackgroundQueued() {
         return queue.BackgroundQueued();
     }
+    bool ForegroundIdle() {
+        return queue.ForegroundIdle();
+    }
 
 private:
+    static u32 AllCores() {
+        return std::max(std::thread::hardware_concurrency(), NumWorkers());
+    }
+
     static u32 NumWorkers() {
         const u32 cores = std::max(std::thread::hardware_concurrency(), 4u);
         // PERF-021: all but two cores (the command thread and the game's own main thread).
@@ -183,21 +222,37 @@ private:
 
     void Work(std::stop_token stop) {
         Common::SetCurrentThreadName("shadGT:PipelineBuild");
+        // PERF-097: driver compiles stay off the cores the game and the recorder run on.
+        Common::PreferEfficiencyCores();
         bool low_priority = false;
+        bool all_cores = false;
         while (true) {
             BuildQueue::Job job;
             bool background = false;
             if (!queue.Pop(job, background, stop)) {
                 return;
             }
-            if (background != low_priority) {
-                low_priority = background;
+            // PERF-102: while the game waits on the splash screen for the precompile, every core
+            // builds (and at normal priority); afterwards only the efficiency cores.
+            const bool boosted = queue.Boosted();
+            if (boosted != all_cores) {
+                all_cores = boosted;
+                if (all_cores) {
+                    Common::AllowAllCores();
+                } else {
+                    Common::PreferEfficiencyCores();
+                }
+            }
+            if ((background && !boosted) != low_priority) {
+                low_priority = background && !boosted;
                 Common::SetCurrentThreadPriority(low_priority ? Common::ThreadPriority::Low
                                                               : Common::ThreadPriority::Normal);
             }
             job();
             if (background) {
                 queue.FinishedBackground();
+            } else {
+                queue.FinishedForeground();
             }
         }
     }
@@ -561,7 +616,9 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
             // turns it on unless SHADGT_PREWARM=0, so GTSport.exe runs without a launcher.
             const char* prewarm = std::getenv("SHADGT_PREWARM");
 #ifdef RYTY_GPU
-            const bool prewarm_on = !prewarm || prewarm[0] != '0';
+            // PERF-098: GPU.precompile_shaders (on by default) unless the variable says otherwise.
+            const bool prewarm_on =
+                prewarm ? prewarm[0] != '0' : EmulatorSettings.IsPrecompileShaders();
 #else
             const bool prewarm_on = prewarm && prewarm[0] == '1';
 #endif
@@ -826,6 +883,7 @@ void PipelineCache::QueueBackgroundBuild(const std::shared_ptr<PipelineBuild>& b
             FinishBuild(*build);
             ++prewarm_built;
         }
+        ++g_precompile_done; // PERF-098
     });
 }
 
@@ -1015,6 +1073,20 @@ void PipelineCache::WaitForBuild(PipelineBuild& build, const DrawIndirectParams 
     while (build.started.load() && build.done.wait_for(500us) != std::future_status::ready) {
         BuildQueuedStates(params, true);
     }
+#ifdef RYTY_GPU
+    // PERF-101: GPU.compile_batch_ms (launcher "Shader compile batching"): with the game paused
+    // for a compile anyway, the builds of the upcoming draws the command thread read ahead are
+    // finished in the same pause, up to that long, so later draws pause less often.
+    static const u32 batch_ms = static_cast<u32>(std::max(0, EmulatorSettings.GetCompileBatchMs()));
+    if (batch_ms != 0 && !AsyncPipelines() && build_workers) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{batch_ms};
+        BuildQueuedStates(params, true);
+        while (!build_workers->ForegroundIdle() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(500us);
+            BuildQueuedStates(params, true);
+        }
+    }
+#endif
 }
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params) {
@@ -1872,6 +1944,13 @@ struct PipelineCache::PrewarmRecord {
 void PipelineCache::PrewarmRead(std::stop_token stop) {
     Common::SetCurrentThreadName("shadGT:PrewarmRead");
     Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+#ifdef RYTY_GPU
+    // PERF-102: the game waits on the splash screen until the precompile is done.
+    if (!g_precompile_hold.exchange(true)) {
+        Common::GuestClock::TakeHold();
+        LOG_WARNING(Render_Vulkan, "PERF-102: the game waits on the splash screen for the precompile");
+    }
+#endif
     auto& store = Storage::DataBase::Instance();
     // The profile file is written only when missing (by the removed precompile), so it can be
     // older than most entries: GT Sport's is from October 6, the store's entries from October 6
@@ -1904,6 +1983,8 @@ void PipelineCache::PrewarmRead(std::stop_token stop) {
         keys.resize(std::min<size_t>(keys.size(), std::strtoull(limit, nullptr, 10)));
     }
     prewarm_total = keys.size();
+    g_precompile_total = keys.size(); // PERF-098
+    g_precompile_done = 0;
     LOG_WARNING(Render_Vulkan, "PERF-038: building {} stored pipelines in the background",
                 keys.size());
     std::unordered_set<u64> listed;
@@ -1955,6 +2036,7 @@ void PipelineCache::PrewarmRead(std::stop_token stop) {
         }
         if (!valid) {
             ++skipped;
+            ++g_precompile_done; // PERF-098
             continue;
         }
         std::unique_lock lk{prewarm_mutex};
@@ -1970,17 +2052,44 @@ void PipelineCache::PrewarmRead(std::stop_token stop) {
                 "missing stages or files)",
                 keys.size(), skipped);
     prewarm_reader_done = true;
+    if (keys.empty()) {
+        ReleasePrecompileHold(); // nothing stored yet (first start)
+    }
 }
 
-void PipelineCache::InstallPrewarmed() {
+void PipelineCache::IdlePrewarm(bool splash) {
+    if (!prewarm_enabled) {
+        ReleasePrecompileHold();
+        return;
+    }
+    // PERF-102: released once every stored pipeline is built (or after 15 minutes at most).
+    static const auto first_call = std::chrono::steady_clock::now();
+    if (PrecompileHoldsGame() &&
+        ((prewarm_reader_done && !GetPrecompileProgress().active) ||
+         std::chrono::steady_clock::now() - first_call > std::chrono::minutes{15})) {
+        ReleasePrecompileHold();
+    }
+    if (build_workers) {
+        build_workers->SetBoost(splash);
+    } else if (splash) {
+        build_workers = std::make_unique<PipelineBuildWorkers>();
+        build_workers->SetBoost(true);
+    }
+    std::scoped_lock lk{lookup_mutex};
+    InstallPrewarmed(splash);
+}
+
+void PipelineCache::InstallPrewarmed(bool force) {
     if (!prewarm_enabled) {
         return;
     }
     using namespace std::chrono_literals;
     const auto start = std::chrono::steady_clock::now();
     ReportPrewarm(start);
-    // Not while new pipelines are being needed: the draws come first.
-    if (prewarm_queued.load(std::memory_order_relaxed) == 0 || start - last_pipeline_miss < 2s) {
+    // Not while new pipelines are being needed: the draws come first (PERF-098: unless forced,
+    // while the splash screen shows).
+    if (prewarm_queued.load(std::memory_order_relaxed) == 0 ||
+        (!force && start - last_pipeline_miss < 2s)) {
         return;
     }
     // The members a key is computed in are restored, so the draw sees what it would have.
@@ -1989,7 +2098,7 @@ void PipelineCache::InstallPrewarmed() {
     const auto saved_modules = modules;
     const auto saved_runtime_infos = runtime_infos;
     auto* const saved_fetch = fetch_shader;
-    const auto budget = start + 300us;
+    const auto budget = start + (force ? 20000us : 300us);
     do {
         std::unique_ptr<PrewarmRecord> record;
         {
@@ -2006,6 +2115,7 @@ void PipelineCache::InstallPrewarmed() {
             ++prewarm_stats.installed;
         } else {
             ++prewarm_stats.skipped;
+            ++g_precompile_done; // PERF-098
         }
     } while (std::chrono::steady_clock::now() < budget);
     graphics_key = saved_key;
@@ -2122,7 +2232,9 @@ bool PipelineCache::AsyncPipelines() {
     static const bool enabled = [] {
         const char* env = std::getenv("SHADGT_ASYNC_PIPELINES");
 #ifdef RYTY_GPU
-        const bool by_default = true;
+        // PERF-100: GPU.compile_freeze (on by default) pauses the game while a new pipeline
+        // compiles instead of skipping its draws.
+        const bool by_default = !EmulatorSettings.IsCompileFreeze();
 #else
         const bool by_default = false;
 #endif

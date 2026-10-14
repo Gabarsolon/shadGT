@@ -1,6 +1,7 @@
 // Emulator-core pieces the renderer and window reference but that have no role when Ryty runs the
 // game: the emulator object, guest signal dispatch, CPU patching, game archives and the overlays.
 
+#include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include <windows.h>
 #include <algorithm>
 #include <atomic>
@@ -176,8 +177,10 @@ static std::atomic<bool> g_splash_hidden{false};
 static std::atomic<bool> g_game_drew{false};
 
 bool IsSplashVisible() {
-    return EmulatorSettings.IsShowSplash() && !(g_splash_hidden.load(std::memory_order_relaxed) &&
-                                                g_game_drew.load(std::memory_order_relaxed));
+    // PERF-102: also while the shader precompile holds the game.
+    return Vulkan::PrecompileHoldsGame() ||
+           (EmulatorSettings.IsShowSplash() && !(g_splash_hidden.load(std::memory_order_relaxed) &&
+                                                 g_game_drew.load(std::memory_order_relaxed)));
 }
 
 void NoteGameDrew() {

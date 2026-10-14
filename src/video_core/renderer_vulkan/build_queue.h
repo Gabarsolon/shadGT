@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
@@ -25,7 +27,20 @@ public:
     using Clock = std::chrono::steady_clock;
     enum class Kind { Urgent, Normal, Background };
 
-    explicit BuildQueue(u32 max_background_) : max_background{max_background_} {}
+    explicit BuildQueue(u32 max_background_, u32 max_boost_ = 0)
+        : max_background{max_background_}, max_boost{std::max(max_background_, max_boost_)} {}
+
+    /// PERF-098: while the splash screen shows, background jobs run on every worker and are
+    /// never paused (no game draw waits for a pipeline yet).
+    bool Boosted() const {
+        return boost.load(std::memory_order_relaxed);
+    }
+
+    void SetBoost(bool on) {
+        if (boost.exchange(on) != on) {
+            cv.notify_all();
+        }
+    }
 
     void Push(Job&& job, Kind kind) {
         {
@@ -57,11 +72,14 @@ public:
                 job = std::move(jobs.front());
                 jobs.pop_front();
                 is_background = false;
+                ++running_foreground;
                 return true;
             }
             const auto now = Clock::now();
-            const bool paused = now < pause_until;
-            if (!background.empty() && !paused && running_background < max_background) {
+            const bool boosted = boost.load(std::memory_order_relaxed);
+            const bool paused = !boosted && now < pause_until;
+            const u32 limit = boosted ? max_boost : max_background;
+            if (!background.empty() && !paused && running_background < limit) {
                 job = std::move(background.front());
                 background.pop_front();
                 ++running_background;
@@ -74,11 +92,23 @@ public:
                 });
             } else {
                 cv.wait(lk, stop, [&] {
-                    return !jobs.empty() ||
-                           (!background.empty() && running_background < max_background);
+                    const u32 limit = boost.load(std::memory_order_relaxed) ? max_boost
+                                                                            : max_background;
+                    return !jobs.empty() || (!background.empty() && running_background < limit);
                 });
             }
         }
+    }
+
+    void FinishedForeground() {
+        std::scoped_lock lk{mutex};
+        --running_foreground;
+    }
+
+    /// PERF-101: no draw or read-ahead build is queued or running.
+    bool ForegroundIdle() {
+        std::scoped_lock lk{mutex};
+        return jobs.empty() && running_foreground == 0;
     }
 
     void FinishedBackground() {
@@ -107,11 +137,14 @@ public:
 
 private:
     const u32 max_background;
+    const u32 max_boost;
+    std::atomic<bool> boost{false};
     std::mutex mutex;
     std::condition_variable_any cv;
     std::deque<Job> jobs;
     std::deque<Job> background;
     u32 running_background{};
+    u32 running_foreground{};
     Clock::time_point pause_until{};
 };
 

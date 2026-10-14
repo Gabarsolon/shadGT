@@ -39,6 +39,7 @@
 #include "video_core/buffer_cache/region_definitions.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "core/libraries/system/systemservice.h"
 #include "ryty_gpu/ryty_diag.h"
 
 namespace AmdGpu {
@@ -110,6 +111,33 @@ static void WriteDeferredFence(void* address, const void* data, u32 num_bytes) {
     }
 }
 
+// PERF-095 (opt-in, SHADGT_LAZY_ASC_EPOCH=1): a compute-queue submission or wait only bumps the
+// upload epoch once a compute queue records something that reads memory (a dispatch or a DMA).
+// On a PS4 Pro, 3 of the 9 compute submissions per race frame only fence, flush caches or chain
+// empty IB links. In the October 13 race A/B it halved the epochs (8 -> 4 per frame) without a
+// measurable gain (run-to-run noise ~10%), so it stays off.
+static bool LazyAscEpochEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("SHADGT_LAZY_ASC_EPOCH");
+        return env != nullptr && env[0] == '1';
+    }();
+    return enabled;
+}
+static std::atomic<bool> g_asc_epoch_pending{false};
+static void NoteAscEpoch() {
+    if (LazyAscEpochEnabled()) {
+        g_asc_epoch_pending.store(true, std::memory_order_release);
+    } else {
+        VideoCore::BumpUploadEpoch();
+    }
+}
+static void BumpPendingAscEpoch() {
+    if (g_asc_epoch_pending.load(std::memory_order_acquire) &&
+        g_asc_epoch_pending.exchange(false, std::memory_order_acq_rel)) {
+        VideoCore::BumpUploadEpoch();
+    }
+}
+
 // PERF-DIAG-009: how long each queue's command processing is blocked in wait packets, and on
 // which addresses, reported every 2 s. Only the command processor thread updates it.
 enum class FrontendWait : u32 {
@@ -125,7 +153,12 @@ enum class FrontendWait : u32 {
 static void RecordFrontendWait(FrontendWait kind, uintptr_t address,
                                std::chrono::steady_clock::time_point start) {
     // PERF-012: whoever the queue waited for may have written memory later draws read.
-    VideoCore::BumpUploadEpoch();
+    // PERF-095: for a compute queue, only once it records a memory read.
+    if (kind >= FrontendWait::AscWaitRegMem) {
+        NoteAscEpoch();
+    } else {
+        VideoCore::BumpUploadEpoch();
+    }
     static constexpr std::array<const char*, size_t(FrontendWait::Count)> Names = {
         "gfx WAIT_REG_MEM", "gfx VO label",      "gfx MEM_SEMAPHORE", "gfx REWIND",
         "asc WAIT_REG_MEM", "asc MEM_SEMAPHORE", "asc REWIND"};
@@ -1216,8 +1249,21 @@ void Liverpool::Process(std::stop_token stoken) {
         }
         {
             std::unique_lock lk{submit_mutex};
-            Common::CondvarWait(submit_cv, lk, stoken,
-                                [this] { return num_commands || num_tasks || submit_done; });
+            const auto has_work = [this] { return num_commands || num_tasks || submit_done; };
+            // PERF-098: while the splash screen shows, or stored pipelines remain, the idle
+            // command thread queues stored pipeline builds every few milliseconds.
+            while (!has_work() && !stoken.stop_requested() && rasterizer &&
+                   (Libraries::SystemService::IsSplashVisible() ||
+                    Vulkan::GetPrecompileProgress().active)) {
+                if (submit_cv.wait_for(lk, stoken, std::chrono::milliseconds{5}, has_work)) {
+                    break;
+                }
+                lk.unlock();
+                rasterizer->GetPipelineCache().IdlePrewarm(
+                    Libraries::SystemService::IsSplashVisible());
+                lk.lock();
+            }
+            Common::CondvarWait(submit_cv, lk, stoken, has_work);
         }
         if (stoken.stop_requested()) {
             break;
@@ -2834,6 +2880,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (SkipRegisterSpaceDmaData(dma_data, "compute")) {
                 break;
             }
+            BumpPendingAscEpoch(); // PERF-095: this queue now reads memory
             // PERF-031: copies run on the recorder thread in order with the dispatches around them.
             if (dma_data->src_sel == DmaDataSrc::Data && dma_data->dst_sel == DmaDataDst::Gds) {
                 RecordDma(
@@ -2929,6 +2976,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
         case PM4ItOpcode::DispatchDirect: {
             const auto* dispatch_direct = reinterpret_cast<const PM4CmdDispatchDirect*>(header);
+            BumpPendingAscEpoch(); // PERF-095: this queue now reads memory
             if (auto it = std::ranges::find(indirect_patches, header, &IndirectPatch::header);
                 it != indirect_patches.end()) {
                 const auto size = sizeof(PM4CmdDispatchIndirect::GroupDimensions);
@@ -2962,6 +3010,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         case PM4ItOpcode::DispatchIndirect: {
             const auto* dispatch_indirect =
                 reinterpret_cast<const PM4CmdDispatchIndirectMec*>(header);
+            BumpPendingAscEpoch(); // PERF-095: this queue now reads memory
             auto& cs_program = GetCsRegs();
             const auto ib_address = dispatch_indirect->Address<VAddr>();
             const auto size = sizeof(PM4CmdDispatchIndirect::GroupDimensions);
@@ -3565,7 +3614,7 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     auto& queue = mapped_queues[gnm_vqid];
 
     const auto vqid = gnm_vqid - 1;
-    VideoCore::BumpUploadEpoch();
+    NoteAscEpoch(); // PERF-095
     const auto& task = ProcessCompute(acb, vqid);
     {
         std::scoped_lock lock{queue.m_access};

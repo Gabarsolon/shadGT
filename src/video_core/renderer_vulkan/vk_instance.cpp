@@ -9,6 +9,7 @@
 #include "common/debug.h"
 #include "common/perf_monitor.h"
 #include "common/types.h"
+#include "core/emulator_settings.h"
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -397,10 +398,16 @@ bool Instance::CreateDevice() {
         return false;
     }
 
-    static constexpr std::array queue_priorities = {1.0f};
+    // ryGT: with frame generation on, three more queues of the graphics family for its
+    // swapchain's own threads (async compute, present, image acquire), when the family has them.
+    static constexpr std::array queue_priorities = {1.0f, 1.0f, 1.0f, 1.0f};
+    const u32 num_queues = EmulatorSettings.IsFrameGenEnabled() &&
+                                   family_properties[queue_family_index].queueCount >= 4
+                               ? 4u
+                               : 1u;
     const vk::DeviceQueueCreateInfo queue_info = {
         .queueFamilyIndex = queue_family_index,
-        .queueCount = static_cast<u32>(queue_priorities.size()),
+        .queueCount = num_queues,
         .pQueuePriorities = queue_priorities.data(),
     };
 
@@ -618,6 +625,10 @@ bool Instance::CreateDevice() {
 
     graphics_queue = device->getQueue(queue_family_index, 0);
     present_queue = device->getQueue(queue_family_index, 0);
+    framegen_queues.clear();
+    for (u32 i = 1; i < num_queues; ++i) {
+        framegen_queues.push_back(device->getQueue(queue_family_index, i));
+    }
 
     if (calibrated_timestamps) {
         const auto [time_domains_result, time_domains] =

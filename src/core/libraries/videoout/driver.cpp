@@ -423,7 +423,16 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         }
         if (Common::GuestClock::IsPaused()) {
             // FIX-044: no vblank passes while the guest clocks are held for a shader or
-            // pipeline compile, as no time passes for the game.
+            // pipeline compile, as no time passes for the game. PERF-100: the last frame is
+            // shown again, with the compile notice drawn over it (PERF-102: or the splash
+            // screen, before the game's first frame).
+            if (timer.GetTotalWait().count() < 0) {
+                if (!main_port.is_open) {
+                    DrawBlankFrame();
+                } else {
+                    DrawLastFrame();
+                }
+            }
             timer.End();
             continue;
         }

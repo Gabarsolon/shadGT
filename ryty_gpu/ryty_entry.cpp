@@ -26,6 +26,8 @@
 #include "core/signals.h"
 #include "core/loader/symbols_resolver.h"
 #include "input/controller.h"
+#include "ryty_gpu/ryty_framegen.h"
+#include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "ryty_gpu/ryty_input_bridge.h"
 #include "ryty_gpu/ryty_library.h"
 #include "sdl_window.h"
@@ -36,6 +38,7 @@
 #include "common/discord_rpc_handler.h"
 #endif
 #include <chrono>
+#include <cmath>
 
 namespace Libraries::SystemService {
 void NoteGameDrew(); // ryty_stubs.cpp: the splash screen ends at the game's first drawn frame
@@ -110,24 +113,143 @@ void StartFirstDrawWatcher() {
 
 // The FPS counter (shadGT's Show FPS Counter setting): the game's frames per second, in small
 // type in the window's top left corner, over the game and the splash screen.
+// PERF-098: the precompile of stored shaders and pipelines, as a translucent blue bar with
+// shadowed white text near the bottom of the splash screen (and of the game, if it is still
+// going when the game starts drawing).
+void DrawPrecompileProgress() {
+    using Clock = std::chrono::steady_clock;
+    const auto progress = Vulkan::GetPrecompileProgress();
+    static Clock::time_point finished{};
+    static bool shown = false;
+    if (progress.total == 0) {
+        return;
+    }
+    float alpha = 1.0f;
+    if (progress.active) {
+        shown = true;
+        finished = {};
+    } else {
+        if (!shown) {
+            return; // nothing was left to build: no bar at all
+        }
+        if (finished == Clock::time_point{}) {
+            finished = Clock::now();
+        }
+        // "Done" stays a moment, then fades out.
+        const float since = std::chrono::duration<float>(Clock::now() - finished).count();
+        alpha = std::clamp(1.0f - (since - 1.5f) / 0.5f, 0.0f, 1.0f);
+        if (alpha <= 0.0f) {
+            return;
+        }
+    }
+    const auto a = [alpha](float value) { return static_cast<int>(value * alpha); };
+    const float fraction =
+        progress.total ? float(progress.done) / float(progress.total) : 0.0f;
+    char text[96];
+    if (progress.active) {
+        std::snprintf(text, sizeof(text), "Precompiling shaders   %llu / %llu   %.0f%%",
+                      static_cast<unsigned long long>(progress.done),
+                      static_cast<unsigned long long>(progress.total), fraction * 100.0f);
+    } else {
+        std::snprintf(text, sizeof(text), "Shaders ready");
+    }
+    auto* draw = ImGui::GetForegroundDrawList();
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    const float width = std::clamp(viewport->Size.x * 0.36f, 240.0f, 720.0f);
+    const float bar_height = 6.0f;
+    const ImVec2 bar_min{viewport->Pos.x + (viewport->Size.x - width) * 0.5f,
+                         viewport->Pos.y + viewport->Size.y * 0.90f};
+    const ImVec2 bar_max{bar_min.x + width, bar_min.y + bar_height};
+    draw->AddRectFilled(bar_min, bar_max, IM_COL32(25, 80, 190, a(70)), bar_height * 0.5f);
+    if (fraction > 0.0f) {
+        draw->AddRectFilled(bar_min, {bar_min.x + width * fraction, bar_max.y},
+                            IM_COL32(70, 150, 255, a(175)), bar_height * 0.5f);
+    }
+    const ImVec2 size = ImGui::CalcTextSize(text);
+    const ImVec2 at{bar_min.x + (width - size.x) * 0.5f, bar_min.y - size.y - 6.0f};
+    for (const ImVec2 offset : {ImVec2{-1, 0}, ImVec2{1, 0}, ImVec2{0, -1}, ImVec2{0, 1},
+                                ImVec2{1, 1}, ImVec2{2, 2}}) {
+        draw->AddText({at.x + offset.x, at.y + offset.y}, IM_COL32(0, 0, 0, a(150)), text);
+    }
+    draw->AddText(at, IM_COL32(255, 255, 255, a(235)), text);
+}
+
+// PERF-100: while a new shader compiles and the game is held, the same translucent style: a
+// notice with a moving bar over the last frame. Not for compiles shorter than 0.15 s.
+void DrawCompileNotice() {
+    using Clock = std::chrono::steady_clock;
+    static Clock::time_point paused_since{};
+    static Clock::time_point last_paused{};
+    const auto now = Clock::now();
+    if (Common::GuestClock::IsPaused()) {
+        if (paused_since == Clock::time_point{} || now - last_paused > std::chrono::milliseconds{300}) {
+            paused_since = now;
+        }
+        last_paused = now;
+    }
+    if (paused_since == Clock::time_point{} || now - paused_since < std::chrono::milliseconds{150} ||
+        now - last_paused > std::chrono::milliseconds{300}) {
+        return;
+    }
+    const char* text = "Compiling new shaders...";
+    auto* draw = ImGui::GetForegroundDrawList();
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    const ImVec2 size = ImGui::CalcTextSize(text);
+    // Bottom left: the text, with a small bar under it.
+    const float margin = 18.0f;
+    const float width = std::max(size.x, 160.0f);
+    const float bar_height = 4.0f;
+    const ImVec2 bar_min{viewport->Pos.x + margin,
+                         viewport->Pos.y + viewport->Size.y - margin - bar_height};
+    const ImVec2 bar_max{bar_min.x + width, bar_min.y + bar_height};
+    draw->AddRectFilled(bar_min, bar_max, IM_COL32(25, 80, 190, 70), bar_height * 0.5f);
+    // A segment sweeping across: the time a compile takes is not known.
+    const float t = std::fmod(std::chrono::duration<float>(now.time_since_epoch()).count(), 1.2f) / 1.2f;
+    const float segment = width * 0.3f;
+    const float x0 = bar_min.x + (width + segment) * t - segment;
+    draw->AddRectFilled({std::max(x0, bar_min.x), bar_min.y},
+                        {std::min(x0 + segment, bar_max.x), bar_max.y},
+                        IM_COL32(70, 150, 255, 175), bar_height * 0.5f);
+    const ImVec2 at{bar_min.x, bar_min.y - size.y - 5.0f};
+    for (const ImVec2 offset : {ImVec2{-1, 0}, ImVec2{1, 0}, ImVec2{0, -1}, ImVec2{0, 1},
+                                ImVec2{1, 1}, ImVec2{2, 2}}) {
+        draw->AddText({at.x + offset.x, at.y + offset.y}, IM_COL32(0, 0, 0, 150), text);
+    }
+    draw->AddText(at, IM_COL32(255, 255, 255, 235), text);
+}
+
 void DrawFpsCounter() {
+    DrawPrecompileProgress();
+    if (!Vulkan::GetPrecompileProgress().active) {
+        DrawCompileNotice();
+    }
     if (!EmulatorSettings.IsShowFpsCounter()) {
         return;
     }
     using Clock = std::chrono::steady_clock;
     static Clock::time_point window_start = Clock::now();
     static u32 window_frames = DebugState.GetFrameNum();
+    static u64 window_shown = Vulkan::RytyFrameGen::ShownFrames();
     static double fps = 0.0;
+    static double shown_fps = 0.0;
     const auto now = Clock::now();
     const double seconds = std::chrono::duration<double>(now - window_start).count();
     if (seconds >= 0.5) {
         const u32 frames = DebugState.GetFrameNum();
+        const u64 shown = Vulkan::RytyFrameGen::ShownFrames();
         fps = (frames - window_frames) / seconds;
+        // With frame generation: the frames on screen too (game and generated).
+        shown_fps = shown > window_shown ? (shown - window_shown) / seconds : 0.0;
         window_frames = frames;
+        window_shown = shown;
         window_start = now;
     }
-    char text[32];
-    std::snprintf(text, sizeof(text), "%.0f FPS", fps);
+    char text[48];
+    if (shown_fps > 0.0) {
+        std::snprintf(text, sizeof(text), "%.0f FPS (%.0f shown)", fps, shown_fps);
+    } else {
+        std::snprintf(text, sizeof(text), "%.0f FPS", fps);
+    }
     auto* draw = ImGui::GetForegroundDrawList();
     const ImVec2 origin = ImGui::GetMainViewport()->Pos;
     const ImVec2 size = ImGui::CalcTextSize(text);

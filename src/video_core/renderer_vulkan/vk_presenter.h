@@ -140,6 +140,9 @@ private:
     std::vector<Frame> present_frames;
     std::queue<Frame*> free_queue;
     Frame* last_submit_frame;
+    /// PERF-100: the last frame shown again, taken out of the free queue meanwhile, so the GPU
+    /// thread cannot take it for a new frame (and reset its fence) while it is redrawn.
+    Frame* reusing_frame{};
     std::mutex free_mutex;
     std::condition_variable free_cv;
     std::condition_variable_any frame_cv;

@@ -90,6 +90,7 @@ namespace {
 // PERF-088: the CPU sets and their efficiency classes (the highest class is the fast cores).
 struct CoreClasses {
     std::vector<ULONG> fast_ids;
+    std::vector<ULONG> slow_ids;
     std::vector<s8> fast_by_index; // by group * 64 + logical processor index: 1 fast, 0 slow
     bool hybrid = false;
 };
@@ -120,6 +121,8 @@ const CoreClasses& GetCoreClasses() {
                 const bool fast = entry.CpuSet.EfficiencyClass == highest;
                 if (fast) {
                     result.fast_ids.push_back(entry.CpuSet.Id);
+                } else {
+                    result.slow_ids.push_back(entry.CpuSet.Id);
                 }
                 const size_t index = size_t(entry.CpuSet.Group) * 64 +
                                      entry.CpuSet.LogicalProcessorIndex;
@@ -156,6 +159,23 @@ void PreferPerformanceCores() {
                          sizeof(throttling));
     SetThreadSelectedCpuSets(GetCurrentThread(), classes.fast_ids.data(),
                              static_cast<ULONG>(classes.fast_ids.size()));
+}
+
+void PreferEfficiencyCores() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("SHADGT_BUILD_ON_SLOW_CORES");
+        return !(env && env[0] == '0');
+    }();
+    const auto& classes = GetCoreClasses();
+    if (!enabled || !classes.hybrid || classes.slow_ids.empty()) {
+        return;
+    }
+    SetThreadSelectedCpuSets(GetCurrentThread(), classes.slow_ids.data(),
+                             static_cast<ULONG>(classes.slow_ids.size()));
+}
+
+void AllowAllCores() {
+    SetThreadSelectedCpuSets(GetCurrentThread(), nullptr, 0);
 }
 
 int CurrentCoreIsFast() {
@@ -218,6 +238,10 @@ bool AccurateSleep(const std::chrono::nanoseconds duration, std::chrono::nanosec
 #else
 
 void PreferPerformanceCores() {}
+
+void PreferEfficiencyCores() {}
+
+void AllowAllCores() {}
 
 int CurrentCoreIsFast() {
     return -1;

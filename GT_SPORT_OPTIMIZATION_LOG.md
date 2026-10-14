@@ -1556,3 +1556,77 @@ Lance's profile against these changes:
 - **Recorder work.** It falls from about 31 ms to about 16-17 ms per race frame: fault waits about -6 ms, hashing about -2.5 ms, heap about -1.5 ms, image scans about -1.8 ms, others about -2 ms.
 - **Recorder-bound rate.** If the fault chain no longer leaves the recorder idle, that is about 55-60 FPS.
 - **GPU bound.** The GPU's busy figure at 25 FPS (31-47%) puts its own limit somewhere between 52 and 80 FPS.
+
+## PS4 Pro ground truth and follow-ups (October 13, branch `ryty-gpu`)
+
+A live PS4 Pro running GT Sport 1.69 was captured through ps4debug (tools and findings in
+`D:\Downloads\PS4 debug\gtprobe`, FINDINGS.md). Measured on hardware:
+
+- Race: 60 fps, 1,601 draws/frame, GPU busy ~13.9 of 16.6 ms.
+- Kyoto menu: 30 fps with 2,300-4,600 draws/frame. The GPU is busy ~16 ms per frame, and the
+  game does not cap the rate (flip rate 60, VSYNC flips, one frame in flight). The console's CPU
+  is the limit.
+- Async compute: 9 DingDongs per frame in a race (5 in Kyoto) on 4-5 queues. 3 of the race's 9
+  (and 3 of Kyoto's 5) contain no dispatch and no DMA, only fences, cache flushes or an empty
+  chain of IB links.
+- GT Sport's eboot has 13 AMD-only SSE4a sites (`insertq`/`extrq`). On Intel, Ryty traps and
+  emulates each execution.
+
+### DIAG-098: SSE4a emulation rate in a race (no code change)
+
+Ryty's libc counter `g_sse4aEmulated` (libc.prx RVA 0x7f590) is read from the running game with
+`tools\peek.exe` during `perf-test.ps1` (autotest). If the rate is negligible, the 13 sites
+are left to Ryty's handler.
+
+- **Result (two autotest runs, 15:30-15:50):** `g_sse4aEmulated` stayed at **0** through boot,
+  every arcade menu and ~90 s of the race. The address was checked by reading the neighbouring
+  `g_sse4aEmulation` (1) and `g_sse4aTrace` (1).
+- **Conclusion:** the SSE4a sites do not run in these scenes, so there is nothing to patch.
+- **Baseline race, old build:** 42.1 fps, recorder 93% busy, 11.06 µs per draw or dispatch.
+- **Test script:** `perf-test.ps1`'s presses ended before the race on the first try (slow car
+  list). `gtprobe\rygt-race-test.ps1` adds presses at 122 s and 130 s and throttle at 136 s.
+
+### PERF-095 (opt-in `SHADGT_LAZY_ASC_EPOCH=1`; first built as perf id 112): compute-queue upload epochs only when a queue reads memory
+
+- **What:** `SubmitAsc` and the compute-queue frontend waits (WAIT_REG_MEM, MEM_SEMAPHORE,
+  REWIND) mark an upload epoch as pending instead of bumping it. A compute queue bumps the
+  pending epoch when it next records a dispatch (direct or indirect) or a DMA. An ASC submission
+  that only fences, flushes caches or chains IBs therefore costs no epoch.
+- **Why:** each epoch makes the recorder re-check dirty and hot pages for every range it binds
+  afterwards. On hardware, 3 of the 9 per-frame race submissions read no memory.
+- **Files:** `src/video_core/amdgpu/liverpool.cpp`.
+- **Risk:**
+  - Graphics draws decoded after a no-op compute submission no longer get the extra epoch it
+    caused.
+  - Graphics submits, graphics waits and write faults still bump, and protected pages still
+    fault. What could be missed is a hot (unprotected) page that the CPU rewrote after the last
+    graphics epoch without any gate in between. Such a page is a race on hardware too.
+  - The reverted PERF-090 graphics-only epoch memo measured only 5-10% cheaper read obtains.
+    Expect a small gain.
+  - `SHADGT_DISABLE_PERF=112` restores the old behavior.
+- **Test:** race `perf-test.ps1` in autotest, with and without id 112, compared on fps,
+  recorder µs/draw and upload epochs, plus screenshots of the cockpit and track.
+- **Status:** implemented and built (15:44), then A/B tested in the autotest race (on, off, on,
+  off with the same binary; `gtprobe\ab-perf095.ps1`):
+
+  | Run | Upload epochs/frame | fps | µs per draw | Protection calls / 2 s |
+  |---|---|---|---|---|
+  | on-1 | 4.1 | 38.2 | 12.03 | 53k |
+  | off-1 | 8.0 | 42.0 | 10.32 | 38k |
+  | on-2 | 4.0 | 37.4 | 11.50 | 43k |
+  | off-2 | 7.8 | 38.5 | 12.38 | 54k |
+
+  - Epochs halve as designed.
+  - The same setting varies ~10% between runs (off-1 vs off-2). The on/off averages (37.8 vs
+    40.3 fps, 11.8 vs 11.4 µs) are inside that noise.
+  - Race screenshots render correctly.
+  - **No measurable gain, so it is now opt-in (default off, behavior unchanged).** This agrees
+    with PERF-090.
+  - **Opt-in build (16:04), verified in two more races:**
+    - Default: 8.0 epochs/frame, as before.
+    - `SHADGT_LAZY_ASC_EPOCH=1`: 3.7 epochs/frame. 41.8 vs 29.8 fps, but the default run's
+      race started late (the 165 s screenshot is still the starting grid), so that pair is
+      not comparable.
+    - No crashes. Installed only in `E:\Development\RyGT\autotest` (backup
+      `libSceVideoOut.prx.bak-pre-perf095`).
+    - Worth one try where the recorder is the limit (Kyoto menu, recorder 98-99% busy).

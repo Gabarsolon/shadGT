@@ -32,6 +32,14 @@ void PreferPerformanceCores();
 /// -1 when the CPU has only one kind.
 int CurrentCoreIsFast();
 
+/// PERF-097: on hybrid CPUs, keeps the calling thread on the efficiency cores (shader and
+/// pipeline compiles, so a burst of them leaves the fast cores to the game and the renderer).
+/// SHADGT_BUILD_ON_SLOW_CORES=0 turns it off.
+void PreferEfficiencyCores();
+
+/// Undoes PreferPerformanceCores/PreferEfficiencyCores for the calling thread.
+void AllowAllCores();
+
 void SetThreadName(void* thread, const char* name);
 
 bool AccurateSleep(std::chrono::nanoseconds duration, std::chrono::nanoseconds* remaining,

@@ -25,10 +25,12 @@ struct Hit {
     std::uint64_t rip;
     std::uint64_t value;
     std::uint64_t rcx, rdx, rbx, rsi, rdi, r11, rsp, r12, below_rsp_16, below_rsp_8, r14, r15;
+    std::uint64_t rax, r8, r9, r10, r13;
 };
 
 std::atomic<bool> g_active{false};
 std::atomic<bool> g_execute{false}; // an instruction breakpoint instead of a write watch
+std::atomic<bool> g_read_write{false}; // DIAG-097: reads trap too
 std::atomic<std::uint64_t> g_address{0};
 std::array<Hit, 2048> g_hits{};
 std::atomic<std::uint32_t> g_num_hits{0};
@@ -54,15 +56,23 @@ LONG CALLBACK OnException(EXCEPTION_POINTERS* pointers) {
         const std::uint64_t address = g_address.load(std::memory_order_relaxed);
         const std::uint32_t index = g_num_hits.fetch_add(1, std::memory_order_relaxed);
         if (index < g_hits.size()) {
+            // Reading the watched address here would trap again in read/write mode.
+            const std::uint64_t value =
+                g_read_write.load(std::memory_order_relaxed)
+                    ? 0
+                    : *reinterpret_cast<const volatile std::uint64_t*>(address);
             g_hits[index] = {NowNs(),      GetCurrentThreadId(),
-                             context->Rip, *reinterpret_cast<const volatile std::uint64_t*>(address),
+                             context->Rip, value,
                              context->Rcx, context->Rdx,
                              context->Rbx, context->Rsi,
                              context->Rdi, context->R11,
                              context->Rsp, context->R12,
                              *reinterpret_cast<const volatile std::uint64_t*>(context->Rsp - 16),
                              *reinterpret_cast<const volatile std::uint64_t*>(context->Rsp - 8),
-                             context->R14, context->R15};
+                             context->R14, context->R15,
+                             context->Rax, context->R8,
+                             context->R9,  context->R10,
+                             context->R13};
         }
     }
     if (g_execute.load(std::memory_order_relaxed)) {
@@ -98,7 +108,9 @@ void SetBreakpoint(std::uint64_t address) {
                 context.Dr7 &= ~((0xFull << 16) | 3ull);
                 if (address != 0) {
                     context.Dr0 = address;
-                    context.Dr7 |= g_execute ? 1ull : (1ull | (1ull << 16) | (3ull << 18));
+                    context.Dr7 |= g_execute      ? 1ull
+                                   : g_read_write ? (1ull | (3ull << 16) | (3ull << 18))
+                                                  : (1ull | (1ull << 16) | (3ull << 18));
                 } else {
                     context.Dr0 = 0;
                 }
@@ -163,6 +175,8 @@ void RytyWatchWrites(std::uint64_t address, std::uint32_t ms, std::string label)
     // A label starting with "exec" makes it an instruction breakpoint at address (registers are
     // captured each time that instruction is about to run).
     g_execute.store(label.starts_with("exec"));
+    // A label starting with "rw" makes it a read/write watch.
+    g_read_write.store(label.starts_with("rw"));
     if (!g_execute) {
         address &= ~7ull;
     }
@@ -185,11 +199,13 @@ void RytyWatchWrites(std::uint64_t address, std::uint32_t ms, std::string label)
             const bool vertex_like = has(0x3f815729) || has(0x3f6e90f7) || has(0x3f6ea9b5);
             line += fmt::format(" | +{:.2f} ms thread {} at {} wrote {:016x}{} (rcx {:x} rdx {:x} "
                                 "rbx {:x} rsi {:x} rdi {:x} r11 {:x} rsp {:x} r12 {:x} "
-                                "[rsp-16] {:016x} [rsp-8] {:016x} r14 {:x} r15 {:x})",
+                                "[rsp-16] {:016x} [rsp-8] {:016x} r14 {:x} r15 {:x} rax {:x} r8 {:x} "
+                                "r9 {:x} r10 {:x} r13 {:x})",
                                 (hit.ns - g_start_ns.load()) / 1e6, ThreadName(hit.tid),
                                 Describe(hit.rip), hit.value, vertex_like ? " VERTEX-LIKE" : "",
                                 hit.rcx, hit.rdx, hit.rbx, hit.rsi, hit.rdi, hit.r11, hit.rsp,
-                                hit.r12, hit.below_rsp_16, hit.below_rsp_8, hit.r14, hit.r15);
+                                hit.r12, hit.below_rsp_16, hit.below_rsp_8, hit.r14, hit.r15,
+                                hit.rax, hit.r8, hit.r9, hit.r10, hit.r13);
         }
         if (count > 64) {
             // Long lists go to a file, one hit per line.

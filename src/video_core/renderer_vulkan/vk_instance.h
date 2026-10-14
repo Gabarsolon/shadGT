@@ -75,6 +75,12 @@ public:
         return present_queue;
     }
 
+    /// ryGT: extra queues of the graphics family for FSR 3.1 frame generation's swapchain
+    /// (async compute, present, image acquire); null when the family has too few queues.
+    vk::Queue GetFrameGenQueue(u32 index) const {
+        return index < framegen_queues.size() ? framegen_queues[index] : vk::Queue{};
+    }
+
     TracyVkCtx GetProfilerContext() const {
         return profiler_context;
     }
@@ -517,6 +523,7 @@ private:
     VmaAllocator allocator{};
     vk::Queue present_queue;
     vk::Queue graphics_queue;
+    std::vector<vk::Queue> framegen_queues;
     std::vector<vk::PhysicalDevice> physical_devices;
     std::vector<std::string> available_extensions;
     std::unordered_map<vk::Format, vk::FormatProperties3> format_properties;

@@ -622,6 +622,27 @@ Frame* Presenter::PrepareLastFrame() {
     }
 
     Frame* frame = last_submit_frame;
+    {
+        // PERF-100: shown again while the game runs on (a compile pause): only while it is
+        // still free, and out of the free queue until Present returns it.
+        std::scoped_lock fl{free_mutex};
+        std::queue<Frame*> rest;
+        bool found = false;
+        while (!free_queue.empty()) {
+            Frame* f = free_queue.front();
+            free_queue.pop();
+            if (f == frame && !found) {
+                found = true;
+            } else {
+                rest.push(f);
+            }
+        }
+        free_queue = std::move(rest);
+        if (!found) {
+            return nullptr; // the GPU thread is already drawing a new frame into it
+        }
+        reusing_frame = frame;
+    }
 
     while (true) {
         vk::Result result = instance.GetDevice().waitForFences(frame->present_done, false,
@@ -906,6 +927,12 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
             std::scoped_lock fl{free_mutex};
             free_queue.push(frame);
             free_cv.notify_one();
+        } else if (frame == reusing_frame) {
+            // PERF-100: back to the free queue once shown again.
+            std::scoped_lock fl{free_mutex};
+            reusing_frame = nullptr;
+            free_queue.push(frame);
+            free_cv.notify_one();
         }
     };
 
@@ -1108,6 +1135,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
                                vk::PipelineStageFlagBits::eAllCommands,
                                vk::DependencyFlagBits::eByRegion, {}, {}, post_barrier);
+        swapchain.PrepareFrameGeneration(cmdbuf); // ryGT
 
         if (profiler_ctx) {
             TracyVkCollect(profiler_ctx, cmdbuf);

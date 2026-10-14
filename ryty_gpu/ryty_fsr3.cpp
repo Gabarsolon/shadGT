@@ -96,6 +96,10 @@ FfxApiResource Resource(vk::Image image, vk::Format format, vk::Extent2D size, u
 
 } // namespace
 
+PFN_vkGetDeviceProcAddr DeviceProcAddrShim() {
+    return &GetDeviceProcAddr;
+}
+
 Pass::~Pass() {
     DestroyContext();
 }

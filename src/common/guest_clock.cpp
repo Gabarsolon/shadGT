@@ -44,6 +44,18 @@ void MarkGpuCommandThread() {
     is_gpu_command_thread = true;
 }
 
+void TakeHold() {
+    if (Enabled()) {
+        Counter().Pause(FencedRDTSC());
+    }
+}
+
+void ReleaseHold() {
+    if (Enabled()) {
+        Counter().Resume(FencedRDTSC());
+    }
+}
+
 CompilePause::CompilePause() : active{is_gpu_command_thread && Enabled()} {
     if (active) {
         start = std::chrono::steady_clock::now();

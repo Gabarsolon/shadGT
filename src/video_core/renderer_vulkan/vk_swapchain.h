@@ -7,6 +7,9 @@
 #include <vector>
 #include "common/types.h"
 #include "video_core/renderer_vulkan/vk_common.h"
+#ifdef RYTY_GPU
+#include "ryty_gpu/ryty_framegen.h"
+#endif
 
 namespace Frontend {
 class WindowSDL;
@@ -92,6 +95,13 @@ public:
         return needs_hdr;
     }
 
+    /// ryGT: frame generation's per-frame preparation, recorded before the present submit.
+    void PrepareFrameGeneration(vk::CommandBuffer cmdbuf) {
+#ifdef RYTY_GPU
+        framegen.Prepare(cmdbuf, swapchain, extent, needs_hdr);
+#endif
+    }
+
 private:
     /// Selects the best available swapchain image format
     void FindPresentFormat();
@@ -134,6 +144,9 @@ private:
     bool needs_recreation = true;
     bool needs_hdr = false;    // The game requested HDR swapchain
     bool supports_hdr = false; // SC supports HDR output
+#ifdef RYTY_GPU
+    RytyFrameGen::FrameGen framegen; // ryGT: FSR 3.1 frame generation's swapchain when on
+#endif
 };
 
 } // namespace Vulkan

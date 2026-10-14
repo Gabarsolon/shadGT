@@ -421,6 +421,17 @@ struct GPUSettings {
     Setting<bool> dlss_enabled{false};
     // ryGT: with fsr_enabled, scale with AMD FSR 3.1 (amd_fidelityfx_vk.dll) instead of FSR 1.
     Setting<bool> fsr3_enabled{true};
+    // ryGT: AMD FSR 3.1 frame generation (amd_fidelityfx_vk.dll) adds a generated frame between
+    // each pair of game frames.
+    Setting<bool> framegen_enabled{false};
+    // ryGT: builds every stored shader pipeline while the splash screen shows (PERF-098).
+    Setting<bool> precompile_shaders{true};
+    // ryGT: pauses the game while a new shader pipeline compiles, instead of drawing on without
+    // the objects that need it (PERF-100).
+    Setting<bool> compile_freeze{true};
+    // ryGT: with compile_freeze, how long a pause may go on building the upcoming draws'
+    // pipelines too (0 off; launcher: Off 0, Short 100, Medium 300, Long 1000) (PERF-101).
+    Setting<int> compile_batch_ms{0};
     // ryGT: CPU accesses keep fresh GPU results (FIX-076), which GT Sport's sparks and tire smoke
     // need; costs frames in races, so it can be turned off.
     Setting<bool> particle_effects{true};
@@ -442,6 +453,10 @@ struct GPUSettings {
             make_override<GPUSettings>("rcas_attenuation", &GPUSettings::rcas_attenuation),
             make_override<GPUSettings>("dlss_enabled", &GPUSettings::dlss_enabled),
             make_override<GPUSettings>("fsr3_enabled", &GPUSettings::fsr3_enabled),
+            make_override<GPUSettings>("framegen_enabled", &GPUSettings::framegen_enabled),
+            make_override<GPUSettings>("precompile_shaders", &GPUSettings::precompile_shaders),
+            make_override<GPUSettings>("compile_freeze", &GPUSettings::compile_freeze),
+            make_override<GPUSettings>("compile_batch_ms", &GPUSettings::compile_batch_ms),
             make_override<GPUSettings>("particle_effects", &GPUSettings::particle_effects),
             make_override<GPUSettings>("dump_shaders", &GPUSettings::dump_shaders),
             make_override<GPUSettings>("patch_shaders", &GPUSettings::patch_shaders),
@@ -462,8 +477,9 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GPUSettings, window_width, window_height, int
                                    direct_memory_access_enabled, dump_shaders, patch_shaders,
                                    vblank_frequency, full_screen, full_screen_mode, present_mode,
                                    hdr_allowed, fsr_enabled, rcas_enabled, rcas_attenuation,
-                                   dlss_enabled, fsr3_enabled, particle_effects, userfaultfd,
-                                   inline_fetch_shader)
+                                   dlss_enabled, fsr3_enabled, framegen_enabled, precompile_shaders,
+                                   compile_freeze, compile_batch_ms, particle_effects,
+                                   userfaultfd, inline_fetch_shader)
 
 // -------------------------------
 // Vulkan settings
@@ -729,6 +745,10 @@ public:
     SETTING_FORWARD(m_gpu, RcasAttenuation, rcas_attenuation)
     SETTING_FORWARD_BOOL(m_gpu, DlssEnabled, dlss_enabled)
     SETTING_FORWARD_BOOL(m_gpu, Fsr3Enabled, fsr3_enabled)
+    SETTING_FORWARD_BOOL(m_gpu, FrameGenEnabled, framegen_enabled)
+    SETTING_FORWARD_BOOL(m_gpu, PrecompileShaders, precompile_shaders)
+    SETTING_FORWARD_BOOL(m_gpu, CompileFreeze, compile_freeze)
+    SETTING_FORWARD(m_gpu, CompileBatchMs, compile_batch_ms)
     SETTING_FORWARD_BOOL(m_gpu, ParticleEffects, particle_effects)
     SETTING_FORWARD(m_gpu, ReadbacksMode, readbacks_mode)
     SETTING_FORWARD_BOOL(m_gpu, ReadbackLinearImagesEnabled, readback_linear_images_enabled)

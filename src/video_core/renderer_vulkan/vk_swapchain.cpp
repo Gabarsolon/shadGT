@@ -70,10 +70,16 @@ void Swapchain::Create(u32 width_, u32 height_) {
         .oldSwapchain = nullptr,
     };
 
-    auto [swapchain_result, chain] = instance.GetDevice().createSwapchainKHR(swapchain_info);
-    ASSERT_MSG(swapchain_result == vk::Result::eSuccess, "Failed to create swapchain: {}",
-               vk::to_string(swapchain_result));
-    swapchain = chain;
+#ifdef RYTY_GPU
+    // ryGT: FSR 3.1 frame generation makes the swapchain when it is on.
+    if (!framegen.CreateSwapchain(instance, swapchain_info, swapchain))
+#endif
+    {
+        auto [swapchain_result, chain] = instance.GetDevice().createSwapchainKHR(swapchain_info);
+        ASSERT_MSG(swapchain_result == vk::Result::eSuccess, "Failed to create swapchain: {}",
+                   vk::to_string(swapchain_result));
+        swapchain = chain;
+    }
 
     SetupImages();
     RefreshSemaphores();
@@ -104,9 +110,18 @@ void Swapchain::SetHDR(bool hdr) {
 
 bool Swapchain::AcquireNextImage() {
     vk::Device device = instance.GetDevice();
+#ifdef RYTY_GPU
+    vk::Result result =
+        framegen.Active()
+            ? framegen.Acquire(device, swapchain, image_acquired[frame_index], &image_index)
+            : device.acquireNextImageKHR(swapchain, std::numeric_limits<u64>::max(),
+                                         image_acquired[frame_index], VK_NULL_HANDLE,
+                                         &image_index);
+#else
     vk::Result result =
         device.acquireNextImageKHR(swapchain, std::numeric_limits<u64>::max(),
                                    image_acquired[frame_index], VK_NULL_HANDLE, &image_index);
+#endif
 
     switch (result) {
     case vk::Result::eSuccess:
@@ -136,7 +151,12 @@ bool Swapchain::Present() {
         .pImageIndices = &image_index,
     };
 
+#ifdef RYTY_GPU
+    auto result = framegen.Active() ? framegen.Present(instance.GetPresentQueue(), present_info)
+                                    : instance.GetPresentQueue().presentKHR(present_info);
+#else
     auto result = instance.GetPresentQueue().presentKHR(present_info);
+#endif
     if (result == vk::Result::eErrorOutOfDateKHR || result == vk::Result::eSuboptimalKHR) {
         needs_recreation = true;
     } else {
@@ -266,9 +286,16 @@ void Swapchain::Destroy() {
     }
     images_view.clear();
 
+#ifdef RYTY_GPU
+    if (framegen.Active()) {
+        framegen.Destroy(); // also destroys its swapchain
+        swapchain = nullptr;
+    }
+#endif
     if (swapchain) {
         device.destroySwapchainKHR(swapchain);
     }
+    swapchain = nullptr;
 
     for (const auto& sem : image_acquired) {
         device.destroySemaphore(sem);
@@ -308,10 +335,19 @@ void Swapchain::RefreshSemaphores() {
 
 void Swapchain::SetupImages() {
     vk::Device device = instance.GetDevice();
-    auto [images_result, imgs] = device.getSwapchainImagesKHR(swapchain);
-    ASSERT_MSG(images_result == vk::Result::eSuccess, "Failed to create swapchain images: {}",
-               vk::to_string(images_result));
-    images = std::move(imgs);
+#ifdef RYTY_GPU
+    if (framegen.Active()) {
+        const auto images_result = framegen.GetImages(device, swapchain, images);
+        ASSERT_MSG(images_result == vk::Result::eSuccess, "Failed to get swapchain images: {}",
+                   vk::to_string(images_result));
+    } else
+#endif
+    {
+        auto [images_result, imgs] = device.getSwapchainImagesKHR(swapchain);
+        ASSERT_MSG(images_result == vk::Result::eSuccess, "Failed to create swapchain images: {}",
+                   vk::to_string(images_result));
+        images = std::move(imgs);
+    }
     image_count = static_cast<u32>(images.size());
     images_view.resize(image_count);
     for (u32 i = 0; i < image_count; ++i) {
