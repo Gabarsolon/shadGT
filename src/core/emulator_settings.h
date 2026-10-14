@@ -432,6 +432,11 @@ struct GPUSettings {
     // ryGT: with compile_freeze, how long a pause may go on building the upcoming draws'
     // pipelines too (0 off; launcher: Off 0, Short 100, Medium 300, Long 1000) (PERF-101).
     Setting<int> compile_batch_ms{0};
+    // ryGT: when a new pipeline compiles during play (PERF-103): 0 the game pauses until it is
+    // compiled, 1 short compiles pause and long ones (over 100 ms) continue in slow motion with
+    // the objects that need them missing until they are compiled, 2 the game keeps going at
+    // full speed with those objects missing.
+    Setting<int> compile_mode{1};
     // ryGT: CPU accesses keep fresh GPU results (FIX-076), which GT Sport's sparks and tire smoke
     // need; costs frames in races, so it can be turned off.
     Setting<bool> particle_effects{true};
@@ -457,6 +462,7 @@ struct GPUSettings {
             make_override<GPUSettings>("precompile_shaders", &GPUSettings::precompile_shaders),
             make_override<GPUSettings>("compile_freeze", &GPUSettings::compile_freeze),
             make_override<GPUSettings>("compile_batch_ms", &GPUSettings::compile_batch_ms),
+            make_override<GPUSettings>("compile_mode", &GPUSettings::compile_mode),
             make_override<GPUSettings>("particle_effects", &GPUSettings::particle_effects),
             make_override<GPUSettings>("dump_shaders", &GPUSettings::dump_shaders),
             make_override<GPUSettings>("patch_shaders", &GPUSettings::patch_shaders),
@@ -478,7 +484,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GPUSettings, window_width, window_height, int
                                    vblank_frequency, full_screen, full_screen_mode, present_mode,
                                    hdr_allowed, fsr_enabled, rcas_enabled, rcas_attenuation,
                                    dlss_enabled, fsr3_enabled, framegen_enabled, precompile_shaders,
-                                   compile_freeze, compile_batch_ms, particle_effects,
+                                   compile_freeze, compile_batch_ms, compile_mode,
+                                   particle_effects,
                                    userfaultfd, inline_fetch_shader)
 
 // -------------------------------
@@ -749,6 +756,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, PrecompileShaders, precompile_shaders)
     SETTING_FORWARD_BOOL(m_gpu, CompileFreeze, compile_freeze)
     SETTING_FORWARD(m_gpu, CompileBatchMs, compile_batch_ms)
+    SETTING_FORWARD(m_gpu, CompileMode, compile_mode)
     SETTING_FORWARD_BOOL(m_gpu, ParticleEffects, particle_effects)
     SETTING_FORWARD(m_gpu, ReadbacksMode, readbacks_mode)
     SETTING_FORWARD_BOOL(m_gpu, ReadbackLinearImagesEnabled, readback_linear_images_enabled)

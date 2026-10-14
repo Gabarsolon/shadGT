@@ -534,6 +534,20 @@ void Scheduler::PerfMonitorThread(std::stop_token stoken) {
         LOG_WARNING(Render_Vulkan, "Frontend work in {:.1f} s: {}",
                     std::chrono::duration<double>(now - window_start).count(),
                     Common::TakeWorkCounters());
+        // DIAG-103: the GPU busy with nothing new submitted for 10 s: the GPU (or a wait on it) is
+        // stuck; once per run, every thread's stack goes to user\log\gpu-stuck-stacks.txt.
+        static u32 stuck_windows = 0;
+        static bool dumped = false;
+        stuck_windows = (samples && busy_samples == samples && tick == window_tick)
+                            ? stuck_windows + 1
+                            : 0;
+        if (stuck_windows >= 5 && !dumped) {
+            dumped = true;
+            LOG_WARNING(Render_Vulkan, "DIAG-103: GPU work unfinished for 10 s with nothing new "
+                        "submitted (GPU tick {} of {})", work_semaphore.KnownGpuTick(),
+                        tick - 1);
+            DumpThreadStacks(L"gpu-stuck-stacks.txt");
+        }
         window_start = now;
         window_tick = tick;
         samples = 0;

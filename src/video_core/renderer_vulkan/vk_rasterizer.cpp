@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <filesystem>
 #include <map>
 #include <deque>
 #include <fstream>
@@ -1151,11 +1152,11 @@ void Rasterizer::TraceImageDependencies(VideoCore::ImageId source_id) {
     std::unordered_map<u64, DiagImageRef> images;
     std::unordered_map<u64, u32> image_depth{{source.image_uid, 0}};
     constexpr size_t MaxProducersPerImage = 400;
-    constexpr size_t MaxProducers = 6000;
+    constexpr size_t MaxProducers = 12000;
     for (size_t q = 0; q < queue.size() && producers.size() < MaxProducers; ++q) {
         const auto [uid, before, depth] = queue[q];
         size_t found = 0;
-        for (size_t i = before; i-- > 0 && found < MaxProducersPerImage;) {
+        for (size_t i = before; i-- > 0 && found < (depth == 0 ? size_t{3000} : MaxProducersPerImage);) {
             const auto& record = g_diag_history[i];
             const bool writes = std::ranges::any_of(record.images, [&](const DiagImageRef& ref) {
                 return ref.uid == uid && ref.role != DiagRole::Sampled;
@@ -1458,6 +1459,74 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     // DIAG-043: kept in memory and written out (with image dumps) when the thumbnail is drawn.
     bool dump_thumbnail_chain = false;
     RecordDiagHistory(pipeline, false, regs.num_indices);
+    // DIAG-104 (with SHADGT_DIAG_HISTORY=1): while user\log\trace-frame exists, the next whole
+    // frame drawn into a display buffer is traced: every draw it came from, how each picture got
+    // its contents, and the pictures dumped to user\log (dep frame_*.bin). For GT Sport's pink
+    // effect rectangles.
+    if (DiagHistoryEnabled()) {
+        // Also on its own: every 10th frame, 4 points of the finished frame are read, and a frame
+        // with the pink rectangles (magenta where they always appear) is traced, at most once
+        // per 15 s and 6 times per run. Traces are numbered (frame1, frame2, ...).
+        static auto last_check = std::chrono::steady_clock::time_point{};
+        static auto last_trace = std::chrono::steady_clock::time_point{};
+        static bool asked = false;
+        static u32 traces = 0;
+        static u32 frames = 0;
+        static VideoCore::ImageId pending{};
+        const auto now = std::chrono::steady_clock::now();
+        const auto trigger = Common::FS::GetUserPath(Common::FS::PathType::LogDir) / "trace-frame";
+        if (!asked && now - last_check > std::chrono::milliseconds{500}) {
+            last_check = now;
+            std::error_code ec;
+            asked = std::filesystem::exists(trigger, ec);
+        }
+        const auto rt = cb_descs[0].image_id;
+        if (rt) {
+            const auto& info = texture_cache.GetImage(rt).info;
+            const bool display = info.pixel_format == vk::Format::eA2B10G10R10UnormPack32 &&
+                                 info.size.width >= 1280;
+            if (display && pending && pending != rt) {
+                bool pink = false;
+                if (!asked && traces < 6 && ++frames % 10 == 0 &&
+                    now - last_trace > std::chrono::seconds{15}) {
+                    const auto& pinfo = texture_cache.GetImage(pending).info;
+                    const u32 w = pinfo.size.width;
+                    const u32 h = pinfo.size.height;
+                    const std::array<std::pair<u32, u32>, 4> points{{{w / 10, h * 93 / 100},
+                                                                     {w / 2, h * 93 / 100},
+                                                                     {w * 9 / 10, h * 93 / 100},
+                                                                     {w * 9 / 10, h * 70 / 100}}};
+                    std::array<u32, 4> texels{};
+                    u32 magenta = 0;
+                    if (texture_cache.ReadTexels32(pending, points, texels)) {
+                        for (const u32 t : texels) {
+                            const u32 c0 = t & 1023;
+                            const u32 c1 = (t >> 10) & 1023;
+                            const u32 c2 = (t >> 20) & 1023;
+                            magenta += c0 > 800 && c2 > 800 && c1 < 300;
+                        }
+                    }
+                    pink = magenta >= 2;
+                }
+                if (asked || pink) {
+                    ++traces;
+                    last_trace = now;
+                    diag_trace_tag = fmt::format("frame{}", traces);
+                    LOG_WARNING(Render_Vulkan, "DIAG-104: tracing frame ({})",
+                                pink ? "pink seen" : "asked");
+                    TraceImageDependencies(pending);
+                    std::error_code ec;
+                    std::filesystem::remove(trigger, ec);
+                    asked = false;
+                    pending = {};
+                } else {
+                    pending = rt;
+                }
+            } else if (display) {
+                pending = rt;
+            }
+        }
+    }
     // DIAG-045: GT Sport accumulates the thumbnail's car frames into a 1600x900 target; trace the
     // frame being added while the images it was made from are still alive.
     {
@@ -2528,6 +2597,29 @@ bool Rasterizer::IsComputeMetaClear(const Pipeline* pipeline) {
         for (const auto& desc : info.buffers) {
             const VAddr address = desc.GetSharp(info).base_address;
             if (!desc.IsSpecial() && desc.is_written && texture_cache.ClearMeta(address)) {
+                // FIX-103: GT Sport reuses memory between frames' passes, so a CMASK address of
+                // one pass can be a color picture's memory in another. When the written range
+                // holds a picture, the dispatch is the game clearing that picture: run it.
+                // Skipping it left a 16 KB block of an effect picture uncleared, and its stale
+                // invalid numbers became the pink and black rectangles of dust, smoke and rain.
+                const auto sharp = desc.GetSharp(info);
+                if (buffer_cache.HasGpuImageAlias(address, std::max<u64>(sharp.GetSize(), 4))) {
+                    if (DiagHistoryEnabled()) {
+                        static std::atomic<u32> logged{};
+                        if (logged++ < 3000) {
+                            LOG_WARNING(Render_Vulkan,
+                                        "DIAG-105: compute clear {:#x}+{:#x} kept (holds a "
+                                        "picture)", address, sharp.GetSize());
+                        }
+                    }
+                    return false;
+                }
+                if (DiagHistoryEnabled()) {
+                    static std::atomic<u32> logged{};
+                    if (logged++ < 3000) {
+                        LOG_WARNING(Render_Vulkan, "DIAG-105: compute meta clear {:#x}", address);
+                    }
+                }
                 // Assume all slices were updates
                 LOG_TRACE(Render_Vulkan, "Metadata update skipped");
                 return true;
@@ -3586,6 +3678,25 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         const auto& col_buf = regs.color_buffers[cb];
         const bool is_clear = texture_cache.IsMetaCleared(col_buf.CmaskAddress(), slice);
         texture_cache.TouchMeta(col_buf.CmaskAddress(), slice, false);
+        if (DiagHistoryEnabled() && image->info.size.width >= 128 &&
+            (image->info.pixel_format == vk::Format::eR16G16B16A16Sfloat ||
+             image->info.pixel_format == vk::Format::eB10G11R11UfloatPack32 ||
+             image->info.pixel_format == vk::Format::eR16Sfloat)) {
+            // DIAG-105: the first draws into each float render target: whether its CMASK said
+            // cleared, for GT Sport's pink effect rectangles.
+            static std::mutex mutex;
+            static std::unordered_map<u64, u32> seen;
+            std::scoped_lock lock{mutex};
+            if (seen.size() < 20000 && seen[image->image_uid]++ < 2) {
+                LOG_WARNING(Render_Vulkan,
+                            "DIAG-105: uid {} {:#x} {}x{} {} cmask {:#x} fast clear {} "
+                            "clear {} cleared {} ver {}",
+                            image->image_uid, image->info.guest_address, image->info.size.width,
+                            image->info.size.height, vk::to_string(image->info.pixel_format),
+                            col_buf.CmaskAddress(), bool(col_buf.info.fast_clear),
+                            is_clear, seen[image->image_uid], image->contents_version);
+            }
+        }
 
         if (image->binding.is_bound) {
             ASSERT_MSG(!image->binding.force_general,
@@ -3748,7 +3859,15 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
     ASSERT_MSG(address % 4 == 0 && num_bytes % 4 == 0,
                "FillBuffer address and size must be a multiple of 4 bytes");
     if (!is_gds) {
-        texture_cache.ClearMeta(address);
+        const bool meta = texture_cache.ClearMeta(address);
+        if (DiagHistoryEnabled()) {
+            // DIAG-105: fills, and whether they cleared a known CMASK/HTILE.
+            static std::atomic<u32> logged{};
+            if (logged++ < 3000) {
+                LOG_WARNING(Render_Vulkan, "DIAG-105: fill {:#x}+{:#x} value {:#x} meta {}",
+                            address, num_bytes, value, meta);
+            }
+        }
         const bool cpu_path = !buffer_cache.IsRegionGpuModified(address, num_bytes) &&
                               !buffer_cache.HasGpuImageAlias(address, num_bytes);
         if (cpu_path) {

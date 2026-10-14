@@ -72,6 +72,8 @@ struct PrecompileProgress {
 PrecompileProgress GetPrecompileProgress();
 /// PERF-102: the game waits on the splash screen for the precompile.
 bool PrecompileHoldsGame();
+/// PERF-103: the game runs in slow motion while pipelines it needs are compiled.
+bool CompileSlowMotion();
 
 class PipelineCache {
 public:

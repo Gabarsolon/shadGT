@@ -181,7 +181,7 @@ void DrawCompileNotice() {
     static Clock::time_point paused_since{};
     static Clock::time_point last_paused{};
     const auto now = Clock::now();
-    if (Common::GuestClock::IsPaused()) {
+    if (Common::GuestClock::IsPaused() || Vulkan::CompileSlowMotion()) {
         if (paused_since == Clock::time_point{} || now - last_paused > std::chrono::milliseconds{300}) {
             paused_since = now;
         }

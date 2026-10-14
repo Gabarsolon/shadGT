@@ -6,6 +6,9 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
+#ifdef RYTY_GPU
+#include "core/libraries/system/systemservice.h"
+#endif
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -71,8 +74,14 @@ void Swapchain::Create(u32 width_, u32 height_) {
     };
 
 #ifdef RYTY_GPU
+    // FIX-102: frame generation starts once the splash screen is gone. With it on during the
+    // splash precompile, its presenter thread and the window thread deadlocked inside the NVIDIA
+    // driver (the presenter held the driver lock while DWM waited on a window message, the window
+    // thread waited for the lock), and every pipeline build then waited for that lock too.
+    framegen_deferred =
+        RytyFrameGen::Requested() && Libraries::SystemService::IsSplashVisible();
     // ryGT: FSR 3.1 frame generation makes the swapchain when it is on.
-    if (!framegen.CreateSwapchain(instance, swapchain_info, swapchain))
+    if (framegen_deferred || !framegen.CreateSwapchain(instance, swapchain_info, swapchain))
 #endif
     {
         auto [swapchain_result, chain] = instance.GetDevice().createSwapchainKHR(swapchain_info);
@@ -84,6 +93,12 @@ void Swapchain::Create(u32 width_, u32 height_) {
     SetupImages();
     RefreshSemaphores();
 }
+
+#ifdef RYTY_GPU
+bool Swapchain::FrameGenStartDue() const {
+    return framegen_deferred && !Libraries::SystemService::IsSplashVisible();
+}
+#endif
 
 void Swapchain::Recreate(u32 width_, u32 height_) {
     LOG_DEBUG(Render_Vulkan, "Recreate the swapchain: width={} height={} HDR={}", width_, height_,

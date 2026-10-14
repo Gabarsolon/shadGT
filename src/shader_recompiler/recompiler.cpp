@@ -133,6 +133,22 @@ bool HasLaneReadsAndLoop(std::span<const u32> code) {
     return lane_reads && loop;
 }
 
+bool HasLegacyMad(std::span<const u32> code) {
+    using namespace Gcn;
+    Gcn::GcnCodeSlice slice(code.data(), code.data() + code.size());
+    Gcn::GcnDecodeContext decoder;
+    while (!slice.atEnd()) {
+        const GcnInst inst = decoder.decodeInstruction(slice);
+        if (inst.opcode == Opcode::V_MAD_LEGACY_F32 || inst.opcode == Opcode::V_MAC_LEGACY_F32) {
+            return true;
+        }
+        if (inst.opcode == Opcode::S_ENDPGM) {
+            break;
+        }
+    }
+    return false;
+}
+
 bool HasEmptyScopeBeforeElse(std::span<const u32> code) {
     using namespace Gcn;
     Gcn::GcnCodeSlice slice(code.data(), code.data() + code.size());

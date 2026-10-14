@@ -70,6 +70,9 @@ struct RytyPadOutputState {
 // "r2on"/"r2off" hold the accelerator (R2, fully pressed) until released.
 std::atomic<std::uint32_t> g_scripted_buttons{0};
 std::atomic<bool> g_scripted_r2{false};
+// "steerN" holds the left stick's X axis at N (0 full left, 128 centre, 255 full right) until
+// "steeroff".
+std::atomic<int> g_scripted_lx{-1};
 
 std::uint32_t ButtonFromName(std::string_view name) {
     using B = Libraries::Pad::OrbisPadButtonDataOffset;
@@ -97,6 +100,9 @@ void RunTestScript(std::string script) {
         std::this_thread::sleep_until(start + std::chrono::milliseconds(static_cast<long long>(at * 1000)));
         if (action == "r2on" || action == "r2off") {
             g_scripted_r2 = action == "r2on";
+            LOG_INFO(Input, "Ryty test script: {} at {} s", action, at);
+        } else if (action.starts_with("steer")) {
+            g_scripted_lx = action == "steeroff" ? -1 : std::stoi(action.substr(5));
             LOG_INFO(Input, "Ryty test script: {} at {} s", action, at);
         } else if (action == "shot") {
             VideoCore::RequestScreenshot(VideoCore::ScreenshotRequest::GameOnly);
@@ -180,6 +186,9 @@ void ForwardInput() {
                         ClampAxis(state.axes[3])};
         input.analogButtonsL2 = ClampAxis(state.axes[4]);
         input.analogButtonsR2 = ClampAxis(state.axes[5]);
+        if (const int lx = g_scripted_lx.load(); lx >= 0) {
+            input.sticks[0] = static_cast<std::uint8_t>(lx);
+        }
         if (g_scripted_r2) {
             input.buttons |= static_cast<std::uint32_t>(Libraries::Pad::OrbisPadButtonDataOffset::R2);
             input.analogButtonsR2 = 255;

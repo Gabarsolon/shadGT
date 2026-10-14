@@ -31,6 +31,11 @@ public:
     /// Recreates the swapchain with a given size and current surface.
     void Recreate(u32 width, u32 height);
 
+#ifdef RYTY_GPU
+    /// FIX-102: frame generation is on and waited for the splash screen, which is now gone.
+    bool FrameGenStartDue() const;
+#endif
+
     /// Acquires the next image in the swapchain.
     bool AcquireNextImage();
 
@@ -146,6 +151,7 @@ private:
     bool supports_hdr = false; // SC supports HDR output
 #ifdef RYTY_GPU
     RytyFrameGen::FrameGen framegen; // ryGT: FSR 3.1 frame generation's swapchain when on
+    bool framegen_deferred = false;  // FIX-102: on, but waiting for the splash screen to end
 #endif
 };
 

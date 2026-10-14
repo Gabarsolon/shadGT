@@ -39,6 +39,10 @@ struct Pools {
 /// in compute shaders with more than 32 invocations per workgroup.
 [[nodiscard]] bool HasLaneReadsAndLoop(std::span<const u32> code);
 
+/// FIX-101: true when the code uses V_MAD_LEGACY_F32 or V_MAC_LEGACY_F32, whose translations
+/// before FIX-101 made NaN from 0 * Inf.
+[[nodiscard]] bool HasLegacyMad(std::span<const u32> code);
+
 /// DIAG-031: a readable listing of GCN code (pc, opcode, operands, memory offsets).
 [[nodiscard]] std::string ListGcnCode(std::span<const u32> code);
 

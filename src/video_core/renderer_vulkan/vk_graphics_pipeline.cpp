@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <algorithm>
+#include <filesystem>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
@@ -35,6 +36,44 @@
 #endif
 
 namespace Vulkan {
+
+#ifdef _WIN32
+// DIAG-100: every thread's stack to user\log\<file_name> (tools\stackdump.exe next to
+// GTSport.exe), for a build or the GPU stuck for long.
+void DumpThreadStacks(const wchar_t* file_name) {
+    wchar_t exe[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    const std::filesystem::path dir = std::filesystem::path{exe}.parent_path();
+    const auto tool = dir / "tools" / "stackdump.exe";
+    if (!std::filesystem::exists(tool)) {
+        return;
+    }
+    const auto out = dir / "user" / "log" / file_name;
+    std::wstring command =
+        L"\"" + tool.wstring() + L"\" " + std::to_wstring(GetCurrentProcessId()) + L" 512";
+    SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
+    HANDLE file = CreateFileW(out.c_str(), GENERIC_WRITE, FILE_SHARE_READ, &sa, CREATE_ALWAYS,
+                              FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    STARTUPINFOW si{sizeof(si)};
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = file;
+    si.hStdError = file;
+    PROCESS_INFORMATION pi{};
+    if (CreateProcessW(nullptr, command.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr,
+                       nullptr, &si, &pi)) {
+        WaitForSingleObject(pi.hProcess, 30000);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        LOG_WARNING(Render_Vulkan, "DIAG-100: thread stacks written to {}", out.string());
+    }
+    CloseHandle(file);
+}
+#else
+void DumpThreadStacks(const wchar_t*) {}
+#endif
 
 namespace {
 
@@ -119,6 +158,17 @@ private:
                             "or more; {} MB committed", long_running, state.running.size(),
                             CommittedMb());
             }
+#ifdef _WIN32
+            // DIAG-100: a creation stuck for 30 s: once per run, every thread's stack goes to
+            // user\log\stuck-stacks.txt (tools\stackdump.exe next to GTSport.exe).
+            static bool dumped = false;
+            const bool stuck = std::ranges::any_of(
+                state.running, [](const auto& entry) { return Seconds(entry.second.start) >= 30.0; });
+            if (stuck && !dumped) {
+                dumped = true;
+                DumpThreadStacks(L"stuck-stacks.txt");
+            }
+#endif
         }
     }
 

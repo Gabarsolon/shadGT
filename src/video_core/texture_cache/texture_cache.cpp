@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstring>
+#include <boost/container/small_vector.hpp>
 #include <atomic>
 #include <chrono>
 #include <limits>
@@ -121,6 +123,40 @@ bool TextureCache::DumpImage(ImageId image_id, const std::filesystem::path& path
         std::fwrite(download.mapped, 1, size, file);
         std::fclose(file);
     }
+    return true;
+}
+
+bool TextureCache::ReadTexels32(ImageId image_id, std::span<const std::pair<u32, u32>> points,
+                                std::span<u32> out) {
+    Image& image = slot_images[image_id];
+    if (image.info.props.is_depth || image.info.props.is_block || image.info.num_bits != 32 ||
+        points.size() > out.size() || points.empty()) {
+        return false;
+    }
+    const auto download =
+        runtime.GetStagingPool().Request(u32(points.size() * 4), MemoryType::HostCached, 16);
+    boost::container::small_vector<vk::BufferImageCopy, 8> copies;
+    for (size_t i = 0; i < points.size(); ++i) {
+        const auto [x, y] = points[i];
+        if (x >= image.info.size.width || y >= image.info.size.height) {
+            return false;
+        }
+        copies.push_back({
+            .bufferOffset = download.offset + i * 4,
+            .bufferRowLength = 1,
+            .bufferImageHeight = 1,
+            .imageSubresource = {.aspectMask = vk::ImageAspectFlagBits::eColor,
+                                 .mipLevel = 0,
+                                 .baseArrayLayer = 0,
+                                 .layerCount = 1},
+            .imageOffset = {s32(x), s32(y), 0},
+            .imageExtent = {1, 1, 1},
+        });
+    }
+    runtime.DownloadImage(&image, download.buffer, std::span{copies.data(), copies.size()});
+    scheduler.Finish();
+    download.Invalidate();
+    std::memcpy(out.data(), download.mapped, points.size() * 4);
     return true;
 }
 
@@ -979,7 +1015,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
                         (u64(info.size.height) << 20) ^ (u64(found.info.size.height) << 52) ^
                         (u64(desc.type) << 60) ^ u64(found.info.pitch) * 0x9e3779b97f4a7c15ull;
         std::scoped_lock lock{log_mutex};
-        if (logged.size() < 4000 && logged.insert(key).second) {
+        if (logged.size() < 30000 && logged.insert(key).second) {
             LOG_WARNING(Render_Vulkan,
                         "DIAG-074: lookup {:#x} {}x{}x{} pitch {} mips {} layers {} {} tile {} "
                         "array {} bind {} -> image {} at {:#x} {}x{}x{} pitch {} mips {} {} tile {} "

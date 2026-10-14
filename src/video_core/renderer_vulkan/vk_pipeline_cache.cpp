@@ -166,6 +166,46 @@ static void ReleasePrecompileHold() {
     }
 }
 
+// PERF-103: compile slow motion. While draws are skipped because their pipeline is still being
+// built, the guest clocks run at a quarter speed: held 3 ms of every 4 (no vblank passes while
+// held, so the game's frame rate drops with it), so a long compile looks like slow motion.
+static std::atomic<s64> g_last_skip_ns{};
+
+static u32 CompileMode() {
+#ifdef RYTY_GPU
+    static const u32 mode = static_cast<u32>(std::clamp(EmulatorSettings.GetCompileMode(), 0, 2));
+    return mode;
+#else
+    return 2;
+#endif
+}
+
+static void NoteSkippedDraw() {
+    g_last_skip_ns.store(std::chrono::steady_clock::now().time_since_epoch().count(),
+                         std::memory_order_relaxed);
+}
+
+bool CompileSlowMotion() {
+    const s64 last = g_last_skip_ns.load(std::memory_order_relaxed);
+    return CompileMode() == 1 && last != 0 &&
+           std::chrono::steady_clock::now().time_since_epoch().count() - last < 50'000'000;
+}
+
+static void SlowMotionThread(std::stop_token stop) {
+    Common::SetCurrentThreadName("shadGT:CompileSlowMotion");
+    using namespace std::chrono_literals;
+    while (!stop.stop_requested()) {
+        if (!CompileSlowMotion()) {
+            std::this_thread::sleep_for(5ms);
+            continue;
+        }
+        Common::GuestClock::TakeHold();
+        std::this_thread::sleep_for(3ms);
+        Common::GuestClock::ReleaseHold();
+        std::this_thread::sleep_for(1ms);
+    }
+}
+
 PrecompileProgress GetPrecompileProgress() {
     const u64 total = g_precompile_total.load(std::memory_order_relaxed);
     const u64 done = std::min(total, g_precompile_done.load(std::memory_order_relaxed));
@@ -634,6 +674,9 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                 }
             }
         }
+    }
+    if (CompileMode() == 1 && AsyncPipelines()) {
+        static std::jthread slow_motion{SlowMotionThread}; // PERF-103
     }
     // FIX-078: a quarter of the hardware threads (at least 2) translate read-ahead shaders.
     if (Common::PerfFeatureEnabled(102)) {
@@ -1265,6 +1308,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
                 // PERF-076: still building; this draw is skipped, the next ones look again.
                 graphics_pipelines.erase(it);
                 ++async_stats.skipped_draws;
+                NoteSkippedDraw(); // PERF-103
                 return nullptr;
             }
             if (CancelBuild(*stored)) {
@@ -1311,6 +1355,8 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         // draws that need it are skipped until it is done (a frame or two of a missing object),
         // and the game does not stall for the 60-140 ms a build takes. SHADGT_ASYNC_PIPELINES=0
         // or -DisablePerf 76 waits as before.
+        // PERF-103: in slow-motion mode every new pipeline goes on in the background at once
+        // and the game goes on in slow motion until it is built.
         if (build && AsyncPipelines() && !WritesMemory(infos) && !NeverSkipped(infos) &&
             build->done.wait_for(std::chrono::seconds{0}) != std::future_status::ready) {
             build->async = true;
@@ -1318,6 +1364,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
             graphics_pipelines.erase(it);
             ++async_stats.deferred;
             ++async_stats.skipped_draws;
+            NoteSkippedDraw(); // PERF-103
             return nullptr;
         }
         if (build) {
@@ -2234,7 +2281,9 @@ bool PipelineCache::AsyncPipelines() {
 #ifdef RYTY_GPU
         // PERF-100: GPU.compile_freeze (on by default) pauses the game while a new pipeline
         // compiles instead of skipping its draws.
-        const bool by_default = !EmulatorSettings.IsCompileFreeze();
+        // PERF-103: GPU.compile_mode 0 (pause) waits; slow motion and keep going build in
+        // the background.
+        const bool by_default = CompileMode() != 0;
 #else
         const bool by_default = false;
 #endif
@@ -2861,6 +2910,11 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     u32 needed_fixes = 0;
     if (first_use) {
         needed_fixes |= Shader::HasEmptyScopeBeforeElse(params.code) ? 1u : 0u;
+        if (Shader::HasLegacyMad(params.code)) {
+            needed_fixes |= 16u; // FIX-101
+            LOG_INFO(Render_Vulkan, "FIX-101: {}_{:#x} uses legacy multiply-add", hw_stage,
+                     params.hash);
+        }
         const auto& wg = runtime_info.hw.cs.workgroup_size;
         if (hw_stage == HwStage::Compute && profile.subgroup_size < 64 &&
             wg[0] * wg[1] * wg[2] > 32 && Common::PerfFeatureEnabled(31) &&

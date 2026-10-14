@@ -24,6 +24,9 @@ class VkCtxScope;
 
 namespace Vulkan {
 
+/// DIAG-100: every thread's stack to user\log\<file_name>, if tools\stackdump.exe is there.
+void DumpThreadStacks(const wchar_t* file_name);
+
 class Instance;
 
 struct RenderAttachment {

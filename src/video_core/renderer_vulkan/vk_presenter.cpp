@@ -936,6 +936,16 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         }
     };
 
+#ifdef RYTY_GPU
+    if (swapchain.FrameGenStartDue()) {
+        // FIX-102: frame generation's swapchain takes over the graphics queue, so nothing may be
+        // submitted to it or running on it while it is made.
+        std::scoped_lock submit_lock{Scheduler::submit_mutex};
+        (void)instance.GetGraphicsQueue().waitIdle();
+        LOG_INFO(Render_Vulkan, "FIX-102: splash screen gone, starting frame generation");
+        swapchain.Recreate(window.GetWidth(), window.GetHeight());
+    }
+#endif
     // Recreate the swapchain if the window was resized.
     if (window.GetWidth() != swapchain.GetWidth() || window.GetHeight() != swapchain.GetHeight()) {
         swapchain.Recreate(window.GetWidth(), window.GetHeight());
