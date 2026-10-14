@@ -378,6 +378,76 @@ void InstallLewisChallenge(u8* base) {
                  reinterpret_cast<void*>(&KeyValueLookupHook), "GTS-002 Lewis Hamilton Challenge");
 }
 
+// GTS-003: the Livery Editor offline. The main menu (gtmode.ad, setupDisplay) disables the Livery
+// button whenever the game is offline (`disable: [!enable_menu || DisableLivery]`, enable_menu =
+// online), although the editor itself has an offline mode that saves liveries locally. The menu
+// script is patched while the game reads it: that one condition uses completed_playgo (true once the
+// game is installed) instead of enable_menu, like the Garage button. The bytes are only changed
+// where the whole original sequence (78 bytes of v1.69's GTMODE.ADC) is found in one 4 KB read.
+// RYGT_LIVERY=0 turns this off.
+struct ScriptPatch {
+    const char* name;
+    std::vector<u8> original;
+    size_t offset; // of `replacement` inside `original`
+    std::vector<u8> replacement;
+};
+std::vector<ScriptPatch> g_script_patches;
+
+struct GuestIoVec {
+    u8* base;
+    u64 length;
+};
+// The game's file read (eboot 0x1be7930); its buffered streams refill 4 KB at a time from these
+// three calls, which is how scripts are read.
+constexpr u64 kFileRead = 0x1be7930;
+constexpr u64 kStreamRefillCalls[] = {0x17626ef, 0x170f88e, 0x1762a38};
+using FileReadFn = s64(PS4_SYSV_ABI*)(void*, GuestIoVec*);
+FileReadFn g_file_read = nullptr;
+
+s64 PS4_SYSV_ABI StreamRefillHook(void* file, GuestIoVec* iov) {
+    const s64 read = g_file_read(file, iov);
+    if (read <= 0 || !iov || !iov->base) {
+        return read;
+    }
+    u8* const begin = iov->base;
+    u8* const end = begin + read;
+    for (const auto& patch : g_script_patches) {
+        u8* found = std::search(begin, end, patch.original.begin(), patch.original.end());
+        if (found != end) {
+            std::memcpy(found + patch.offset, patch.replacement.data(), patch.replacement.size());
+            std::fprintf(stderr, "[patch] %s applied to the menu script\n", patch.name);
+        }
+    }
+    return read;
+}
+
+void InstallScriptPatches(u8* base) {
+    const char* livery = std::getenv("RYGT_LIVERY");
+    if (!(livery && livery[0] == '0')) {
+        // STRING_CONST 'disable', ARRAY_CONST 1, VARIABLE_EVAL enable_menu [7], UNARY_OPERATOR
+        // __not__, LOGICAL_OR, VARIABLE_EVAL VariableManager.get, STRING_CONST
+        // 'GameDemo::DisableLivery', CALL 1. enable_menu [7] becomes completed_playgo [2].
+        g_script_patches.push_back(
+            {"GTS-003 Livery Editor offline",
+             ParseHex("940200001d811e940200003201000000940200002601000000811c070000009402000022160000"
+                      "0000407001000094020000260300000076777800000000940200001d8142940200000601000000"),
+             25, ParseHex("811302000000")});
+    }
+    if (g_script_patches.empty()) {
+        return;
+    }
+    u8* stubs = AllocNear(base);
+    if (!stubs) {
+        std::fprintf(stderr, "[patch] GTS-003: no memory near the game's code for the hooks\n");
+        return;
+    }
+    g_file_read = reinterpret_cast<FileReadFn>(base + kFileRead + kTextRvaShift);
+    for (size_t i = 0; i < std::size(kStreamRefillCalls); ++i) {
+        RedirectCall(base, stubs + i * 16, kStreamRefillCalls[i], kFileRead,
+                     reinterpret_cast<void*>(&StreamRefillHook), "GTS-003 script reads");
+    }
+}
+
 void InstallMiscHooks(u8* base) {
     const char* diag = std::getenv("RYGT_ENV_DIAG");
     const char* scale = std::getenv("RYGT_ENV_SCALE");
@@ -442,6 +512,7 @@ void InstallMiscHooks(u8* base) {
 void RytyApplyGamePatches() {
     InstallMiscHooks(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallLewisChallenge(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
+    InstallScriptPatches(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     auto* base = reinterpret_cast<u8*>(GetModuleHandleA(nullptr));
     char buffer[4096];
     const DWORD length = GetEnvironmentVariableA("RYGT_PATCH", buffer, sizeof(buffer));
