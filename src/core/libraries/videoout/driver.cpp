@@ -338,11 +338,13 @@ void VideoOutDriver::DrawBlankFrame() {
     presenter->Present(empty_frame, false, false);
 }
 
-void VideoOutDriver::DrawLastFrame() {
+bool VideoOutDriver::DrawLastFrame() {
     const auto frame = presenter->PrepareLastFrame();
     if (frame != nullptr) {
         presenter->Present(frame, true);
+        return true;
     }
+    return false;
 }
 
 bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
@@ -427,7 +429,9 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             // shown again, with the compile notice drawn over it (PERF-102: or the splash
             // screen, before the game's first frame).
             if (timer.GetTotalWait().count() < 0) {
-                if (!main_port.is_open) {
+                // Before the game's first frame a blank frame, which shows the splash screen
+                // and the precompile bar; after it the last frame (skipped while it is taken).
+                if (!main_port.is_open || !presenter->HasLastFrame()) {
                     DrawBlankFrame();
                 } else {
                     DrawLastFrame();

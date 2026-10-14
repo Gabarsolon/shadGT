@@ -139,7 +139,15 @@ private:
     vk::UniqueCommandPool command_pool;
     std::vector<Frame> present_frames;
     std::queue<Frame*> free_queue;
-    Frame* last_submit_frame;
+    Frame* last_submit_frame{};
+
+public:
+    /// True once a frame has been shown (it can be shown again).
+    bool HasLastFrame() const {
+        return last_submit_frame != nullptr;
+    }
+
+private:
     /// PERF-100: the last frame shown again, taken out of the free queue meanwhile, so the GPU
     /// thread cannot take it for a new frame (and reset its fence) while it is redrawn.
     Frame* reusing_frame{};
