@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <deque>
+
 #include "common/recycling_pool.h"
 
 #include <optional>
@@ -158,6 +160,7 @@ public:
         u64 labels_pushed{}; // and the ones pushed by then
         bool vertices{};     // MT-004: the vertex buffers lead the entries
         bool index{};        // MT-005: then the index buffer
+        u64 seq{};           // MT-007: the stage's number for the job
     };
     /// PERF-067 (buffer stage thread): obtains what it can of the selected draw's shader
     /// buffers. False when it stopped early (the recorder obtains the rest, and must have
@@ -166,6 +169,10 @@ public:
                              VAddr index_address = 0, u32 index_bytes = 0);
     /// PERF-067 (recorder): around the draw the plan was made for.
     void SetBufferPlan(BufferPlan* plan) {
+        if (!plan && buffer_plan && buffer_plan->seq) {
+            // MT-007: this job's writes are registered now.
+            recorded_seq.store(buffer_plan->seq, std::memory_order_release);
+        }
         buffer_plan = plan;
     }
 
@@ -393,6 +400,16 @@ private:
     std::atomic<u64> guards_dropped{};
     // PERF-067
     BufferPlan* buffer_plan{};
+    /// MT-007 (buffer stage thread): ranges the planned jobs not recorded yet write. A later
+    /// job's read over one is left to the recorder, so the stage does not wait after them.
+    struct PendingWrite {
+        u64 seq;
+        VAddr begin;
+        VAddr end;
+    };
+    std::deque<PendingWrite> pending_writes;
+    u64 stage_seq{};
+    std::atomic<u64> recorded_seq{};
     std::array<std::atomic<u64>, 4> plan_refusals{};
     std::optional<std::pair<const VideoCore::Buffer*, u64>> TakePlannedBuffer(VAddr address,
                                                                                u32 size,

@@ -611,6 +611,24 @@ bool Rasterizer::PrepareBuffersAhead(const SelectedPipeline& selected, BufferPla
     plan.generation = texture_cache.RegistryGeneration();
     plan.labels_done = liverpool->LabelsDone(); // PERF-082
     plan.labels_pushed = liverpool->LabelsPushed();
+    // MT-007: reads over a range an earlier planned job writes are left to the recorder.
+    static const bool track_writes = Common::PerfFeatureEnabled(129);
+    if (track_writes) {
+        plan.seq = ++stage_seq;
+        const u64 recorded = recorded_seq.load(std::memory_order_acquire);
+        while (!pending_writes.empty() && pending_writes.front().seq <= recorded) {
+            pending_writes.pop_front();
+        }
+    }
+    const auto pending_overlap = [&](VAddr begin, u64 size) {
+        for (const auto& write : pending_writes) {
+            if (write.begin < begin + size && begin < write.end) {
+                return true;
+            }
+        }
+        return false;
+    };
+    boost::container::small_vector<PendingWrite, 4> job_writes;
     // MT-004: the vertex buffers too, merged as BindVertexBuffers merges them (it takes these
     // entries first). Quad lists refresh their pages first and are left to the recorder.
     static const bool plan_vertices = Common::PerfFeatureEnabled(126);
@@ -660,6 +678,10 @@ bool Rasterizer::PrepareBuffersAhead(const SelectedPipeline& selected, BufferPla
             for (const auto& range : merged) {
                 const u32 size =
                     static_cast<u32>(memory->ClampRangeSize(range.begin, range.end - range.begin));
+                if (track_writes && pending_overlap(range.begin, size)) {
+                    plan.entries.push_back({range.begin, 0, false, false, nullptr, 0, false});
+                    continue;
+                }
                 bool overlapped = false;
                 const auto result = buffer_cache.ObtainBufferAhead(
                     range.begin, size, false, false, plan.uploads, &overlapped);
@@ -677,15 +699,20 @@ bool Rasterizer::PrepareBuffersAhead(const SelectedPipeline& selected, BufferPla
     if (plan_index && index_bytes != 0 && index_address != 0 && !selected.is_compute &&
         !selected.is_quad_list) {
         bool overlapped = false;
-        const auto result = buffer_cache.ObtainBufferAhead(index_address, index_bytes, false,
-                                                           false, plan.uploads, &overlapped);
-        if (!result) {
-            ++plan_refusals[2];
-            return false;
+        if (track_writes && pending_overlap(index_address, index_bytes)) {
+            plan.entries.push_back({index_address, 0, false, false, nullptr, 0, false});
+            plan.index = true;
+        } else {
+            const auto result = buffer_cache.ObtainBufferAhead(
+                index_address, index_bytes, false, false, plan.uploads, &overlapped);
+            if (!result) {
+                ++plan_refusals[2];
+                return false;
+            }
+            plan.entries.push_back({index_address, index_bytes, false, false, result->first,
+                                    result->second, overlapped});
+            plan.index = true;
         }
-        plan.entries.push_back(
-            {index_address, index_bytes, false, false, result->first, result->second, overlapped});
-        plan.index = true;
     }
     struct FlatView {
         const std::vector<u32>& flattened_ud_buf;
@@ -693,6 +720,7 @@ bool Rasterizer::PrepareBuffersAhead(const SelectedPipeline& selected, BufferPla
     };
     static const bool null_impossible = Common::PerfFeatureEnabled(39);
     constexpr u64 GpuAddressLimit = 1ULL << 40;
+    bool barrier_after = false;
     const auto& canonical = pipeline->CanonicalStages();
     for (u32 stage = 0; stage < Shader::MaxStageTypes; ++stage) {
         const auto& sel = selected.stages[stage];
@@ -711,13 +739,16 @@ bool Rasterizer::PrepareBuffersAhead(const SelectedPipeline& selected, BufferPla
         // without the CPU's newer bytes, and a CPU fault there wrote the GPU copy back over
         // them (cockpit shadows flickered). -DisablePerf 105 plans written buffers again.
         static const bool written_to_recorder = Common::PerfFeatureEnabled(105);
+        static const bool skip_written = Common::PerfFeatureEnabled(128);
         for (const auto& desc : info->buffers) {
             if (desc.IsSpecial()) {
                 continue;
             }
             if (written_to_recorder && desc.is_written) {
                 ++plan_refusals[3];
-                return false;
+                if (!skip_written) {
+                    return false;
+                }
             }
             if (!desc.sharp_fetch.FitsIn(sel.flattened.size())) {
                 ++plan_refusals[1];
@@ -738,6 +769,25 @@ bool Rasterizer::PrepareBuffersAhead(const SelectedPipeline& selected, BufferPla
             }
             const u32 size =
                 static_cast<u32>(memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize()));
+            if (written_to_recorder && desc.is_written) {
+                // MT-006: the buffer is left to the recorder (an entry without a buffer), the
+                // draw's other buffers are still planned, and the stage waits after the draw
+                // (MT-007: or remembers the range and goes on).
+                plan.entries.push_back(
+                    {vsharp.base_address, 0, true, desc.is_formatted, nullptr, 0, false});
+                if (track_writes) {
+                    job_writes.push_back({plan.seq, vsharp.base_address,
+                                          vsharp.base_address + size});
+                } else {
+                    barrier_after = true;
+                }
+                continue;
+            }
+            if (track_writes && pending_overlap(vsharp.base_address, size)) {
+                plan.entries.push_back(
+                    {vsharp.base_address, 0, false, desc.is_formatted, nullptr, 0, false});
+                continue;
+            }
             bool overlapped = false;
             const auto result = buffer_cache.ObtainBufferAhead(
                 vsharp.base_address, size, desc.is_written, desc.is_formatted, plan.uploads,
@@ -750,7 +800,8 @@ bool Rasterizer::PrepareBuffersAhead(const SelectedPipeline& selected, BufferPla
                                     result->first, result->second, overlapped});
         }
     }
-    return true;
+    pending_writes.insert(pending_writes.end(), job_writes.begin(), job_writes.end());
+    return !barrier_after;
 }
 
 std::optional<std::pair<const VideoCore::Buffer*, u64>> Rasterizer::TakePlannedBuffer(
@@ -760,6 +811,11 @@ std::optional<std::pair<const VideoCore::Buffer*, u64>> Rasterizer::TakePlannedB
         return std::nullopt;
     }
     const auto& entry = plan->entries[plan->next];
+    if (!entry.buffer && entry.address == address && entry.written == written &&
+        entry.texel == texel) {
+        ++plan->next; // MT-006: left to the recorder
+        return std::nullopt;
+    }
     if (entry.address != address || entry.size != size || entry.written != written ||
         entry.texel != texel) {
         // The recorder binds something else than planned: it obtains the rest itself.
