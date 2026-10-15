@@ -145,6 +145,7 @@ public:
     std::vector<std::unique_ptr<Buffer>> imported_buffers;
     std::atomic<u64> import_rejected{};
     std::atomic<u64> inplace_obtains{};
+    std::atomic<u64> ceil_skipped_syncs{}; // EXP-126
     std::atomic<u64> shared_obtains{};
 
     /// Attempts to obtain a buffer without modifying the cache contents.

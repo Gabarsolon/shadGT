@@ -2124,6 +2124,29 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferImpl(VAddr device_addr, u
     const auto* arena = GetArena(first_block, last_block);
     ArenaMemo* arena_memo = memo_lookup_slot;
     const u64 versions = memo_versions;
+    // EXP-126 (SHADGT_CEIL_ONCE_PER_SUBMIT=1, measurement only): a read-only arena range is
+    // synchronized once per graphics submission, not again in its later upload epochs: the frame
+    // rate if those reads cost nothing after the first.
+    static const bool once_per_submit = [] {
+        const char* env = std::getenv("SHADGT_CEIL_ONCE_PER_SUBMIT");
+        return env && env[0] == '1';
+    }();
+    if (once_per_submit && !is_written && !is_texel_buffer && !memo_skip_sync) {
+        static std::unordered_map<u64, u64> synced; // range -> submission
+        const u64 key = device_addr ^ (u64(size) << 40) ^ (u64(size) >> 24);
+        const u64 submit = g_gfx_submit_count.load(std::memory_order_acquire);
+        auto [it, inserted] = synced.try_emplace(key, submit);
+        if (!inserted && it->second == submit) {
+            ++ceil_skipped_syncs;
+            EnsureResident(arena, first_block, last_block);
+            memo_skip_sync = true;
+        } else {
+            it->second = submit;
+        }
+        if (synced.size() > (1u << 20)) {
+            synced.clear();
+        }
+    }
     if (!memo_skip_sync) {
         EnsureResident(arena, first_block, last_block);
         SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);

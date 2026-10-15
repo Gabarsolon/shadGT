@@ -3678,6 +3678,7 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
 
     // PERF-012: memory written before this submission must be uploaded again.
     VideoCore::BumpUploadEpoch();
+    VideoCore::g_gfx_submit_count.fetch_add(1, std::memory_order_release); // EXP-126
     {
         // DIAG-051
         const auto now = std::chrono::steady_clock::now();
