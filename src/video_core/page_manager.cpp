@@ -20,6 +20,7 @@
 #include "core/memory.h"
 #include "core/signals.h"
 #include "video_core/page_manager.h"
+#include "video_core/buffer_cache/proto_import.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
 #ifndef _WIN64
@@ -526,6 +527,23 @@ struct SignalImpl : public PageManager::Impl {
         ++Common::GetWorkCounters().protects;
         Common::GetWorkCounters().protect_bytes += size;
         RYDIAG_SCOPE(Protect, address);
+        // P2: imported guest views stay writable (the GPU faults on protected imported pages).
+        if (VideoCore::g_imported_count.load(std::memory_order_acquire) != 0) {
+            bool any_imported = false;
+            VideoCore::ForEachNotImported(address, size, [&](VAddr start, u64 length) {
+                any_imported |= start != address || length != size;
+            });
+            if (any_imported) {
+                boost::container::small_vector<std::pair<VAddr, u64>, 4> parts;
+                VideoCore::ForEachNotImported(address, size, [&](VAddr start, u64 length) {
+                    parts.emplace_back(start, length);
+                });
+                for (const auto& [start, length] : parts) {
+                    Protect(start, length, perms);
+                }
+                return;
+            }
+        }
         auto* memory = Core::Memory::Instance();
         auto& impl = memory->GetAddressSpace();
         ASSERT_MSG(perms != Core::MemoryPermission::Write,

@@ -44,6 +44,11 @@ public:
     }
 
     /// Returns the Vulkan device
+    /// P1: VK_EXT_external_memory_host is enabled.
+    bool IsExternalMemoryHostSupported() const {
+        return external_memory_host;
+    }
+
     vk::Device GetDevice() const {
         return *device;
     }
@@ -543,6 +548,7 @@ private:
     bool shader_stencil_export{};
     bool image_load_store_lod{};
     bool amd_gcn_shader{};
+    bool external_memory_host{}; // P1
     bool amd_shader_trinary_minmax{};
     bool nv_framebuffer_mixed_samples{};
     bool amd_mixed_attachment_samples{};

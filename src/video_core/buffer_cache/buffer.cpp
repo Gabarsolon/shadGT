@@ -121,6 +121,14 @@ void UniqueBuffer::Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
 }
 
 Buffer::Buffer(const Vulkan::Instance& instance, VAddr cpu_addr_, u64 size_bytes_,
+               vk::Buffer imported)
+    : cpu_addr{cpu_addr_}, size_bytes{size_bytes_}, mem_type{MemoryType::HostUncached},
+      buffer{instance.GetDevice(), instance.GetAllocator()} {
+    buffer.buffer = imported;
+    is_coherent = true;
+}
+
+Buffer::Buffer(const Vulkan::Instance& instance, VAddr cpu_addr_, u64 size_bytes_,
                MemoryType mem_type_, std::string_view debug_name)
     : cpu_addr{cpu_addr_}, size_bytes{size_bytes_}, mem_type{mem_type_},
       buffer{instance.GetDevice(), instance.GetAllocator()} {

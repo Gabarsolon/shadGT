@@ -137,6 +137,14 @@ public:
                                                                     bool is_written,
                                                                     bool is_texel_buffer);
     std::optional<bool> ImagesOverQuick(VAddr device_addr, u32 size) const;
+    /// P2
+    const Buffer* TryImportView(VAddr device_addr, u32 size);
+    std::mutex import_mutex;
+    std::unordered_set<VAddr> import_tried; // view bases
+    std::unordered_map<VAddr, std::pair<VAddr, VAddr>> view_extents; // per 2 MB block
+    std::vector<std::unique_ptr<Buffer>> imported_buffers;
+    std::atomic<u64> import_rejected{};
+    std::atomic<u64> inplace_obtains{};
     std::atomic<u64> shared_obtains{};
 
     /// Attempts to obtain a buffer without modifying the cache contents.

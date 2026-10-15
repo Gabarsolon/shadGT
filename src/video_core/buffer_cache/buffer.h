@@ -84,6 +84,10 @@ struct Buffer {
     explicit Buffer(const Vulkan::Instance& instance, VAddr cpu_addr_, u64 size_bytes_,
                     MemoryType mem_type, std::string_view debug_name = "");
 
+    /// P2 (prototype): wraps a buffer bound to imported guest memory (not owned memory).
+    explicit Buffer(const Vulkan::Instance& instance, VAddr cpu_addr_, u64 size_bytes_,
+                    vk::Buffer imported);
+
     Buffer& operator=(const Buffer&) = delete;
     Buffer(const Buffer&) = delete;
 

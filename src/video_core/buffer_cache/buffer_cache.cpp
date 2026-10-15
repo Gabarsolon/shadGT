@@ -31,6 +31,7 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/buffer_cache.h"
+#include "video_core/buffer_cache/proto_import.h"
 #include "video_core/buffer_cache/parallel_hasher.h"
 #include "video_core/buffer_cache/memory_tracker.h"
 #include "video_core/buffer_cache/region_definitions.h"
@@ -252,6 +253,8 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     const auto device = instance.GetDevice();
     const auto reqs = device.getBufferMemoryRequirements(req_info).memoryRequirements;
     block_size = Common::AlignUp(std::max<u64>(reqs.alignment, MIN_BLOCK_SIZE), reqs.alignment);
+    LOG_WARNING(Render_Vulkan, "P3: arena sparse memory types {:#x}, alignment {:#x}, block {:#x}",
+                reqs.memoryTypeBits, reqs.alignment, block_size);
     ASSERT_MSG(std::popcount(block_size) == 1, "Sparse block size {} is not a power of 2",
                block_size);
     block_shift = std::bit_width(block_size) - 1;
@@ -1687,8 +1690,8 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
 }
 
 // DIAG-111 (with SHADGT_DIAG_OBTAIN=1): cycles spent in obtains by kind, logged with DIAG-109.
-static std::atomic<u64> g_obtain_cycles[3]{}; // stream, arena read, arena written
-static std::atomic<u64> g_obtain_counts[3]{};
+static std::atomic<u64> g_obtain_cycles[4]{}; // stream, arena read, arena written, in place (P2)
+static std::atomic<u64> g_obtain_counts[4]{};
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
                                                         bool is_written, bool is_texel_buffer) {
@@ -1699,8 +1702,32 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     if (diag_time) {
         const u64 start = __rdtsc();
         const auto result = ObtainBufferImpl(device_addr, size, is_written, is_texel_buffer);
-        const int kind = result.first == &stream_buffer ? 0 : is_written ? 2 : 1;
+        const int kind = result.first == &stream_buffer ? 0
+                         : result.first->mem_type == MemoryType::HostUncached ? 3 // P2 in place
+                         : is_written ? 2 : 1;
         g_obtain_cycles[kind] += __rdtsc() - start;
+        // DIAG-115: arena read cycles by 16 MB block (top blocks every 2 s, with DIAG-109).
+        if (kind == 1) {
+            static std::unordered_map<VAddr, std::pair<u64, u64>> by_block;
+            static auto window = std::chrono::steady_clock::now();
+            auto& entry = by_block[device_addr >> 24];
+            entry.first += __rdtsc() - start;
+            ++entry.second;
+            if (const auto now = std::chrono::steady_clock::now();
+                now - window >= std::chrono::seconds{2}) {
+                window = now;
+                std::vector<std::pair<VAddr, std::pair<u64, u64>>> top(by_block.begin(), by_block.end());
+                std::ranges::sort(top, std::greater{}, [](const auto& e) { return e.second.first; });
+                std::string text;
+                for (size_t i = 0; i < std::min<size_t>(top.size(), 10); ++i) {
+                    text += fmt::format(" {:#x}: {} Mcycles/{} (view {:#x})", top[i].first << 24,
+                                        top[i].second.first / 1000000, top[i].second.second,
+                                        GuestViewBase(top[i].first << 24));
+                }
+                LOG_WARNING(Render_Vulkan, "DIAG-115: arena reads by 16 MB block:{}", text);
+                by_block.clear();
+            }
+        }
         ++g_obtain_counts[kind];
         return result;
     }
@@ -1826,8 +1853,117 @@ std::optional<std::pair<const Buffer*, u64>> BufferCache::ObtainBufferShared(
     return std::pair<const Buffer*, u64>{arena, arena->Offset(device_addr)};
 }
 
+const Buffer* BufferCache::TryImportView(VAddr device_addr, u32 size) {
+    // P2: up to 512 views of at most 64 MB without images or GPU writes. A view refused for
+    // what it holds is not tried again; a range reaching past its view is left as it is.
+    std::scoped_lock lk{import_mutex};
+    if (imported_buffers.size() >= 512) {
+        return nullptr;
+    }
+    VAddr begin{}, end{};
+    // The view's extent, remembered per 2 MB block (VirtualQuery walks cost ~1 us each).
+    auto& extent = view_extents[device_addr >> 21];
+    if (extent.second == 0) {
+        extent.first = GuestViewBase(device_addr);
+        extent.second = extent.first ? GuestViewEnd(extent.first, 64_MB) : 1;
+    }
+    const VAddr base = extent.first;
+    if (base == 0 || device_addr + size > extent.second || import_tried.contains(base)) {
+        return nullptr;
+    }
+    import_tried.insert(base);
+    // SHADGT_PROTO_INPLACE_MAX=<hex address>: only views below it (the game decommits pool
+    // memory higher up, and an imported page made inaccessible loses the device).
+    static const VAddr limit = [] {
+        const char* env = std::getenv("SHADGT_PROTO_INPLACE_MAX");
+        return env ? static_cast<VAddr>(std::strtoull(env, nullptr, 16)) : ~VAddr{0};
+    }();
+    if (base >= limit) {
+        ++import_rejected;
+        return nullptr;
+    }
+    const VAddr view_end = GuestViewEnd(base, 64_MB);
+    if (view_end <= base || view_end - base > 64_MB ||
+        texture_cache.AnyImageInRegion(base, view_end - base) ||
+        IsRegionGpuModified(base, view_end - base)) {
+        if (++import_rejected <= 30) {
+            LOG_WARNING(Render_Vulkan, "P2: view {:#x}+{:#x} not imported (images {}, GPU-written {})",
+                        base, view_end - base,
+                        view_end > base && texture_cache.AnyImageInRegion(base, view_end - base),
+                        view_end > base && IsRegionGpuModified(base, view_end - base));
+        }
+        return nullptr;
+    }
+    const vk::Buffer handle = ImportGuestView(instance, device_addr, size, 64_MB, &begin, &end);
+    if (!handle) {
+        ++import_rejected;
+        return nullptr;
+    }
+    auto& buffer = imported_buffers.emplace_back(
+        std::make_unique<Buffer>(instance, begin, end - begin, handle));
+    {
+        std::unique_lock views_lk{g_imported_mutex};
+        g_imported_views.push_back({begin, end, buffer.get()});
+        std::ranges::sort(g_imported_views, {}, &ImportedView::begin);
+        g_imported_count.store(static_cast<u32>(g_imported_views.size()), std::memory_order_release);
+    }
+    LOG_WARNING(Render_Vulkan, "P2: imported view {:#x}+{:#x} ({} views)", begin, end - begin,
+                imported_buffers.size());
+    return buffer.get();
+}
+
 std::pair<const Buffer*, u64> BufferCache::ObtainBufferImpl(VAddr device_addr, u32 size,
                                                             bool is_written, bool is_texel_buffer) {
+    // EXP-125 (SHADGT_CEIL_REGION=<lo hex>-<hi hex>, measurement only, rendering goes wrong):
+    // obtains inside the region skip every synchronization and use the arena as it is: the frame
+    // rate if that memory were read in place.
+    static const std::pair<VAddr, VAddr> ceil_region = [] {
+        const char* env = std::getenv("SHADGT_CEIL_REGION");
+        if (!env) {
+            return std::pair<VAddr, VAddr>{0, 0};
+        }
+        char* rest{};
+        const VAddr lo = std::strtoull(env, &rest, 16);
+        const VAddr hi = rest && *rest == '-' ? std::strtoull(rest + 1, nullptr, 16) : 0;
+        return std::pair<VAddr, VAddr>{lo, hi};
+    }();
+    static const auto ceil_start = std::chrono::steady_clock::now();
+    if (ceil_region.second != 0 &&
+        std::chrono::steady_clock::now() - ceil_start > std::chrono::seconds{190} &&
+        device_addr >= ceil_region.first &&
+        device_addr + size <= ceil_region.second && !is_texel_buffer) {
+        std::scoped_lock ceil_lock{mutex};
+        const u64 first_block = device_addr >> block_shift;
+        const u64 last_block = (device_addr + size - 1) >> block_shift;
+        const auto* arena = GetArena(first_block, last_block);
+        EnsureResident(arena, first_block, last_block);
+        return {arena, arena->Offset(device_addr)};
+    }
+    // P2 (SHADGT_PROTO_INPLACE=1, prototype): ranges in imported guest views are used in place.
+    static const bool proto_inplace = [] {
+        const char* env = std::getenv("SHADGT_PROTO_INPLACE");
+        return env && env[0] == '1';
+    }();
+    if (proto_inplace) {
+        static auto window = std::chrono::steady_clock::now();
+        if (const auto now = std::chrono::steady_clock::now();
+            now - window >= std::chrono::seconds{2}) {
+            window = now;
+            LOG_WARNING(Render_Vulkan, "P2: in 2 s: {} obtains in place, {} views imported, {} refused",
+                        inplace_obtains.exchange(0), g_imported_count.load(),
+                        import_rejected.load());
+        }
+    }
+    if (proto_inplace && !is_texel_buffer) {
+        if (const auto* view = FindImportedView(device_addr, size)) {
+            ++inplace_obtains;
+            return {static_cast<const Buffer*>(view->buffer), device_addr - view->begin};
+        }
+        if (const Buffer* imported = TryImportView(device_addr, size)) {
+            ++inplace_obtains;
+            return {imported, imported->Offset(device_addr)};
+        }
+    }
     // R6: the common case under the shared lock (stage workers obtain meanwhile). -DisablePerf
     // 132 always takes it exclusively.
     static const bool shared_obtain =
@@ -1889,12 +2025,13 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferImpl(VAddr device_addr, u
                         "DIAG-109: obtains in 2 s: {} ({} small), {} repeat a read-only range of "
                         "the same epoch ({} small); {} epochs; PERF-117 arena memo {} hits {} "
                         "stores; DIAG-111 Mcycles/count: stream "
-                        "{}/{}, arena read {}/{}, arena written {}/{}",
+                        "{}/{}, arena read {}/{}, arena written {}/{}, in place {}/{}",
                         calls, small_calls, repeats, small_repeats, epochs,
                         std::exchange(arena_memo_hits, 0), std::exchange(arena_memo_stores, 0),
                         g_obtain_cycles[0].exchange(0) / 1000000, g_obtain_counts[0].exchange(0),
                         g_obtain_cycles[1].exchange(0) / 1000000, g_obtain_counts[1].exchange(0),
-                        g_obtain_cycles[2].exchange(0) / 1000000, g_obtain_counts[2].exchange(0));
+                        g_obtain_cycles[2].exchange(0) / 1000000, g_obtain_counts[2].exchange(0),
+                        g_obtain_cycles[3].exchange(0) / 1000000, g_obtain_counts[3].exchange(0));
             std::string sources;
             for (u32 i = 0; i < g_epoch_bump_sources.size(); ++i) {
                 if (const u32 n = g_epoch_bump_sources[i].exchange(0); n != 0) {
@@ -1968,6 +2105,19 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferImpl(VAddr device_addr, u
         stream_buffer.Commit();
         ++Common::GetWorkCounters().obtain_stream;
         return {&stream_buffer, offset};
+    }
+    // P1 (SHADGT_PROTO_IMPORT=1): once, 200 s in, on a read range of 64 KB or more.
+    static const bool proto_import = [] {
+        const char* env = std::getenv("SHADGT_PROTO_IMPORT");
+        return env && env[0] == '1';
+    }();
+    if (proto_import && !is_written && size >= 64_KB) {
+        static const auto start = std::chrono::steady_clock::now();
+        static bool done = false;
+        if (!done && std::chrono::steady_clock::now() - start > std::chrono::seconds{200}) {
+            done = true;
+            ProtoImportTest(instance, scheduler, device_addr, size);
+        }
     }
     const u64 first_block = device_addr >> block_shift;
     const u64 last_block = (device_addr + size - 1) >> block_shift;

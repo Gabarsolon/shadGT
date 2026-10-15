@@ -339,6 +339,8 @@ bool Instance::CreateDevice() {
         LOG_INFO(Render_Vulkan, "- shaderImageFloat32AtomicMinMax: {}",
                  shader_atomic_float2_features.shaderImageFloat32AtomicMinMax);
     }
+    // P1 (prototype): guest memory imported into Vulkan, for the GPU to read in place.
+    external_memory_host = add_extension(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
     workgroup_memory_explicit_layout =
         add_extension(VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME);
     if (workgroup_memory_explicit_layout) {
