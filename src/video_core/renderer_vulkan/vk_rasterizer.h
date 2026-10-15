@@ -349,7 +349,6 @@ private:
         VideoCore::ImageId image_id;
         VideoCore::TextureCache::ImageDesc desc;
     };
-    std::array<ImageBinding, Shader::NUM_IMAGES> image_bindings;
     // PERF-042: decoded texture descriptors. A T# and the resource's depth/written/array flags
     // decide the image description completely (ImageInfo, ImageViewInfo), so a T# that passed
     // the checks before is not checked and decoded again. Direct-mapped, by hash.
@@ -360,7 +359,6 @@ private:
         VideoCore::TextureCache::ImageDesc desc;
         VideoCore::TextureCache::FindMemo find_memo; // PERF-114
     };
-    std::vector<DecodedTsharp> decoded_tsharps;
 
     // PERF-047: the recorder thread binds a graphics draw through its own copies of the pipeline
     // cache's infos, which the command thread keeps reusing for its lookups.
@@ -429,14 +427,9 @@ private:
     void SeedStage(SelectedStage& selected, const Shader::Info* info);
     // FIX-046: bumped on every unmap (any thread); the decoded T#s are checked again after it.
     std::atomic<u64> tsharp_epoch{};
-    u64 decoded_epoch{};
     /// FIX-046: whether the address is inside the guest address space.
     bool IsMappedStart(VAddr address);
-    std::array<ImageBinding, AmdGpu::NUM_COLOR_BUFFERS> cb_descs;
-    std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc> db_desc;
 
-    boost::container::static_vector<vk::DescriptorImageInfo, Shader::NUM_IMAGES> image_infos;
-    boost::container::static_vector<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffer_infos;
 
     struct BoundTexture {
         u32 descriptor_index;
@@ -444,7 +437,6 @@ private:
         VideoCore::TextureCache::ImageDesc desc;
         vk::Image backing_image;
     };
-    boost::container::static_vector<BoundTexture, Shader::NUM_IMAGES> bound_textures;
 
     struct BoundBuffer {
         const VideoCore::Buffer* buffer;
@@ -453,10 +445,31 @@ private:
         bool is_written;
         VAddr guest_address{};
     };
-    boost::container::static_vector<BoundBuffer, Shader::NUM_BUFFERS> bound_buffers;
-    boost::container::static_vector<VideoCore::ImageId, Shader::NUM_IMAGES> bound_images;
+
+    /// MT-001: the per-draw state of one recording thread. The recorder thread uses main_ctx;
+    /// worker threads of the multithreaded recorder get their own.
+    struct DrawContext {
+        std::array<ImageBinding, Shader::NUM_IMAGES> image_bindings;
+        std::vector<DecodedTsharp> decoded_tsharps;
+        u64 decoded_epoch{};
+        std::array<ImageBinding, AmdGpu::NUM_COLOR_BUFFERS> cb_descs;
+        std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc> db_desc;
+        boost::container::static_vector<vk::DescriptorImageInfo, Shader::NUM_IMAGES> image_infos;
+        boost::container::static_vector<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffer_infos;
+        boost::container::static_vector<BoundTexture, Shader::NUM_IMAGES> bound_textures;
+        boost::container::static_vector<BoundBuffer, Shader::NUM_BUFFERS> bound_buffers;
+        boost::container::static_vector<VideoCore::ImageId, Shader::NUM_IMAGES> bound_images;
+        std::string diag_empty_bindings;
+        boost::container::static_vector<VideoCore::ImageId, Shader::NUM_IMAGES> diag_storage_images;
+        u32 set_write_index{};
+        Pipeline::DescriptorWrites set_writes;
+        Shader::PushData push_data;
+        vk::ImageAspectFlags attachment_feedback_loop{};
+        bool needs_barrier{};
+    };
+    DrawContext main_ctx;
+    DrawContext* ctx = &main_ctx;
     /// DIAG-041: buffers and images of the current draw that were bound empty.
-    std::string diag_empty_bindings;
     /// DIAG-044: records the current draw or dispatch in the dependency history.
     void RecordDiagHistory(const Pipeline* pipeline, bool compute, u32 count);
     /// DIAG-044: logs and dumps everything the image's current contents were made from.
@@ -464,14 +477,8 @@ private:
     VideoCore::ImageId diag_trace_source{};
     std::string diag_trace_tag{"thumb"};
     /// DIAG-045: images of the current draw or dispatch bound for writing (storage).
-    boost::container::static_vector<VideoCore::ImageId, Shader::NUM_IMAGES> diag_storage_images;
 
-    u32 set_write_index{};
-    Pipeline::DescriptorWrites set_writes;
-    Shader::PushData push_data;
 
-    vk::ImageAspectFlags attachment_feedback_loop{};
-    bool needs_barrier{};
     u32 invalid_texture_context_count{};
     std::unordered_set<u64> logged_gpu_constant_shaders;
     std::atomic<u32> deferred_fences{};
