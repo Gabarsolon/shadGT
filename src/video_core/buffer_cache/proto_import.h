@@ -24,6 +24,11 @@ namespace VideoCore {
 void ProtoImportTest(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler, VAddr address,
                      u64 size);
 
+/// N1 (SHADGT_PROTO_IMPORT=2): tries to import every committed guest allocation between lo and
+/// hi once (each made writable for the attempt, protections put back, import freed) and logs
+/// which kinds of memory import.
+void ProtoImportSurvey(const Vulkan::Instance& instance, VAddr lo, VAddr hi);
+
 /// P2 (SHADGT_PROTO_INPLACE=1, prototype): guest views imported into Vulkan. The GPU reads and
 /// writes them in place: the renderer never write-protects them (the GPU faults on protected
 /// imported pages) and does not track their changes.

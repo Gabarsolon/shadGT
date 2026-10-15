@@ -1601,6 +1601,12 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         PhaseTimer t{Phase::RenderTargets};
         PrepareRenderState(pipeline);
     }
+    VideoCore::BufferCache::t_ceil_draw = true; // EXP-127
+    struct CeilDrawEnd {
+        ~CeilDrawEnd() {
+            VideoCore::BufferCache::t_ceil_draw = false;
+        }
+    } ceil_draw_end;
     {
         PhaseTimer t{Phase::VertexIndex};
         BindVertexBuffers(pipeline);

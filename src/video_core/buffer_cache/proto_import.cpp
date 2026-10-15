@@ -320,6 +320,82 @@ void ProtoImportTest(const Vulkan::Instance& instance, Vulkan::Scheduler& schedu
                 props2.properties.limits.maxMemoryAllocationCount);
 }
 
+void ProtoImportSurvey(const Vulkan::Instance& instance, VAddr lo, VAddr hi) {
+#ifdef _WIN32
+    const auto& d = VULKAN_HPP_DEFAULT_DISPATCHER;
+    const VkDevice device = instance.GetDevice();
+    u64 total = 0, imported = 0, count = 0, ok = 0;
+    std::string failures;
+    for (VAddr cursor = lo; cursor < hi;) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(reinterpret_cast<void*>(cursor), &mbi, sizeof(mbi)) == 0) {
+            break;
+        }
+        const VAddr base = reinterpret_cast<VAddr>(mbi.AllocationBase);
+        const VAddr region_end = reinterpret_cast<VAddr>(mbi.BaseAddress) + mbi.RegionSize;
+        if (mbi.State != MEM_COMMIT || base != reinterpret_cast<VAddr>(mbi.BaseAddress)) {
+            cursor = region_end;
+            continue;
+        }
+        // The whole allocation and its protection runs.
+        VAddr end = base;
+        std::vector<std::pair<VAddr, std::pair<u64, DWORD>>> runs;
+        bool all_committed = true;
+        while (true) {
+            MEMORY_BASIC_INFORMATION run{};
+            if (VirtualQuery(reinterpret_cast<void*>(end), &run, sizeof(run)) == 0 ||
+                run.AllocationBase != mbi.AllocationBase) {
+                break;
+            }
+            all_committed &= run.State == MEM_COMMIT;
+            runs.push_back({end, {run.RegionSize, run.Protect}});
+            end += run.RegionSize;
+        }
+        cursor = end;
+        const u64 length = end - base;
+        ++count;
+        total += length;
+        bool noaccess = false;
+        for (const auto& [at, run] : runs) {
+            noaccess |= run.second == PAGE_NOACCESS;
+        }
+        DWORD old;
+        const bool made_writable =
+            VirtualProtect(reinterpret_cast<void*>(base), length, PAGE_READWRITE, &old) != 0;
+        VkImportMemoryHostPointerInfoEXT import{
+            VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT, nullptr,
+            VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, reinterpret_cast<void*>(base)};
+        VkMemoryHostPointerPropertiesEXT ptr_props{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+        d.vkGetMemoryHostPointerPropertiesEXT(device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+                                              reinterpret_cast<void*>(base), &ptr_props);
+        VkResult result = VK_ERROR_FORMAT_NOT_SUPPORTED;
+        if (ptr_props.memoryTypeBits != 0 && made_writable) {
+            VkMemoryAllocateInfo info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &import, length,
+                                      static_cast<u32>(std::countr_zero(ptr_props.memoryTypeBits))};
+            VkDeviceMemory memory{};
+            result = d.vkAllocateMemory(device, &info, nullptr, &memory);
+            if (result == VK_SUCCESS) {
+                d.vkFreeMemory(device, memory, nullptr);
+            }
+        }
+        for (const auto& [at, run] : runs) {
+            VirtualProtect(reinterpret_cast<void*>(at), run.first, run.second, &old);
+        }
+        if (result == VK_SUCCESS) {
+            ++ok;
+            imported += length;
+        } else if (failures.size() < 3000) {
+            failures += fmt::format("\n  {:#x}+{:#x} {} prot {:#x} runs {}{}{} -> {}", base, length,
+                                    mbi.Type == MEM_MAPPED ? "mapped" : mbi.Type == MEM_PRIVATE ? "private" : "image",
+                                    mbi.AllocationProtect, runs.size(), noaccess ? " has-noaccess" : "",
+                                    made_writable ? "" : " not-made-writable", int(result));
+        }
+    }
+    LOG_WARNING(Render_Vulkan, "N1: import survey {:#x}-{:#x}: {} of {} allocations import ({} of {} MB){}",
+                lo, hi, ok, count, imported >> 20, total >> 20, failures);
+#endif
+}
+
 VAddr GuestViewBase(VAddr address) {
 #ifdef _WIN32
     MEMORY_BASIC_INFORMATION mbi{};

@@ -1695,6 +1695,20 @@ static std::atomic<u64> g_obtain_counts[4]{};
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
                                                         bool is_written, bool is_texel_buffer) {
+    // EXP-127 (SHADGT_CEIL_NOBUFFERS=1, measurement only, rendering goes wrong): 190 s in, every
+    // buffer obtain returns a 1 GB dummy buffer without any other work: the recorder's cost per
+    // draw if buffer memory needed no CPU work at all (the direct renderer's model).
+    static const bool ceil_nobuffers = [] {
+        const char* env = std::getenv("SHADGT_CEIL_NOBUFFERS");
+        return env && env[0] == '1';
+    }();
+    if (ceil_nobuffers && t_ceil_draw && !is_written && size <= 1_GB && !is_texel_buffer) {
+        static const auto start = std::chrono::steady_clock::now();
+        if (std::chrono::steady_clock::now() - start > std::chrono::seconds{190}) {
+            static Buffer dummy{instance, 0, 1_GB, MemoryType::DeviceLocal, "EXP-127 dummy"};
+            return {&dummy, 0};
+        }
+    }
     static const bool diag_time = [] {
         const char* env = std::getenv("SHADGT_DIAG_OBTAIN");
         return env && env[0] == '1';
@@ -2109,14 +2123,20 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferImpl(VAddr device_addr, u
     // P1 (SHADGT_PROTO_IMPORT=1): once, 200 s in, on a read range of 64 KB or more.
     static const bool proto_import = [] {
         const char* env = std::getenv("SHADGT_PROTO_IMPORT");
-        return env && env[0] == '1';
+        return env && (env[0] == '1' || env[0] == '2');
     }();
     if (proto_import && !is_written && size >= 64_KB) {
         static const auto start = std::chrono::steady_clock::now();
         static bool done = false;
         if (!done && std::chrono::steady_clock::now() - start > std::chrono::seconds{200}) {
             done = true;
-            ProtoImportTest(instance, scheduler, device_addr, size);
+            const char* mode = std::getenv("SHADGT_PROTO_IMPORT");
+            if (mode && mode[0] == '2') {
+                scheduler.Finish();
+                ProtoImportSurvey(instance, 0x200000000ULL, 0x10000000000ULL);
+            } else {
+                ProtoImportTest(instance, scheduler, device_addr, size);
+            }
         }
     }
     const u64 first_block = device_addr >> block_shift;

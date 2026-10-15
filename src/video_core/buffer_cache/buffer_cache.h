@@ -513,6 +513,9 @@ public:
         t_stage_worker = index;
     }
     /// R6: called on the recorder thread when it starts (its obtains may run shared).
+    /// EXP-127: set while a direct graphics draw binds its buffers.
+    static inline thread_local bool t_ceil_draw{};
+
     static void MarkRecorderThread() noexcept {
         t_recorder_thread = true;
     }
