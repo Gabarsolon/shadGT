@@ -25,6 +25,7 @@
 #include "video_core/buffer_cache/fault_manager.h"
 #include "video_core/texture_cache/types.h"
 #include "common/read_capture.h"
+#include "common/recursive_shared_mutex.h"
 #include "video_core/buffer_cache/page_hash_table.h"
 #include "video_core/buffer_cache/range_set.h"
 #include "video_core/buffer_cache/uploaded_pages.h"
@@ -162,7 +163,9 @@ public:
     void RecordAheadUploads(const AheadUploads& uploads);
     /// PERF-067: the cache is used by the buffer stage thread and the recorder; every entry
     /// point takes this.
-    std::recursive_mutex& Mutex() noexcept {
+    struct MutexTag {};
+    using CacheMutex = Common::RecursiveSharedMutex<MutexTag>;
+    CacheMutex& Mutex() noexcept {
         return mutex;
     }
 
@@ -310,8 +313,8 @@ private:
         u64 size;
     };
     std::unordered_map<VAddr, GpuWriter> small_gpu_writers;
-    u64 stage_prehash_hits{};   // PERF-087
-    u64 stage_prehash_misses{};
+    std::atomic<u64> stage_prehash_hits{};   // PERF-087
+    std::atomic<u64> stage_prehash_misses{};
     /// DIAG-029: GPU writes larger than 4 KB, by start address.
     std::map<VAddr, GpuWriter> large_gpu_writers;
     u64 big_quad_draws_logged{};
@@ -337,7 +340,7 @@ private:
         u32 page_only_faults{};
         u32 split_faults{};
         u32 gds_split_faults{};
-        u32 uploads_over_gpu_bytes{}; // FIX-066
+        std::atomic<u32> uploads_over_gpu_bytes{}; // FIX-066
         std::atomic<u32> cpu_overwrote{};
         struct PageFaults {
             u32 faults{};
@@ -418,21 +421,25 @@ private:
     std::atomic<u64> hot_pages_uploaded{};
     // PERF-064: per hot page, how many checks in a row found it unchanged.
     tsl::robin_map<VAddr, u8> hot_unchanged_streak;
-    u64 hot_pages_cooled{};
-    u64 hot_pages_cooled_changed{};
+    std::mutex streak_mutex;     // R3: hot_unchanged_streak (shared-mode syncs)
+    std::mutex gpu_ranges_mutex; // R3: gpu_modified_ranges between shared-mode syncs
+    std::mutex pending_uploads_mutex; // R3: pending_ahead_uploads
+    std::atomic<u64> hot_pages_cooled{};
+    std::atomic<u64> hot_pages_cooled_changed{};
     // PERF-062: hot-page hashes taken by the command thread as it decodes draws.
     PageHashTable ahead_hashes;
-    u32 draw_epoch{};
-    const Common::ReadCapture* read_capture{};
+    // R1: per thread (the buffer stage and the recorder each have their own job).
+    static thread_local u32 draw_epoch;
+    static thread_local const Common::ReadCapture* read_capture;
     std::atomic<u64> ahead_hashed{};
-    u64 ahead_hits{};
-    u64 capture_hash_hits{};   // PERF-063
-    u64 capture_hash_misses{};
-    u64 ahead_misses{};
+    std::atomic<u64> ahead_hits{};
+    std::atomic<u64> capture_hash_hits{};   // PERF-063
+    std::atomic<u64> capture_hash_misses{};
+    std::atomic<u64> ahead_misses{};
     // PERF-049: hot-page hashes taken ahead on a background thread.
     std::unique_ptr<HotPagePrehasher> prehasher;
-    u64 prehashed_hits{};
-    u64 prehashed_misses{};
+    std::atomic<u64> prehashed_hits{};
+    std::atomic<u64> prehashed_misses{};
     std::atomic<u32> num_tracked_async_readbacks{};
 
     struct ArenaBinds {
@@ -481,7 +488,7 @@ private:
     // PERF-067: rings the buffer stage fills ahead of the recorder.
     StreamBuffer ahead_stream;
     StreamBuffer ahead_staging;
-    AheadUploads* ahead_uploads{}; // set while ObtainBufferAhead runs
+    static thread_local AheadUploads* ahead_uploads; // set while ObtainBufferAhead runs
 public:
     /// PERF-067: why the stage left buffers to the recorder (texel read, image, stream ring,
     /// arena, residency, staging ring).
@@ -492,7 +499,7 @@ private:
     std::deque<std::shared_ptr<AheadUpload>> pending_ahead_uploads;
     void RecordPendingAheadUploads(VAddr device_addr, u64 size);
     void RecordAheadUpload(AheadUpload& upload);
-    mutable std::recursive_mutex mutex;
+    mutable CacheMutex mutex; // R2: exclusive unless a path is known safe shared
     Buffer gds_buffer;
     RangeSet gpu_modified_ranges;
     /// FIX-079: the bytes a write-through store changed, copied to the arena on the recorder.

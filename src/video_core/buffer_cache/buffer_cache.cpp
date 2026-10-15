@@ -536,7 +536,7 @@ void BufferCache::LogHotPageStats() {
                 stats.faults, stats.page_only_faults, stats.split_faults, stats.gds_split_faults,
                 stats.cpu_overwrote.exchange(0), stats.new_pages, hot_page_order.size(),
                 stats.recorded, stats.recorded_bytes / 1024, stats.completed.exchange(0),
-                stats.invalidated.exchange(0), stats.uploads_over_gpu_bytes,
+                stats.invalidated.exchange(0), stats.uploads_over_gpu_bytes.load(),
                 std::exchange(writebacks_cpu_newer, 0), std::exchange(readbacks_cpu_rewrote, 0),
                 std::exchange(unseen_cpu_bytes_synced, 0), top);
     if (auto& sync = image_sync_stats; sync.calls != 0) {
@@ -564,8 +564,8 @@ void BufferCache::LogHotPageStats() {
                     "PERF-033 hot pages in 2.0 s: {} unchanged and not uploaded ({} MB), {} "
                     "uploaded; PERF-049: {} hashes taken ahead, {} on the recorder; PERF-064: "
                     "{} cooled ({} written while cooling)",
-                    unchanged, unchanged * BYTES_PER_PAGE >> 20, uploaded, prehashed_hits,
-                    prehashed_misses, hot_pages_cooled, hot_pages_cooled_changed);
+                    unchanged, unchanged * BYTES_PER_PAGE >> 20, uploaded, prehashed_hits.load(),
+                    prehashed_misses.load(), hot_pages_cooled.load(), hot_pages_cooled_changed.load());
     }
     hot_pages_cooled = 0;
     hot_pages_cooled_changed = 0;
@@ -573,7 +573,7 @@ void BufferCache::LogHotPageStats() {
     prehashed_misses = 0;
     if (stage_prehash_hits + stage_prehash_misses != 0) {
         LOG_WARNING(Render_Vulkan, "PERF-087: hot pages hashed by the buffer stage before the "
-                    "lock: {} used, {} hashed under it", stage_prehash_hits, stage_prehash_misses);
+                    "lock: {} used, {} hashed under it", stage_prehash_hits.load(), stage_prehash_misses.load());
         stage_prehash_hits = 0;
         stage_prehash_misses = 0;
     }
@@ -581,7 +581,7 @@ void BufferCache::LogHotPageStats() {
         LOG_WARNING(Render_Vulkan,
                     "PERF-062: hot-page hashes taken by the command thread: {} used, {} hashed "
                     "here; {} hashed ahead",
-                    ahead_hits, ahead_misses, ahead_hashed.exchange(0));
+                    ahead_hits.load(), ahead_misses.load(), ahead_hashed.exchange(0));
     }
     ahead_hits = 0;
     ahead_misses = 0;
@@ -772,17 +772,24 @@ void BufferCache::ApplyCompletedReadbacks() {
         ranges.swap(completed_readback_ranges);
         num_completed_readback_ranges = 0;
     }
-    for (const auto& [address, size] : ranges) {
-        gpu_modified_ranges.Subtract(address, size);
-    }
-    for (const auto& [address, size] : ranges) {
-        const VAddr first_page = Common::AlignDown(address, 4_KB);
-        const VAddr last_page = Common::AlignDown(address + size - 1, 4_KB);
-        for (VAddr page = first_page; page <= last_page; page += 4_KB) {
-            if (!gpu_modified_ranges.Intersects(page, 4_KB)) {
-                memory_tracker->UnmarkRegionAsGpuModified(page, 4_KB, false);
+    boost::container::small_vector<VAddr, 16> unmark;
+    {
+        std::scoped_lock gpu_lk{gpu_ranges_mutex}; // R3
+        for (const auto& [address, size] : ranges) {
+            gpu_modified_ranges.Subtract(address, size);
+        }
+        for (const auto& [address, size] : ranges) {
+            const VAddr first_page = Common::AlignDown(address, 4_KB);
+            const VAddr last_page = Common::AlignDown(address + size - 1, 4_KB);
+            for (VAddr page = first_page; page <= last_page; page += 4_KB) {
+                if (!gpu_modified_ranges.Intersects(page, 4_KB)) {
+                    unmark.push_back(page);
+                }
             }
         }
+    }
+    for (const VAddr page : unmark) {
+        memory_tracker->UnmarkRegionAsGpuModified(page, 4_KB, false);
     }
 }
 
@@ -2032,6 +2039,9 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
 // threads from 128 pages (512 KB) on; -DisablePerf 58 hashes them on this thread.
 // PERF-087: hashes of hot pages the buffer stage took for the obtain it runs (ascending).
 static thread_local std::vector<std::pair<VAddr, u64>> t_stage_prehash;
+thread_local u32 BufferCache::draw_epoch{};
+thread_local const Common::ReadCapture* BufferCache::read_capture{};
+thread_local BufferCache::AheadUploads* BufferCache::ahead_uploads{};
 
 template <typename PageAt>
 static void HashPages(size_t count, PageAt&& page_at, std::span<u64> hashes) {
@@ -2120,7 +2130,16 @@ std::optional<std::pair<const Buffer*, u64>> BufferCache::ObtainBufferAhead(
             t_stage_prehash.clear();
         }
     } clear_prehash;
-    std::unique_lock lk{mutex};
+    // R3: a read is obtained under the shared lock (with other stage workers; the recorder's
+    // obtains are exclusive). -DisablePerf 131 takes it exclusively.
+    static const bool shared_reads = Common::PerfFeatureEnabled(131);
+    std::unique_lock<CacheMutex> lk_ex{mutex, std::defer_lock};
+    std::shared_lock<CacheMutex> lk_sh{mutex, std::defer_lock};
+    if (shared_reads && !is_written) {
+        lk_sh.lock();
+    } else {
+        lk_ex.lock();
+    }
     // PERF-079: a range under images is obtained ahead through the arena as well; the recorder
     // exports the images before using it (ExportImagesOver). In GT Sport's races a third of the
     // buffers the stage was given lie under images, and each stopped it. -DisablePerf 84 leaves
@@ -2152,7 +2171,11 @@ std::optional<std::pair<const Buffer*, u64>> BufferCache::ObtainBufferAhead(
         // waited on it for these copies). -DisablePerf 130 fills it under the lock.
         static const bool copy_unlocked = Common::PerfFeatureEnabled(130);
         if (copy_unlocked) {
-            lk.unlock();
+            if (lk_sh.owns_lock()) {
+                lk_sh.unlock();
+            } else {
+                lk_ex.unlock();
+            }
         }
         const auto [data, offset] = ahead_stream.Map(size, instance.UniformMinAlignment(), false);
         if (!data) {
@@ -2229,7 +2252,9 @@ void BufferCache::RecordAheadUpload(AheadUpload& upload) {
 }
 
 void BufferCache::RecordAheadUploads(const AheadUploads& uploads) {
-    std::scoped_lock buffer_lock{mutex};
+    // R3: the uploads and the pending list need no cache state; shared with the stage's syncs.
+    std::shared_lock buffer_lock{mutex};
+    std::scoped_lock pending_lk{pending_uploads_mutex};
     for (const auto& upload : uploads) {
         RecordAheadUpload(*upload);
     }
@@ -2241,6 +2266,7 @@ void BufferCache::RecordAheadUploads(const AheadUploads& uploads) {
 void BufferCache::RecordPendingAheadUploads(VAddr device_addr, u64 size) {
     // Lock held. An upload prepared for a later draw over these bytes is recorded now, with
     // the ones prepared before it, so this use sees them.
+    std::scoped_lock pending_lk{pending_uploads_mutex}; // R3
     if (pending_ahead_uploads.empty()) {
         return;
     }
@@ -2290,6 +2316,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
     const auto upload_range = [&](u64 addr, u64 size) {
         // PERF-011: bytes the GPU wrote and guest memory does not have yet stay as they are in
         // the arena; uploading the stale guest copy would overwrite them.
+        std::unique_lock gpu_lk{gpu_ranges_mutex}; // R3
         if (split_write_faults && gpu_modified_ranges.Intersects(addr, size)) {
             VAddr cursor = addr;
             gpu_modified_ranges.ForEachInRange(addr, size, [&](VAddr start, VAddr end) {
@@ -2303,6 +2330,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
             }
             return;
         }
+        gpu_lk.unlock();
         VAddr cursor = addr;
         for (const auto& [start, end] : gds_pending) {
             if (end <= cursor || start >= addr + size) {
@@ -2335,8 +2363,11 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         }
     });
     const auto whole_page_from_guest = [&](VAddr page) {
-        if (split_write_faults && gpu_modified_ranges.Intersects(page, BYTES_PER_PAGE)) {
-            return false;
+        if (split_write_faults) {
+            std::scoped_lock gpu_lk{gpu_ranges_mutex}; // R3
+            if (gpu_modified_ranges.Intersects(page, BYTES_PER_PAGE)) {
+                return false;
+            }
         }
         return std::ranges::none_of(gds_pending, [&](const auto& gds) {
             return gds.first < page + BYTES_PER_PAGE && page < gds.second;
@@ -2486,6 +2517,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
                 cursor = page + BYTES_PER_PAGE;
                 ++unchanged_count;
                 if (cool_hot_pages && !read_capture) {
+                    std::scoped_lock streak_lk{streak_mutex}; // R3
                     u8& streak = hot_unchanged_streak[page];
                     if (++streak >= CoolAfterChecks) {
                         cool.emplace_back(page, hash);
@@ -2493,6 +2525,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
                 }
             } else if (whole_page_from_guest(page)) {
                 if (cool_hot_pages) {
+                    std::scoped_lock streak_lk{streak_mutex}; // R3
                     hot_unchanged_streak.erase(page);
                 }
                 hot_uploads.push_back({page, generation, hash});
@@ -2509,7 +2542,10 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
     }
     hot_pages_unchanged += unchanged_count;
     for (const auto& [page, hash] : cool) {
-        hot_unchanged_streak.erase(page);
+        {
+            std::scoped_lock streak_lk{streak_mutex}; // R3
+            hot_unchanged_streak.erase(page);
+        }
         // Clean and write-protected again: the GPU copy holds these bytes (the last upload).
         memory_tracker->CoolHotPages(page, BYTES_PER_PAGE);
         ++hot_pages_cooled;
@@ -2520,8 +2556,11 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
             ++hot_pages_cooled_changed;
         }
     }
-    if (hot_unchanged_streak.size() > 1 << 20) {
-        hot_unchanged_streak.clear();
+    {
+        std::scoped_lock streak_lk{streak_mutex}; // R3
+        if (hot_unchanged_streak.size() > 1 << 20) {
+            hot_unchanged_streak.clear();
+        }
     }
     if (!copies.empty()) {
         for (const auto& copy : copies) {
@@ -2538,19 +2577,26 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         // flickered and glowed green). -DisablePerf 90 keeps them listed.
         static const bool forget_uploaded = Common::PerfFeatureEnabled(90);
         if (forget_uploaded) {
-            for (const auto& copy : copies) {
-                const VAddr start = copy.dstOffset;
-                const VAddr end = start + copy.size;
-                if (!gpu_modified_ranges.Intersects(start, copy.size)) {
-                    continue;
-                }
-                gpu_modified_ranges.Subtract(start, copy.size);
-                for (VAddr page = Common::AlignDown(start, 4_KB); page < end; page += 4_KB) {
-                    if (!gpu_modified_ranges.Intersects(page, 4_KB)) {
-                        memory_tracker->UnmarkRegionAsGpuModified(page, 4_KB, false);
+            boost::container::small_vector<VAddr, 16> unmark;
+            {
+                std::scoped_lock gpu_lk{gpu_ranges_mutex}; // R3
+                for (const auto& copy : copies) {
+                    const VAddr start = copy.dstOffset;
+                    const VAddr end = start + copy.size;
+                    if (!gpu_modified_ranges.Intersects(start, copy.size)) {
+                        continue;
                     }
+                    gpu_modified_ranges.Subtract(start, copy.size);
+                    for (VAddr page = Common::AlignDown(start, 4_KB); page < end; page += 4_KB) {
+                        if (!gpu_modified_ranges.Intersects(page, 4_KB)) {
+                            unmark.push_back(page);
+                        }
+                    }
+                    ++hot_page_stats.uploads_over_gpu_bytes;
                 }
-                ++hot_page_stats.uploads_over_gpu_bytes;
+            }
+            for (const VAddr page : unmark) {
+                memory_tracker->UnmarkRegionAsGpuModified(page, 4_KB, false);
             }
         }
         Common::GetWorkCounters().uploads += copies.size();
@@ -2576,6 +2622,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
                 upload->end = std::max(upload->end, arena->cpu_addr + copy.dstOffset + copy.size);
             }
             ahead_uploads->push_back(upload);
+            std::scoped_lock pending_lk{pending_uploads_mutex}; // R3
             pending_ahead_uploads.push_back(std::move(upload));
             copies.clear();
         }
