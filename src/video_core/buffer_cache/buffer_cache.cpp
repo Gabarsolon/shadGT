@@ -655,11 +655,19 @@ void BufferCache::CompleteAsyncReadbacks(
     std::span<const std::shared_ptr<AsyncReadback>> readbacks) {
     std::scoped_lock buffer_lock{mutex}; // PERF-067
     std::scoped_lock lk{async_readbacks_mutex};
+    // FIX-106: guest bytes are read through CopySparseMemory, which does not fault on pages
+    // protected for tracking. A plain read faulted on this helper thread while it held the
+    // buffer cache lock, and the fault's flush waited for the recorder, which waited for that
+    // lock (early fences froze at car select).
+    thread_local std::vector<u8> current;
+    const auto guest_differs = [&](const AsyncReadback& readback) {
+        current.resize(readback.size);
+        memory->CopySparseMemory(readback.address, current.data(), readback.size);
+        return std::memcmp(current.data(), readback.snapshot.data(), readback.size) != 0;
+    };
     for (const auto& readback : readbacks) {
         if (readback->valid && memory->IsValidMapping(readback->address, readback->size) &&
-            !readback->snapshot.empty() &&
-            std::memcmp(std::bit_cast<const void*>(readback->address), readback->snapshot.data(),
-                        readback->size) != 0) {
+            !readback->snapshot.empty() && guest_differs(*readback)) {
             // PERF-011: the CPU wrote the range after the fault; its value is newer than the
             // GPU's. Stop excluding the range from uploads and upload the CPU value.
             completed_readback_ranges.emplace_back(readback->address, readback->size);
@@ -1666,6 +1674,39 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     // ranges this write adds.
     ApplyCompletedReadbacks();
     ++Common::GetWorkCounters().obtain_buffer;
+    // DIAG-109 (SHADGT_DIAG_OBTAIN=1): how many read-only obtains repeat a range already obtained
+    // in the same upload epoch (what a per-epoch memo of obtains could skip).
+    static const bool diag_obtain = [] {
+        const char* env = std::getenv("SHADGT_DIAG_OBTAIN");
+        return env && env[0] == '1';
+    }();
+    if (diag_obtain) {
+        static std::unordered_set<u64> seen;
+        static u32 seen_epoch = 0;
+        static u64 calls = 0, repeats = 0, small_calls = 0, small_repeats = 0, epochs = 0;
+        static auto window = std::chrono::steady_clock::now();
+        const u32 epoch = g_upload_epoch.load(std::memory_order_acquire);
+        if (epoch != seen_epoch) {
+            seen.clear();
+            seen_epoch = epoch;
+            ++epochs;
+        }
+        const bool small = size <= STREAM_THRESHOLD;
+        ++calls;
+        small_calls += small;
+        if (!is_written && !seen.insert(device_addr ^ (u64(size) << 40)).second) {
+            ++repeats;
+            small_repeats += small;
+        }
+        if (const auto now = std::chrono::steady_clock::now(); now - window >= std::chrono::seconds{2}) {
+            LOG_WARNING(Render_Vulkan,
+                        "DIAG-109: obtains in 2 s: {} ({} small), {} repeat a read-only range of "
+                        "the same epoch ({} small); {} epochs",
+                        calls, small_calls, repeats, small_repeats, epochs);
+            calls = repeats = small_calls = small_repeats = epochs = 0;
+            window = now;
+        }
+    }
     const bool images_overlap = SynchronizeMemoryFromImage(device_addr, size);
     // PERF-043: with no image over the range, it has no GPU image alias either; the texture
     // cache is not walked again. -DisablePerf 55 walks it again.

@@ -570,6 +570,15 @@ bool Liverpool::EarlyFenceAllowed() {
     if (!early_fences_mode || !draw_pipe || !rasterizer) {
         return false;
     }
+    // DIAG-110 (SHADGT_EARLY_FENCES_AFTER=<seconds>): fences are signaled early only that long
+    // after start (captures run from the start), to measure races without the menus.
+    static const auto early_after = [] {
+        const char* env = std::getenv("SHADGT_EARLY_FENCES_AFTER");
+        return std::chrono::steady_clock::now() + std::chrono::seconds(env ? std::atoi(env) : 0);
+    }();
+    if (std::chrono::steady_clock::now() < early_after) {
+        return false;
+    }
     if (!window_safe) {
         return false; // counted by UnsafeWindow
     }
