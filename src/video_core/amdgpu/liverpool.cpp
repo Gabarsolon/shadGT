@@ -802,12 +802,23 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
     };
     std::shared_ptr<StagedDraw> staged;
     DrawPipe::Prepare prepare;
+    // MT-005: an indexed direct draw's index buffer, as BindIndexBuffer obtains it.
+    VAddr staged_index_address = 0;
+    u32 staged_index_bytes = 0;
+    if (staged_index_offset && !compute) {
+        const u32 index_size = regs.index_buffer_type.index_type == IndexType::Index16 ? 2 : 4;
+        staged_index_address = regs.index_base_address.Address<VAddr>() +
+                               u64(*staged_index_offset) * index_size;
+        staged_index_bytes = regs.num_indices * index_size;
+    }
+    staged_index_offset.reset();
     if (draw_pipe->HasStage() && selected) {
         staged = std::make_shared<StagedDraw>();
         staged->selected = std::move(selected);
         selected.reset();
-        prepare = [this, staged] {
-            return rasterizer->PrepareBuffersAhead(*staged->selected, staged->plan);
+        prepare = [this, staged, staged_index_address, staged_index_bytes] {
+            return rasterizer->PrepareBuffersAhead(*staged->selected, staged->plan,
+                                                   staged_index_address, staged_index_bytes);
         };
     }
     // A draw whose buffers the stage does not obtain is obtained by the recorder: the stage
@@ -1805,6 +1816,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     break;
                 }
                 const auto cmd_address = reinterpret_cast<const void*>(header);
+                staged_index_offset = 0; // MT-005
                 RecordDraw(
                     [this, cmd_address] {
                         rasterizer->ScopeMarker("gfx:{}:DrawIndex2",
@@ -1831,6 +1843,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 }
                 const auto cmd_address = reinterpret_cast<const void*>(header);
                 const u32 index_offset = draw_index_off->index_offset;
+                staged_index_offset = index_offset; // MT-005
                 RecordDraw(
                     [this, cmd_address, index_offset] {
                         rasterizer->ScopeMarker("gfx:{}:DrawIndexOffset2",
@@ -2117,12 +2130,19 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                 *result = counter | OcclusionCounterValidMask;
                             }
                         };
-                        if (early_fences_mode) {
+                        // PERF-116 (SHADGT_OCCLUSION_AT_DECODE=1): the values do not depend on
+                        // the draws, so they are written now; recorded, they were a barrier for
+                        // the buffer stage (~450 a second in races).
+                        static const bool write_at_decode = [] {
+                            const char* env = std::getenv("SHADGT_OCCLUSION_AT_DECODE");
+                            return env && env[0] == '1';
+                        }();
+                        if (early_fences_mode || write_at_decode) {
                             // PERF-063: the values do not depend on the draws; written now, so
                             // the window's fence may be signaled at decode.
                             write_results();
                         } else {
-                            Record(write_results);
+                            Record(write_results, "occlusion results");
                         }
                     }
                 }

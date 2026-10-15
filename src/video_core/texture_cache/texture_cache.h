@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <array>
 #include <mutex>
 #include <shared_mutex>
 #include <absl/container/flat_hash_map.h>
@@ -267,6 +268,9 @@ public:
     /// Runs the garbage collector.
     void RunGarbageCollector();
 
+    /// MT-003: whether an image was registered over the range since `generation` (any thread).
+    bool ImageRegisteredSince(u64 generation, VAddr address, u64 size);
+
     /// PERF-057: changes whenever an image is registered or unregistered, i.e. whenever
     /// ForEachImageInRegion could find a different set of images.
     u64 RegistryGeneration() const {
@@ -397,6 +401,13 @@ private:
     PageManager& tracker;
     PageTable page_table;
     std::atomic<u64> registry_generation{1}; // PERF-057
+    struct Registration {
+        u64 generation;
+        VAddr address;
+        u64 size;
+    };
+    std::array<Registration, 1024> registration_log{}; // MT-003
+    std::mutex registration_log_mutex;
     mutable std::shared_mutex registry_mutex;  // PERF-067: page_table structure
     Common::SlotVector<Image> slot_images;
     Common::SlotVector<ImageView> slot_image_views;

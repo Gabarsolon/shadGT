@@ -561,6 +561,8 @@ private:
     /// `direct_draw`: a draw packet with its counts in the packet (PERF-047 selects its pipeline
     /// here, while decoding).
     void RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bool direct_draw = false);
+    /// MT-005: set by the indexed direct draw packets for the next RecordDraw (its index offset).
+    std::optional<u32> staged_index_offset;
     /// Waits for the recorder thread to finish, before the command thread uses the rasterizer.
     void SyncRecorder(std::string_view reason);
     /// Whether [address, address + size) overlaps a command buffer being decoded.

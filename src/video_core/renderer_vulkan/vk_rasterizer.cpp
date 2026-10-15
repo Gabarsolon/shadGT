@@ -599,7 +599,8 @@ bool Rasterizer::CaptureDrawReads(const SelectedPipeline& selected,
     return complete;
 }
 
-bool Rasterizer::PrepareBuffersAhead(const SelectedPipeline& selected, BufferPlan& plan) {
+bool Rasterizer::PrepareBuffersAhead(const SelectedPipeline& selected, BufferPlan& plan,
+                                     VAddr index_address, u32 index_bytes) {
     const Pipeline* pipeline = selected.is_compute
                                    ? static_cast<const Pipeline*>(selected.compute)
                                    : static_cast<const Pipeline*>(selected.pipeline);
@@ -610,6 +611,82 @@ bool Rasterizer::PrepareBuffersAhead(const SelectedPipeline& selected, BufferPla
     plan.generation = texture_cache.RegistryGeneration();
     plan.labels_done = liverpool->LabelsDone(); // PERF-082
     plan.labels_pushed = liverpool->LabelsPushed();
+    // MT-004: the vertex buffers too, merged as BindVertexBuffers merges them (it takes these
+    // entries first). Quad lists refresh their pages first and are left to the recorder.
+    static const bool plan_vertices = Common::PerfFeatureEnabled(126);
+    if (plan_vertices && !selected.is_compute && !selected.is_quad_list && selected.pipeline) {
+        const auto& fetch = selected.pipeline->GetFetchShader();
+        const auto& vs = selected.stages[u32(Shader::SwStage::Vertex)];
+        if (!fetch.Empty() && !fetch.attributes.empty()) {
+            if (!vs.present) {
+                return false;
+            }
+            struct Range {
+                VAddr begin;
+                VAddr end;
+            };
+            boost::container::small_vector<Range, 16> ranges;
+            for (const auto& attrib : fetch.attributes) {
+                if (attrib.sgpr_base == Shader::IR::NumScalarRegs ||
+                    attrib.sgpr_base + 1u >= vs.num_user_data) {
+                    return false;
+                }
+                VAddr table;
+                std::memcpy(&table, &vs.user_data[attrib.sgpr_base], sizeof(table));
+                table &= 0xFFFFFFFFFFFFULL;
+                const VAddr entry = table + attrib.dword_offset * sizeof(u32);
+                if (!IsMappedStart(entry)) {
+                    return false;
+                }
+                AmdGpu::Buffer vsharp;
+                memory->CopySparseMemory(entry, reinterpret_cast<u8*>(&vsharp), sizeof(vsharp));
+                vsharp.base_address += attrib.inst_offset;
+                if (vsharp.base_address == 0 || vsharp.GetSize() == 0 ||
+                    memory->MappedAreaEnd(vsharp.base_address, vsharp.base_address + 1) == 0) {
+                    continue; // Bound empty by the recorder (FIX-053).
+                }
+                const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
+                ranges.push_back({vsharp.base_address, vsharp.base_address + size});
+            }
+            std::ranges::sort(ranges, {}, &Range::begin);
+            boost::container::small_vector<Range, 16> merged;
+            for (const auto& range : ranges) {
+                if (merged.empty() || merged.back().end < range.begin) {
+                    merged.push_back(range);
+                } else {
+                    merged.back().end = std::max(merged.back().end, range.end);
+                }
+            }
+            for (const auto& range : merged) {
+                const u32 size =
+                    static_cast<u32>(memory->ClampRangeSize(range.begin, range.end - range.begin));
+                bool overlapped = false;
+                const auto result = buffer_cache.ObtainBufferAhead(
+                    range.begin, size, false, false, plan.uploads, &overlapped);
+                if (!result) {
+                    ++plan_refusals[2];
+                    return false;
+                }
+                plan.entries.push_back(
+                    {range.begin, size, false, false, result->first, result->second, overlapped});
+            }
+            plan.vertices = true;
+        }
+    }
+    static const bool plan_index = Common::PerfFeatureEnabled(127);
+    if (plan_index && index_bytes != 0 && index_address != 0 && !selected.is_compute &&
+        !selected.is_quad_list) {
+        bool overlapped = false;
+        const auto result = buffer_cache.ObtainBufferAhead(index_address, index_bytes, false,
+                                                           false, plan.uploads, &overlapped);
+        if (!result) {
+            ++plan_refusals[2];
+            return false;
+        }
+        plan.entries.push_back(
+            {index_address, index_bytes, false, false, result->first, result->second, overlapped});
+        plan.index = true;
+    }
     struct FlatView {
         const std::vector<u32>& flattened_ud_buf;
         VAddr pgm_base;
@@ -696,8 +773,12 @@ std::optional<std::pair<const VideoCore::Buffer*, u64>> Rasterizer::TakePlannedB
         ++plan_stats.redone;
         return std::nullopt;
     }
+    // MT-003: only an image registered over the range since the plan (any image change used to
+    // redo every planned range under an image: ~15% of the plans in races).
+    static const bool precise_redo = Common::PerfFeatureEnabled(125);
     if (texture_cache.RegistryGeneration() != plan->generation &&
-        texture_cache.AnyImageInRegion(address, size)) {
+        (precise_redo ? texture_cache.ImageRegisteredSince(plan->generation, address, size)
+                      : texture_cache.AnyImageInRegion(address, size))) {
         // An image over the range appeared since: obtained again, with its export.
         ++plan_stats.redone;
         return std::nullopt;
@@ -2467,8 +2548,16 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
                                           pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash,
                                           true);
         }
-        std::tie(range.buffer, range.offset) =
-            buffer_cache.ObtainBuffer(range.base_address, size, false);
+        // MT-004: obtained ahead by the buffer stage when it planned this draw's vertex buffers.
+        if (const auto planned =
+                buffer_plan && buffer_plan->vertices
+                    ? TakePlannedBuffer(range.base_address, static_cast<u32>(size), false, false)
+                    : std::nullopt) {
+            std::tie(range.buffer, range.offset) = *planned;
+        } else {
+            std::tie(range.buffer, range.offset) =
+                buffer_cache.ObtainBuffer(range.base_address, size, false);
+        }
         ctx->needs_barrier |= runtime.IsBufferAccessed(range.buffer, range.offset, size);
         // FIX-016: record the vertex fetch as a read of the range, so a later upload into it
         // (GT Sport rewrites grass vertex buffers between draws) waits for this draw. Without
@@ -2527,8 +2616,12 @@ void Rasterizer::BindIndexBuffer(u32 index_offset) {
 
     // Bind index buffer.
     const u32 index_buffer_size = regs.num_indices * index_size;
+    // MT-005: obtained ahead by the buffer stage when it planned this draw's index buffer.
+    const auto planned = buffer_plan && buffer_plan->index
+                             ? TakePlannedBuffer(index_address, index_buffer_size, false, false)
+                             : std::nullopt;
     const auto [buffer, offset] =
-        buffer_cache.ObtainBuffer(index_address, index_buffer_size, false);
+        planned ? *planned : buffer_cache.ObtainBuffer(index_address, index_buffer_size, false);
     ctx->needs_barrier |= runtime.IsBufferAccessed(buffer, offset, index_buffer_size);
     ctx->bound_buffers.emplace_back(buffer, offset, index_buffer_size, false); // FIX-016
     const auto cmdbuf = scheduler.CommandBuffer();

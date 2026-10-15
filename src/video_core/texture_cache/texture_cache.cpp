@@ -1345,12 +1345,37 @@ vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sharp,
     return sampler.Handle();
 }
 
+bool TextureCache::ImageRegisteredSince(u64 generation, VAddr address, u64 size) {
+    const u64 now = RegistryGeneration();
+    if (now - generation >= registration_log.size()) {
+        return true; // Too many changes to tell.
+    }
+    std::scoped_lock lk{registration_log_mutex};
+    for (u64 g = generation + 1; g <= now; ++g) {
+        const auto& entry = registration_log[g % registration_log.size()];
+        if (entry.generation != g) {
+            continue; // An unregistration.
+        }
+        if (entry.address < address + size && address < entry.address + entry.size) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void TextureCache::RegisterImage(ImageId image_id) {
     Image& image = slot_images[image_id];
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
                "Trying to register an already registered image");
     image.flags |= ImageFlagBits::Registered;
-    ++registry_generation; // PERF-057
+    const u64 generation = ++registry_generation; // PERF-057
+    {
+        // MT-003: which ranges got images, for ImageRegisteredSince.
+        std::scoped_lock lk{registration_log_mutex};
+        registration_log[generation % registration_log.size()] = {generation,
+                                                                  image.info.guest_address,
+                                                                  image.info.guest_size};
+    }
     total_used_memory += Common::AlignUp(image.info.guest_size, 1024);
     image_lru_cache.Insert(image, gc_tick);
     const auto& info = image.info;

@@ -156,11 +156,14 @@ public:
         size_t next{};
         u64 labels_done{};   // PERF-082: label writes the recorder had run when planned
         u64 labels_pushed{}; // and the ones pushed by then
+        bool vertices{};     // MT-004: the vertex buffers lead the entries
+        bool index{};        // MT-005: then the index buffer
     };
     /// PERF-067 (buffer stage thread): obtains what it can of the selected draw's shader
     /// buffers. False when it stopped early (the recorder obtains the rest, and must have
     /// recorded this draw before the stage goes on).
-    bool PrepareBuffersAhead(const SelectedPipeline& selected, BufferPlan& plan);
+    bool PrepareBuffersAhead(const SelectedPipeline& selected, BufferPlan& plan,
+                             VAddr index_address = 0, u32 index_bytes = 0);
     /// PERF-067 (recorder): around the draw the plan was made for.
     void SetBufferPlan(BufferPlan* plan) {
         buffer_plan = plan;
