@@ -1357,6 +1357,28 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         SubmitChunkIfNeeded();
         scheduler.PopPendingOperations();
     }
+    // MT-002 test (SHADGT_MT_RING_TEST=1): the draw's commands go through a second ring and are
+    // put back in order as a chunk, as a worker's will be.
+    static const bool ring_test = [] {
+        const char* env = std::getenv("SHADGT_MT_RING_TEST");
+        return env && env[0] == '1';
+    }();
+    struct ChunkScope {
+        Scheduler* scheduler{};
+        CommandRing* worker{};
+        u64 start{};
+        ~ChunkScope() {
+            if (worker) {
+                Scheduler::SetThreadRing(nullptr);
+                scheduler->RecordChunk(worker, start, worker->Recorded());
+            }
+        }
+    } chunk_scope;
+    if (ring_test && scheduler.HasCommandThread()) {
+        static std::unique_ptr<CommandRing> test_ring = scheduler.NewWorkerRing();
+        chunk_scope = {&scheduler, test_ring.get(), test_ring->Recorded()};
+        Scheduler::SetThreadRing(test_ring.get());
+    }
 
     const auto& regs = liverpool->DrawRegs();
     if (DrawSetEnabled()) {

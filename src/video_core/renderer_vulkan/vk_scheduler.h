@@ -438,11 +438,26 @@ public:
 
     /// Returns the current command buffer.
     CmdBuf CommandBuffer() const {
+        if (CommandRing* worker = ThreadRing()) {
+            return CmdBuf{worker, CmdTarget::Primary}; // MT-002
+        }
         if (ring) {
             return CmdBuf{ring.get(), CmdTarget::Primary};
         }
         return CmdBuf{sessions.back().primary};
     }
+
+    /// MT-002: commands this thread records go into `worker_ring` (a worker's own ring) until
+    /// it is set back to nullptr; RecordChunk puts them into the command order.
+    static void SetThreadRing(CommandRing* worker_ring) noexcept;
+    static CommandRing* ThreadRing() noexcept;
+
+    /// MT-002: a ring for one recording thread (a worker).
+    std::unique_ptr<CommandRing> NewWorkerRing() const;
+
+    /// MT-002: the command thread replays worker_ring's commands [start, end) at this point of
+    /// the main ring (it waits for the worker to have recorded them). Main-ring thread only.
+    void RecordChunk(CommandRing* worker_ring, u64 start, u64 end);
 
     /// Returns the current command buffer tick.
     [[nodiscard]] u64 CurrentTick() const noexcept {
@@ -499,6 +514,8 @@ private:
     vk::CommandBuffer OpenUploadCommandBuffer();
 
     void CommandThread(std::stop_token stoken);
+    /// MT-002: replays [start, end) of a worker ring on the command thread.
+    void ReplayChunk(CommandRing& worker_ring, u64 start, u64 end);
 
     void PriorityPendingOpsThread(std::stop_token stoken);
 

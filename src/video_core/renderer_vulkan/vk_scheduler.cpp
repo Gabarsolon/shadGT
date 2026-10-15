@@ -95,6 +95,47 @@ vk::CommandBuffer ReplayCommandBuffer(Scheduler& scheduler, CmdTarget target) {
     return scheduler.sessions.back().primary;
 }
 
+namespace {
+thread_local CommandRing* t_thread_ring = nullptr; // MT-002
+}
+
+void Scheduler::SetThreadRing(CommandRing* worker_ring) noexcept {
+    t_thread_ring = worker_ring;
+}
+
+CommandRing* Scheduler::ThreadRing() noexcept {
+    return t_thread_ring;
+}
+
+std::unique_ptr<CommandRing> Scheduler::NewWorkerRing() const {
+    return std::make_unique<CommandRing>();
+}
+
+void Scheduler::RecordChunk(CommandRing* worker_ring, u64 start, u64 end) {
+    if (start == end) {
+        return;
+    }
+    ASSERT_MSG(ring, "MT-002: chunks need the command thread");
+    ring->RecordControl([worker_ring, start, end](Scheduler& scheduler) {
+        scheduler.ReplayChunk(*worker_ring, start, end);
+    });
+}
+
+void Scheduler::ReplayChunk(CommandRing& worker_ring, u64 start, u64 end) {
+    while (worker_ring.Published() < end) {
+        _mm_pause();
+    }
+    u64 position = start;
+    while (position < end) {
+        auto* header = worker_ring.At(position);
+        if (header->exec != nullptr) {
+            header->exec(*this, reinterpret_cast<u8*>(header) + header->fn_offset);
+        }
+        position += header->size;
+    }
+    worker_ring.SetReplayed(end);
+}
+
 void CommandRing::WaitForSpace(size_t needed) {
     ++full_waits;
     while (head_local + needed - tail.load(std::memory_order_acquire) > Capacity) {
@@ -275,6 +316,9 @@ void Scheduler::EndRendering() {
 
 CmdBuf Scheduler::UploadCommandBuffer() {
     if (ring) {
+        if (CommandRing* worker = ThreadRing()) {
+            return CmdBuf{worker, CmdTarget::Upload}; // MT-002
+        }
         return CmdBuf{ring.get(), CmdTarget::Upload};
     }
     return CmdBuf{OpenUploadCommandBuffer()};
