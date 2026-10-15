@@ -3227,6 +3227,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 decoded->valid = false;
                 decoded->sharp = words;
                 decoded->flags = flags;
+                decoded->find_memo = {};
             }
         }
         const auto bind_null_image = [&] {
@@ -3370,7 +3371,13 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
             {
                 Common::PhaseTimer find_timer{Common::Phase::TexFindImage};
-                image_id = texture_cache.FindImage(desc);
+                // PERF-114: a decoded T# with one plain binding looks its image up through a memo.
+                if (decoded && num_bindings == 1 &&
+                    mip_fallback_mode == Shader::MipStorageFallbackMode::None) {
+                    image_id = texture_cache.FindImageMemo(desc, decoded->find_memo);
+                } else {
+                    image_id = texture_cache.FindImage(desc);
+                }
             }
             auto* image = &texture_cache.GetImage(image_id);
             if (auto depth_image_id = texture_cache.GetAssociatedDepth(*image)) {

@@ -123,7 +123,28 @@ public:
     void ProcessDownloadImages();
 
     /// Retrieves the image handle of the image with the provided attributes.
-    [[nodiscard]] ImageId FindImage(ImageDesc& desc, bool exact_fmt = false);
+    /// PERF-114: what a FindImage call found, for a caller that looks the same descriptor up again.
+    /// Valid while no image was registered or unregistered (RegistryGeneration), and only for a
+    /// perfect match that is the only image starting at its address (no crops to merge back).
+    struct FindMemo {
+        u64 generation{};
+        ImageId id{};
+        bool cacheable{};
+    };
+
+    [[nodiscard]] ImageId FindImage(ImageDesc& desc, bool exact_fmt = false,
+                                    FindMemo* memo = nullptr);
+
+    /// PERF-114: FindImage through a memo of the same descriptor's last lookup.
+    [[nodiscard]] ImageId FindImageMemo(ImageDesc& desc, FindMemo& memo) {
+        if (memo.cacheable && memo.generation == RegistryGeneration()) {
+            Image& image = slot_images[memo.id];
+            image.tick_accessed_last = scheduler.CurrentTick();
+            TouchImage(image);
+            return memo.id;
+        }
+        return FindImage(desc, false, &memo);
+    }
 
     /// Retrieves image whose address matches provided
     [[nodiscard]] ImageId FindImageFromRange(VAddr address, size_t size, bool ensure_valid = true);

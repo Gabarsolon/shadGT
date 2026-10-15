@@ -358,6 +358,7 @@ private:
         u8 flags{};
         bool valid{};
         VideoCore::TextureCache::ImageDesc desc;
+        VideoCore::TextureCache::FindMemo find_memo; // PERF-114
     };
     std::vector<DecodedTsharp> decoded_tsharps;
 

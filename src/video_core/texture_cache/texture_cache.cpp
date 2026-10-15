@@ -893,8 +893,12 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
     return new_image_id;
 }
 
-ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
+ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt, FindMemo* memo) {
     ++Common::GetWorkCounters().find_image;
+    if (memo) {
+        memo->cacheable = false;
+    }
+    const u64 generation_before = RegistryGeneration();
     const auto& info = desc.info;
     ASSERT(info.guest_address != 0);
 
@@ -945,6 +949,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         }
         image_id = cache_id;
     }
+    const bool perfect_match = static_cast<bool>(image_id);
 
     // Try to resolve overlaps (if any)
     int view_mip{-1};
@@ -1064,6 +1069,15 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     Image& image = slot_images[image_id];
     image.tick_accessed_last = scheduler.CurrentTick();
     TouchImage(image);
+
+    // PERF-114: a perfect match alone at its address, found without registry changes, is what
+    // the same lookup finds again until an image is registered or unregistered.
+    static const bool memo_enabled = Common::PerfFeatureEnabled(114);
+    if (memo && memo_enabled && perfect_match && !registry_changed && same_address.size() == 1 &&
+        same_address[0] == image_id && RegistryGeneration() == generation_before &&
+        newer_subrects.empty()) {
+        *memo = {generation_before, image_id, true};
+    }
 
     // If the image requested is a subresource of the image from cache record its location.
     if (view_mip > 0) {

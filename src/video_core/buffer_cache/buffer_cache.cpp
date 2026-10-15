@@ -2944,7 +2944,9 @@ bool BufferCache::SynchronizeMemoryFromImage(VAddr device_addr, u32 size) {
     static const bool overlap_memo_enabled = memo && Common::PerfFeatureEnabled(78);
     auto& overlap =
         overlap_memo[((device_addr >> 8) ^ (device_addr >> 24) ^ size) % overlap_memo.size()];
-    std::vector<ImageId> walked;
+    // PERF-113: one list per recorder thread, reused (a new vector per call was ~1% of it).
+    thread_local std::vector<ImageId> walked;
+    walked.clear();
     const std::vector<ImageId>* first_level = &walked;
     if (overlap_memo_enabled && overlap.address == device_addr && overlap.size == size &&
         overlap.generation == generation) {

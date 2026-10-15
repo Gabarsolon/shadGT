@@ -109,7 +109,9 @@ void DropAliases(VAddr address, u64 size) {
     if ((end - first) / AliasPage > cache.views.size()) {
         for (auto it = cache.views.begin(); it != cache.views.end();) {
             if (it->first >= first && it->first < end) {
-                unmap_alias(it->second);
+                if (it->second) {
+                    unmap_alias(it->second);
+                }
                 it = cache.views.erase(it);
             } else {
                 ++it;
@@ -119,7 +121,9 @@ void DropAliases(VAddr address, u64 size) {
     }
     for (VAddr page = first; page < end; page += AliasPage) {
         if (const auto it = cache.views.find(page); it != cache.views.end()) {
-            unmap_alias(it->second);
+            if (it->second) {
+                unmap_alias(it->second);
+            }
             cache.views.erase(it);
         }
     }
@@ -127,6 +131,46 @@ void DropAliases(VAddr address, u64 size) {
 
 // Copies through an alias view of the same pages, so protections set for write tracking do not
 // fault and the copy does not count as a guest write.
+// PERF-112: a write that fits in one 16 KiB page goes through a cached alias view of the page,
+// without the VirtualQuery TryWriteBacking made for each write (fence and label writes: ~3% of the
+// recorder in a 20-car race). Pages without an alias (not Ryty shared memory) are remembered as
+// such (a null view) and return false, so the caller takes the usual path.
+bool WriteThroughCachedAlias(VAddr address, const void* source, u64 size) {
+    static const auto map_alias = RytyFunction<MapAliasFn>("libc.prx", "TXQU8CpoEtI");
+    static const auto unmap_alias = RytyFunction<UnmapAliasFn>("libc.prx", "674-w6lwWXI");
+    static const bool cache_views = [] {
+        const char* env = std::getenv("SHADGT_ALIAS_CACHE");
+        return !(env && env[0] == '0');
+    }();
+    if (!cache_views || map_alias == nullptr || unmap_alias == nullptr) {
+        return false;
+    }
+    constexpr VAddr AliasPage = 0x4000;
+    const VAddr first = address & ~(AliasPage - 1);
+    if (((address + size + AliasPage - 1) & ~(AliasPage - 1)) - first != AliasPage) {
+        return false;
+    }
+    auto& cache = GetAliasCache();
+    std::scoped_lock lk{cache.mutex};
+    auto it = cache.views.find(first);
+    if (it == cache.views.end()) {
+        if (cache.views.size() >= 4096) {
+            for (const auto& [page, view] : cache.views) {
+                if (view) {
+                    unmap_alias(view);
+                }
+            }
+            cache.views.clear();
+        }
+        it = cache.views.emplace(first, map_alias(first, AliasPage)).first;
+    }
+    if (it->second == nullptr) {
+        return false;
+    }
+    std::memcpy(static_cast<u8*>(it->second) + (address - first), source, size);
+    return true;
+}
+
 bool CopyThroughAlias(VAddr address, void* dest, const void* source, u64 size) {
     static const auto map_alias = RytyFunction<MapAliasFn>("libc.prx", "TXQU8CpoEtI");
     static const auto unmap_alias = RytyFunction<UnmapAliasFn>("libc.prx", "674-w6lwWXI");
@@ -151,7 +195,9 @@ bool CopyThroughAlias(VAddr address, void* dest, const void* source, u64 size) {
         if (it == cache.views.end()) {
             if (cache.views.size() >= 4096) {
                 for (const auto& [page, view] : cache.views) {
-                    unmap_alias(view);
+                    if (view) {
+                        unmap_alias(view);
+                    }
                 }
                 cache.views.clear();
             }
@@ -159,7 +205,7 @@ bool CopyThroughAlias(VAddr address, void* dest, const void* source, u64 size) {
                 it = cache.views.emplace(first, view).first;
             }
         }
-        if (it != cache.views.end()) {
+        if (it != cache.views.end() && it->second != nullptr) {
             std::memcpy(static_cast<u8*>(it->second) + (address - first), source, size);
             return true;
         }
@@ -941,6 +987,11 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size,
         return false;
     }
     RecordBackingWrite(virtual_addr, size, loc); // DIAG-071
+    static const bool cached_alias_first = Common::PerfFeatureEnabled(112);
+    if (cached_alias_first && WriteThroughCachedAlias(virtual_addr, data, size)) {
+        RytyMemory::NoteOwnWrite(virtual_addr, size); // FIX-073
+        return true;
+    }
     MEMORY_BASIC_INFORMATION info;
     if (::VirtualQuery(address, &info, sizeof(info)) && IsWritable(info.Protect) &&
         reinterpret_cast<VAddr>(info.BaseAddress) + info.RegionSize >= virtual_addr + size) {
