@@ -129,6 +129,8 @@ public:
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBuffer(VAddr device_addr, u32 size,
                                                              bool is_written,
                                                              bool is_texel_buffer = false);
+    std::pair<const Buffer*, u64> ObtainBufferImpl(VAddr device_addr, u32 size, bool is_written,
+                                                   bool is_texel_buffer);
 
     /// Attempts to obtain a buffer without modifying the cache contents.
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBufferForImage(VAddr device_addr, u32 size);
@@ -385,6 +387,20 @@ private:
         u64 export_state;
     };
     std::vector<QuietRange> quiet_memo = std::vector<QuietRange>(4096);
+    /// PERF-117: the last synchronization of a read-only arena range (see ObtainBuffer).
+    struct ArenaMemo {
+        VAddr address{};
+        u32 size{};
+        bool texel{};
+        const Buffer* arena{};
+        u32 epoch{};
+        u64 versions{};
+        u64 registry{};
+        u64 export_state{};
+    };
+    std::vector<ArenaMemo> arena_memos = std::vector<ArenaMemo>(8192);
+    u64 arena_memo_hits{};
+    u64 arena_memo_stores{};
     /// PERF-085: images already listed in this export plan, by slot index.
     std::vector<u32> listed_stamps;
     u32 listed_stamp{};

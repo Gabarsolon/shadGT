@@ -201,6 +201,18 @@ private:
         return false;
     }
 
+public:
+    /// PERF-117: a value that changes whenever any region the range touches has pages marked
+    /// CPU-modified (sum of the regions' versions; regions not created yet count as 0).
+    u64 CpuVersionSum(VAddr cpu_address, u64 size) {
+        u64 sum = 0;
+        IteratePages<false>(cpu_address, size, [&](RegionManager* manager, u64, u64) {
+            sum += manager->CpuVersion();
+        });
+        return sum;
+    }
+
+private:
     RegionManager* CreateRegion(u64 page_index) {
         const VAddr base_cpu_addr = page_index << HIGHER_PAGE_BITS;
         if (free_managers.empty()) {

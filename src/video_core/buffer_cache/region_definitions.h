@@ -3,6 +3,10 @@
 
 #pragma once
 
+#include <string_view>
+
+#include <source_location>
+
 #include <atomic>
 #include "common/perf_monitor.h"
 
@@ -31,7 +35,15 @@ constexpr u64 NUM_REGION_PAGES = HIGHER_PAGE_SIZE / BYTES_PER_PAGE;
 inline std::atomic<u32> g_upload_epoch{1};
 /// PERF-049: told of each new epoch (the hot-page prehasher).
 inline std::atomic<void (*)(u32)> g_upload_epoch_listener{nullptr};
-inline void BumpUploadEpoch() {
+/// DIAG-112: epoch bumps by source line (index line + 8192 for vk_rasterizer.cpp).
+inline std::array<std::atomic<u32>, 16384> g_epoch_bump_sources{};
+inline void BumpUploadEpoch(std::source_location loc = std::source_location::current()) {
+    {
+        const std::string_view file = loc.file_name();
+        const u32 line = loc.line() & 8191;
+        g_epoch_bump_sources[line + (file.find("rasterizer") != std::string_view::npos ? 8192 : 0)]
+            .fetch_add(1, std::memory_order_relaxed);
+    }
     const u32 epoch = g_upload_epoch.fetch_add(1, std::memory_order_acq_rel) + 1;
     Common::GetWorkCounters().upload_epochs.fetch_add(1, std::memory_order_relaxed);
     if (const auto listener = g_upload_epoch_listener.load(std::memory_order_acquire)) {

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <intrin.h>
 #include <array>
 #include <atomic>
 #include <condition_variable>
@@ -1259,7 +1260,10 @@ void BufferCache::RefreshReadbackPageHashes(VAddr address, u64 size) {
     const auto refresh = [&](VAddr page, std::array<u8, 4096>& snapshot) {
         const VAddr s = std::max(address, page);
         const VAddr e = std::min<VAddr>(end, page + 4_KB);
-        Common::CopyGuest(snapshot.data() + (s - page), std::bit_cast<const void*>(s), e - s);
+        // FIX-107: through CopySparseMemory, which reads tracked and guarded pages through an
+        // alias view: a fault here (often on the readback thread holding the buffer-cache lock)
+        // waited for the recorder, which waited for that lock (early fences froze).
+        memory->CopySparseMemory(s, snapshot.data() + (s - page), e - s);
         NoteSnapshotUpdate(page, "renderer write or upload");
     };
     const VAddr first = Common::AlignDown(address, 4_KB);
@@ -1271,7 +1275,7 @@ void BufferCache::RefreshReadbackPageHashes(VAddr address, u64 size) {
             auto& snapshot = readback_page_snapshots[page];
             if (!snapshot) {
                 snapshot = std::make_unique<std::array<u8, 4096>>();
-                Common::CopyGuest(snapshot->data(), std::bit_cast<const void*>(page), 4_KB);
+                memory->CopySparseMemory(page, snapshot->data(), 4_KB); // FIX-107
                 NoteSnapshotUpdate(page, "fault write-back");
             }
             it = pending_snapshot_pages.erase(it);
@@ -1515,7 +1519,13 @@ std::shared_ptr<BufferCache::FaultDownload> BufferCache::BeginFaultFlush(VAddr d
             }
 #endif
             const u8* snapshot = fault->snapshots[c].data();
-            const u8* guest = std::bit_cast<const u8*>(start);
+            // FIX-108: the guest bytes are compared from a copy CopySparseMemory takes through
+            // an alias view where pages are protected: a fault here, with fault_downloads_mutex
+            // held, waited for the recorder, which waited for that lock (early fences froze).
+            thread_local std::vector<u8> guest_copy;
+            guest_copy.resize(copy.size);
+            memory->CopySparseMemory(start, guest_copy.data(), copy.size);
+            const u8* guest = guest_copy.data();
             for (const auto& [s, e] : PartsWithoutNewerWrites(start, start + copy.size,
                                                               fault->released)) {
                 // PERF-052b: only bytes still as they were when the download was recorded; a
@@ -1663,8 +1673,29 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
     }
 }
 
+// DIAG-111 (with SHADGT_DIAG_OBTAIN=1): cycles spent in obtains by kind, logged with DIAG-109.
+static std::atomic<u64> g_obtain_cycles[3]{}; // stream, arena read, arena written
+static std::atomic<u64> g_obtain_counts[3]{};
+
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
                                                         bool is_written, bool is_texel_buffer) {
+    static const bool diag_time = [] {
+        const char* env = std::getenv("SHADGT_DIAG_OBTAIN");
+        return env && env[0] == '1';
+    }();
+    if (diag_time) {
+        const u64 start = __rdtsc();
+        const auto result = ObtainBufferImpl(device_addr, size, is_written, is_texel_buffer);
+        const int kind = result.first == &stream_buffer ? 0 : is_written ? 2 : 1;
+        g_obtain_cycles[kind] += __rdtsc() - start;
+        ++g_obtain_counts[kind];
+        return result;
+    }
+    return ObtainBufferImpl(device_addr, size, is_written, is_texel_buffer);
+}
+
+std::pair<const Buffer*, u64> BufferCache::ObtainBufferImpl(VAddr device_addr, u32 size,
+                                                            bool is_written, bool is_texel_buffer) {
     std::scoped_lock buffer_lock{mutex}; // PERF-067
     RecordPendingAheadUploads(device_addr, size);
     if (is_written) {
@@ -1701,12 +1732,68 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         if (const auto now = std::chrono::steady_clock::now(); now - window >= std::chrono::seconds{2}) {
             LOG_WARNING(Render_Vulkan,
                         "DIAG-109: obtains in 2 s: {} ({} small), {} repeat a read-only range of "
-                        "the same epoch ({} small); {} epochs",
-                        calls, small_calls, repeats, small_repeats, epochs);
+                        "the same epoch ({} small); {} epochs; PERF-117 arena memo {} hits {} "
+                        "stores; DIAG-111 Mcycles/count: stream "
+                        "{}/{}, arena read {}/{}, arena written {}/{}",
+                        calls, small_calls, repeats, small_repeats, epochs,
+                        std::exchange(arena_memo_hits, 0), std::exchange(arena_memo_stores, 0),
+                        g_obtain_cycles[0].exchange(0) / 1000000, g_obtain_counts[0].exchange(0),
+                        g_obtain_cycles[1].exchange(0) / 1000000, g_obtain_counts[1].exchange(0),
+                        g_obtain_cycles[2].exchange(0) / 1000000, g_obtain_counts[2].exchange(0));
+            std::string sources;
+            for (u32 i = 0; i < g_epoch_bump_sources.size(); ++i) {
+                if (const u32 n = g_epoch_bump_sources[i].exchange(0); n != 0) {
+                    sources += fmt::format(" {}:{}={}", i >= 8192 ? "rasterizer" : "liverpool",
+                                           i & 8191, n);
+                }
+            }
+            LOG_WARNING(Render_Vulkan, "DIAG-112: upload epoch bumps in 2 s by source:{}", sources);
             calls = repeats = small_calls = small_repeats = epochs = 0;
             window = now;
         }
     }
+    // PERF-117: a read-only arena range synchronized earlier in this upload epoch is current
+    // while no page of its regions was marked CPU-modified since and no image over it changed:
+    // later draws of the epoch bind it without walking, hashing or protecting its pages again.
+    // Draws bind the same pool ranges over and over (~1 arena read per draw, ~2.7 us each).
+    // Only ranges above the stream threshold, which always come from the arena.
+    // Opt-in (SHADGT_ARENA_MEMO=1): no measurable gain in the Tokyo A/B, kept for the ceiling
+    // tests and the draw-state cache.
+    static const bool arena_memo_enabled = [] {
+        const char* env = std::getenv("SHADGT_ARENA_MEMO");
+        return Common::PerfFeatureEnabled(117) && env && env[0] == '1';
+    }();
+    ArenaMemo* memo_lookup_slot = nullptr;
+    u64 memo_versions = 0;
+    if (arena_memo_enabled && !is_written && size > STREAM_THRESHOLD && !read_capture) {
+        memo_lookup_slot = &arena_memos[((device_addr >> 6) ^ (device_addr >> 22) ^ size ^
+                                         (u64(is_texel_buffer) << 5)) %
+                                        arena_memos.size()];
+        memo_versions = memory_tracker->CpuVersionSum(device_addr, size);
+        const auto& m = *memo_lookup_slot;
+        // EXP-118 (SHADGT_CEIL_NOSYNC=1, measurement only, rendering goes wrong): a range is
+        // synchronized once and never again, for the frame rate without arena synchronization.
+        static const bool ceil_nosync = [] {
+            const char* env = std::getenv("SHADGT_CEIL_NOSYNC");
+            return env && env[0] == '1';
+        }();
+        if (ceil_nosync && m.address == device_addr && m.size == size &&
+            m.texel == is_texel_buffer) {
+            ++arena_memo_hits;
+            return {m.arena, m.arena->Offset(device_addr)};
+        }
+        if (m.address == device_addr && m.size == size && m.texel == is_texel_buffer &&
+            m.arena == GetArena(device_addr >> block_shift, (device_addr + size - 1) >> block_shift) &&
+            m.epoch == g_upload_epoch.load(std::memory_order_acquire) &&
+            m.versions == memo_versions && m.registry == texture_cache.RegistryGeneration() &&
+            m.export_state == g_image_export_state.load(std::memory_order_relaxed)) {
+            ++arena_memo_hits;
+            return {m.arena, m.arena->Offset(device_addr)};
+        }
+    }
+    const u32 memo_epoch = g_upload_epoch.load(std::memory_order_acquire);
+    const u64 memo_registry = texture_cache.RegistryGeneration();
+    const u64 memo_export_state = g_image_export_state.load(std::memory_order_relaxed);
     const bool images_overlap = SynchronizeMemoryFromImage(device_addr, size);
     // PERF-043: with no image over the range, it has no GPU image alias either; the texture
     // cache is not walked again. -DisablePerf 55 walks it again.
@@ -1723,8 +1810,17 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     const u64 first_block = device_addr >> block_shift;
     const u64 last_block = (device_addr + size - 1) >> block_shift;
     const auto* arena = GetArena(first_block, last_block);
+    ArenaMemo* arena_memo = memo_lookup_slot;
+    const u64 versions = memo_versions;
     EnsureResident(arena, first_block, last_block);
     SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
+    if (arena_memo) {
+        // The state from before this synchronization: anything it changed shows up as a
+        // different version or generation, and the next lookup synchronizes again.
+        *arena_memo = {device_addr, size,     is_texel_buffer, arena,
+                       memo_epoch,  versions, memo_registry,  memo_export_state};
+        ++arena_memo_stores;
+    }
     if (is_written) {
         SyncUnseenCpuWrites(arena, device_addr, size); // FIX-073
         gpu_modified_ranges.Add(device_addr, size);

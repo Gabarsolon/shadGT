@@ -36,6 +36,12 @@ public:
     }
     explicit RegionManager() = default;
 
+    /// PERF-117: changes whenever pages of this region are marked CPU-modified (a CPU write
+    /// fault, an emulator write, an unmap), i.e. whenever the region may need uploading again.
+    u32 CpuVersion() const {
+        return cpu_version.load(std::memory_order_acquire);
+    }
+
     void SetCpuAddress(VAddr new_cpu_addr) {
         cpu_addr = new_cpu_addr;
     }
@@ -99,6 +105,9 @@ public:
         IterateWords(bounds, [&](u64 index, u64 mask) {
             UpdateStateAndProtection<cpu_op, gpu_op>(write_prot, read_prot, index, mask);
         });
+        if constexpr (cpu_op == StateOp::Set) {
+            cpu_version.fetch_add(1, std::memory_order_release); // PERF-117
+        }
         const auto write_op = GetPageOp<Type::CPU>(cpu_op);
         const auto read_op = GetPageOp<Type::GPU>(gpu_op);
         const bool update_watchers = write_op != PageOp::None || read_op != PageOp::None;
@@ -395,6 +404,7 @@ private:
     RegionBits cpu;
     RegionBits gpu;
     LockType mutex;
+    std::atomic<u32> cpu_version{1};
 
     // PERF-012: hot pages and their uploads in the current epoch.
     static constexpr u8 HotPageFaults = 8;

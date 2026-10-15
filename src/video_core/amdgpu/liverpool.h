@@ -400,6 +400,8 @@ private:
     // memory through a capture taken at decode; when all of it does, the fence that ends the
     // window is signaled at decode.
     int early_fences_mode{};
+    int early_fences_pending{};                          // EXP-120
+    std::chrono::steady_clock::time_point early_fences_at{}; // EXP-120
     std::shared_ptr<Common::ReadCapture> window_capture;
     std::vector<std::pair<VAddr, u64>> window_guards; // PERF-070
     std::atomic<u64> guard_waits_070{};

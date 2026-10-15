@@ -395,6 +395,13 @@ void Liverpool::StartDrawPipe() {
         env && (env[0] == '1' || env[0] == '2') && Common::PerfFeatureEnabled(71) &&
         Common::PerfFeatureEnabled(69) && rasterizer && rasterizer->SelectsPipelinesAhead()) {
         early_fences_mode = env[0] - '0';
+        // EXP-120 (SHADGT_EARLY_FENCES_LATE=<seconds>, measurement only): the mode starts that
+        // long after start, at a graphics submission (the menus froze with it).
+        if (const char* late = std::getenv("SHADGT_EARLY_FENCES_LATE"); late && *late) {
+            early_fences_pending = early_fences_mode;
+            early_fences_mode = 0;
+            early_fences_at = std::chrono::steady_clock::now() + std::chrono::seconds(std::atoi(late));
+        }
         LOG_WARNING(Render, "PERF-063: early fences on (mode {})", early_fences_mode);
     }
     LOG_WARNING(
@@ -1473,6 +1480,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     if (!original_dcb.empty()) {
         RecordCmdBuffer(original_dcb.data(), original_dcb.size_bytes(), false);
         decoding_submit.fetch_add(1, std::memory_order_relaxed); // DIAG-061
+    }
+    if (early_fences_pending && std::chrono::steady_clock::now() >= early_fences_at) {
+        early_fences_mode = std::exchange(early_fences_pending, 0); // EXP-120
+        LOG_WARNING(Render, "EXP-120: early fences on now (mode {})", early_fences_mode);
     }
 
     cblock.Reset();

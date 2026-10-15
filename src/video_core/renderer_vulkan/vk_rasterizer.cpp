@@ -1333,6 +1333,21 @@ void NoteDrawKey(std::pair<u64, u64> key, int outcome) {
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     RENDERER_TRACE;
     ++Common::GetWorkCounters().draws;
+    // EXP-119 (SHADGT_CEIL_SKIPDRAW=1 after SHADGT_CEIL_AFTER seconds, measurement only, nothing
+    // is drawn): the frame rate with draws costing nothing on the recorder.
+    static const bool ceil_skip = [] {
+        const char* env = std::getenv("SHADGT_CEIL_SKIPDRAW");
+        return env && env[0] == '1';
+    }();
+    if (ceil_skip) {
+        static const auto after = [] {
+            const char* env = std::getenv("SHADGT_CEIL_AFTER");
+            return std::chrono::steady_clock::now() + std::chrono::seconds(env ? std::atoi(env) : 0);
+        }();
+        if (std::chrono::steady_clock::now() >= after) {
+            return;
+        }
+    }
     using Common::Phase;
     using Common::PhaseTimer;
     PhaseTimer total_timer{Phase::DrawTotal};
@@ -1402,6 +1417,49 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     if (!BindResources(pipeline)) {
         if (DrawSetEnabled()) NoteDrawSet(pipeline_cache.SelectedInfos(), 2);
         return;
+    }
+    // DIAG-113 (SHADGT_DIAG_REUSE=1): how many draws bind exactly what a draw of the last
+    // ~33 ms bound (pipeline, image views, non-stream buffers; stream offsets ignored), i.e. what
+    // a draw-state cache could reuse.
+    static const bool diag_reuse = [] {
+        const char* env = std::getenv("SHADGT_DIAG_REUSE");
+        return env && env[0] == '1';
+    }();
+    if (diag_reuse) {
+        static std::unordered_set<u64> current, previous;
+        static auto window = std::chrono::steady_clock::now();
+        static auto report = window;
+        static u64 draws = 0, hits = 0, stream_bindings = 0;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - window >= std::chrono::milliseconds(33)) {
+            previous.swap(current);
+            current.clear();
+            window = now;
+        }
+        u64 h = XXH3_64bits(&pipeline, sizeof(pipeline));
+        for (const auto& info : image_infos) {
+            h = XXH3_64bits_withSeed(&info.imageView, sizeof(info.imageView), h);
+        }
+        const vk::Buffer stream = buffer_cache.GetStreamBuffer().Handle();
+        for (const auto& info : buffer_infos) {
+            if (info.buffer == stream) {
+                ++stream_bindings;
+                continue;
+            }
+            h = XXH3_64bits_withSeed(&info, sizeof(info), h);
+        }
+        ++draws;
+        hits += previous.contains(h) || current.contains(h);
+        current.insert(h);
+        if (now - report >= std::chrono::seconds(2)) {
+            LOG_WARNING(Render_Vulkan,
+                        "DIAG-113: {} draws, {} bind what a draw of the last ~33 ms bound "
+                        "({:.0f}%), {:.1f} stream bindings per draw",
+                        draws, hits, draws ? 100.0 * hits / draws : 0.0,
+                        draws ? double(stream_bindings) / draws : 0.0);
+            draws = hits = stream_bindings = 0;
+            report = now;
+        }
     }
     if (DrawSetEnabled()) {
         const auto& stages = pipeline->GetStages();
