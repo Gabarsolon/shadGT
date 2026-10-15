@@ -233,6 +233,12 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       // came with exploded vertices. The drain's wait for all earlier GPU work is what the game
       // relies on there.
       split_gds_write_faults{false} {
+    for (u32 i = 1; i < StageWorkerCount(); ++i) { // R5
+        worker_streams[i] = std::make_unique<StreamBuffer>(instance, scheduler, MemoryType::Stream,
+                                                           STREAM_BUFFER_SIZE / 2);
+        worker_stagings[i] = std::make_unique<StreamBuffer>(
+            instance, scheduler, MemoryType::HostUncached, STREAM_BUFFER_SIZE / 2);
+    }
     const vk::BufferCreateInfo probe_ci = {
         .flags =
             vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency,
@@ -1701,8 +1707,138 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     return ObtainBufferImpl(device_addr, size, is_written, is_texel_buffer);
 }
 
+std::optional<bool> BufferCache::ImagesOverQuick(VAddr device_addr, u32 size) const {
+    // R6 (recorder): SynchronizeMemoryFromImage's answer when its memos have it and nothing is
+    // to be exported; nothing when the images must be walked or exported.
+    if (size == 0) {
+        return false;
+    }
+    if (!Common::PerfFeatureEnabled(67)) {
+        return std::nullopt;
+    }
+    const u64 generation = texture_cache.RegistryGeneration();
+    const auto& slot =
+        no_image_memo[((device_addr >> 6) ^ (device_addr >> 21) ^ size) % no_image_memo.size()];
+    if (slot.address == device_addr && slot.size == size && slot.generation == generation) {
+        return false;
+    }
+    if (Common::PerfFeatureEnabled(77)) {
+        constexpr u32 BlockBits = 16;
+        const VAddr first = device_addr >> BlockBits;
+        const VAddr last = (device_addr + size - 1) >> BlockBits;
+        bool all_free = last - first < 16;
+        for (VAddr block = first; all_free && block <= last; ++block) {
+            const auto& entry = no_image_blocks[block % no_image_blocks.size()];
+            all_free = entry.block == block && entry.generation == generation;
+        }
+        if (all_free) {
+            return false;
+        }
+    }
+    if (Common::PerfFeatureEnabled(98)) {
+        const u64 export_state = g_image_export_state.load(std::memory_order_relaxed);
+        const auto& quiet =
+            quiet_memo[((device_addr >> 8) ^ (device_addr >> 24) ^ size) % quiet_memo.size()];
+        if (quiet.address == device_addr && quiet.size == size &&
+            quiet.generation == generation && quiet.export_state == export_state) {
+            return true;
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<std::pair<const Buffer*, u64>> BufferCache::ObtainBufferShared(
+    VAddr device_addr, u32 size, bool is_written, bool is_texel_buffer) {
+    // R6 (recorder, cache lock held shared): the common obtain, while the stage workers keep
+    // obtaining. Nothing (and nothing changed but recorded ahead uploads) when it needs an
+    // image walk or export, a new arena, residency or metadata: the exclusive path then.
+    if (is_texel_buffer) {
+        return std::nullopt;
+    }
+    const auto images = ImagesOverQuick(device_addr, size);
+    if (!images) {
+        return std::nullopt;
+    }
+    const u64 first_block = device_addr >> block_shift;
+    const u64 last_block = (device_addr + size - 1) >> block_shift;
+    const u64 first_page = first_block >> blocks_per_arena_page_shift;
+    const u64 last_page = last_block >> blocks_per_arena_page_shift;
+    const bool stream = !is_written && size <= STREAM_THRESHOLD && !*images;
+    const Buffer* arena = address_space[first_page];
+    if (!stream) {
+        if (!arena || arena != address_space[last_page]) {
+            return std::nullopt;
+        }
+        bool resident = true;
+        resident_ranges.ForEachGap(first_block, last_block + 1,
+                                   [&](u64, u64) { resident = false; });
+        if (!resident) {
+            return std::nullopt;
+        }
+    }
+    RecordPendingAheadUploads(device_addr, size);
+    if (is_written) {
+        InvalidateAsyncReadbacks(device_addr, size);
+    }
+    ApplyCompletedReadbacks();
+    ++Common::GetWorkCounters().obtain_buffer;
+    if (stream && !IsRegionGpuModified(device_addr, size)) {
+        const auto [data, offset] = stream_buffer.Map(size, instance.UniformMinAlignment());
+        memory->CopySparseMemory(device_addr, data, size, read_capture);
+        stream_buffer.Commit();
+        ++Common::GetWorkCounters().obtain_stream;
+        return std::pair<const Buffer*, u64>{&stream_buffer, offset};
+    }
+    if (!arena || arena != address_space[last_page]) {
+        return std::nullopt; // GPU-written small range without an arena yet
+    }
+    if (stream) {
+        bool resident = true;
+        resident_ranges.ForEachGap(first_block, last_block + 1,
+                                   [&](u64, u64) { resident = false; });
+        if (!resident) {
+            return std::nullopt;
+        }
+    }
+    SynchronizeMemory(arena, device_addr, size, is_written, false);
+    if (is_written) {
+        SyncUnseenCpuWrites(arena, device_addr, size); // FIX-073
+        {
+            std::scoped_lock gpu_lk{gpu_ranges_mutex};
+            gpu_modified_ranges.Add(device_addr, size);
+        }
+        NoteGpuWriteSeq(device_addr, size); // FIX-069
+        NoteGpuWrite(device_addr, size);
+        if (size <= 4_KB) {
+            if (small_gpu_writers.size() > 65536) {
+                small_gpu_writers.clear();
+            }
+            small_gpu_writers[Common::AlignDown(device_addr, 4_KB)] =
+                GpuWriter{g_gpu_write_kind, g_gpu_write_tag, device_addr, size};
+        } else {
+            if (large_gpu_writers.size() > 16384) {
+                large_gpu_writers.clear();
+            }
+            large_gpu_writers[device_addr] =
+                GpuWriter{g_gpu_write_kind, g_gpu_write_tag, device_addr, size};
+        }
+    }
+    return std::pair<const Buffer*, u64>{arena, arena->Offset(device_addr)};
+}
+
 std::pair<const Buffer*, u64> BufferCache::ObtainBufferImpl(VAddr device_addr, u32 size,
                                                             bool is_written, bool is_texel_buffer) {
+    // R6: the common case under the shared lock (stage workers obtain meanwhile). -DisablePerf
+    // 132 always takes it exclusively.
+    static const bool shared_obtain =
+        Common::PerfFeatureEnabled(132) && StageWorkerCount() > 1;
+    if (shared_obtain && t_recorder_thread && !CacheMutex::HeldExclusive()) {
+        std::shared_lock shared{mutex};
+        if (const auto result = ObtainBufferShared(device_addr, size, is_written, is_texel_buffer)) {
+            ++shared_obtains;
+            return *result;
+        }
+    }
     std::scoped_lock buffer_lock{mutex}; // PERF-067
     // EXP-124 (SHADGT_CEIL_STREAMFAST=1, measurement only): small read-only ranges are copied
     // into the stream ring with no other bookkeeping (no image or GPU-write checks).
@@ -2177,6 +2313,7 @@ std::optional<std::pair<const Buffer*, u64>> BufferCache::ObtainBufferAhead(
                 lk_ex.unlock();
             }
         }
+        auto& ahead_stream = AheadStream(); // R5
         const auto [data, offset] = ahead_stream.Map(size, instance.UniformMinAlignment(), false);
         if (!data) {
             ++ahead_refusals[2];
@@ -2208,7 +2345,7 @@ std::optional<std::pair<const Buffer*, u64>> BufferCache::ObtainBufferAhead(
     // The uploads' staging must not wait for the GPU either: size of everything this range
     // could upload.
     {
-        const auto [probe, probe_offset] = ahead_staging.Map(size, 16, false);
+        const auto [probe, probe_offset] = AheadStaging().Map(size, 16, false);
         if (!probe) {
             ++ahead_refusals[5];
             return std::nullopt;
@@ -2216,7 +2353,12 @@ std::optional<std::pair<const Buffer*, u64>> BufferCache::ObtainBufferAhead(
     }
     const Buffer* arena = address_space[first_page];
     ahead_uploads = &uploads;
+    // R5: the recorder waits for this before it uses a range over it (SettleAheadRange).
+    auto& sync = worker_syncs[t_stage_worker];
+    sync.end.store(device_addr + size, std::memory_order_relaxed);
+    sync.begin.store(device_addr, std::memory_order_seq_cst);
     SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
+    sync.begin.store(0, std::memory_order_release);
     ahead_uploads = nullptr;
     if (is_written) {
         gpu_modified_ranges.Add(device_addr, size);
@@ -2237,6 +2379,31 @@ std::optional<std::pair<const Buffer*, u64>> BufferCache::ObtainBufferAhead(
         }
     }
     return std::pair<const Buffer*, u64>{arena, arena->Offset(device_addr)};
+}
+
+u32 BufferCache::StageWorkerCount() {
+    static const u32 count = [] {
+        const char* env = std::getenv("SHADGT_STAGE_WORKERS");
+        const int n = env ? std::atoi(env) : 1;
+        return static_cast<u32>(std::clamp(n, 1, static_cast<int>(MaxStageWorkers)));
+    }();
+    return count;
+}
+
+void BufferCache::SettleAheadRange(VAddr device_addr, u64 size) {
+    const VAddr end = device_addr + size;
+    for (u32 i = 0; i < StageWorkerCount(); ++i) {
+        auto& sync = worker_syncs[i];
+        while (true) {
+            const VAddr begin = sync.begin.load(std::memory_order_seq_cst);
+            if (begin == 0 || begin >= end || sync.end.load(std::memory_order_relaxed) <= device_addr) {
+                break;
+            }
+            _mm_pause();
+        }
+    }
+    std::shared_lock buffer_lock{mutex};
+    RecordPendingAheadUploads(device_addr, size);
 }
 
 void BufferCache::RecordAheadUpload(AheadUpload& upload) {
@@ -2603,6 +2770,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         Common::GetWorkCounters().upload_bytes += total_size_bytes;
         if (ahead_uploads) {
             // PERF-067: on the buffer stage; the ring and the free check were done before.
+            auto& ahead_staging = AheadStaging(); // R5
             const auto [mapped, staging_offset] = ahead_staging.Map(total_size_bytes, 16, false);
             ASSERT(mapped);
             for (auto& copy : copies) {

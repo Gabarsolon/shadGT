@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 
@@ -35,7 +36,17 @@ DrawPipe::DrawPipe(std::function<void()> thread_init_, size_t max_pending_)
     if (const char* env = std::getenv("SHADGT_BUFFER_STAGE");
         env && env[0] == '1' && Common::PerfFeatureEnabled(74)) {
         stage_enabled = true;
-        stage = std::jthread{[this](std::stop_token stop) { RunStage(stop); }};
+        if (const char* workers_env = std::getenv("SHADGT_STAGE_WORKERS")) {
+            worker_count = static_cast<u32>(std::clamp(std::atoi(workers_env), 1, 4));
+        }
+        if (worker_count > 1) {
+            for (u32 i = 0; i < worker_count; ++i) {
+                workers.emplace_back([this, i](std::stop_token stop) { RunWorker(stop, i); });
+            }
+            stage = std::jthread{[this](std::stop_token stop) { RunDispatcher(stop); }};
+        } else {
+            stage = std::jthread{[this](std::stop_token stop) { RunStage(stop); }};
+        }
     }
 }
 
@@ -48,6 +59,14 @@ DrawPipe::~DrawPipe() {
             stage_cv.notify_all();
         }
         stage.join();
+        for (auto& worker : workers) {
+            worker.request_stop();
+        }
+        {
+            std::scoped_lock lk{work_mutex};
+            work_items_cv.notify_all();
+        }
+        workers.clear();
     }
     recorder.request_stop();
     {
@@ -61,7 +80,7 @@ void DrawPipe::Push(Work&& work) {
     Push(std::move(work), JobKind::Barrier);
 }
 
-void DrawPipe::Push(Work&& work, JobKind kind, Prepare&& prepare) {
+void DrawPipe::Push(Work&& work, JobKind kind, Prepare&& prepare, Work&& order) {
     if (stage_enabled) {
         {
             std::scoped_lock lk{mutex};
@@ -88,7 +107,8 @@ void DrawPipe::Push(Work&& work, JobKind kind, Prepare&& prepare) {
             }
         }
         push_tag = nullptr;
-        stage_queue.push_back(StageJob{std::move(work), std::move(prepare), kind});
+        stage_queue.push_back(
+            StageJob{std::move(work), std::move(prepare), kind, std::move(order)});
         stage_cv.notify_one();
         return;
     }
@@ -167,6 +187,9 @@ void DrawPipe::RunStage(std::stop_token stop) {
         if (job.prepare) {
             Common::Nvtx::Scope nvtx{"buffer stage"}; // DIAG-056
             const auto prepare_start = std::chrono::steady_clock::now();
+            if (job.order) {
+                job.order();
+            }
             sync |= !job.prepare();
             stage_prepare_us.fetch_add(MicrosecondsSince(prepare_start), std::memory_order_relaxed);
             stage_prepared.fetch_add(1, std::memory_order_relaxed);
@@ -180,6 +203,156 @@ void DrawPipe::RunStage(std::stop_token stop) {
             WaitFinished(forwarded);
             stage_sync_us.fetch_add(MicrosecondsSince(sync_start), std::memory_order_relaxed);
         }
+    }
+}
+
+std::vector<DrawPipe::Idle> DrawPipe::RecentIdle() {
+    std::scoped_lock lk{idle_mutex};
+    std::vector<Idle> out;
+    const u32 count = std::min<u32>(idle_next, idle_ring.size());
+    for (u32 i = idle_next - count; i != idle_next; ++i) {
+        out.push_back(idle_ring[i % idle_ring.size()]);
+    }
+    return out;
+}
+
+void DrawPipe::RunWorker(std::stop_token stop, u32 index) {
+    Common::SetCurrentThreadName(fmt::format("shadGT:GpuStageWorker{}", index).c_str());
+    Common::PreferPerformanceCores();
+    bool initialized = false;
+    while (true) {
+        InFlight* item;
+        {
+            std::unique_lock lk{work_mutex};
+            work_items_cv.wait(lk, stop, [this] { return !work_items.empty(); });
+            if (work_items.empty()) {
+                return; // stopped
+            }
+            item = work_items.front();
+            work_items.pop_front();
+        }
+        if (!initialized && worker_init) {
+            worker_init(index); // set once the rasterizer exists
+            initialized = true;
+        }
+        const auto prepare_start = std::chrono::steady_clock::now();
+        item->ok = item->job.prepare();
+        stage_prepare_us.fetch_add(MicrosecondsSince(prepare_start), std::memory_order_relaxed);
+        stage_prepared.fetch_add(1, std::memory_order_relaxed);
+        {
+            std::scoped_lock lk{stage_mutex};
+            item->done.store(true, std::memory_order_release);
+            stage_cv.notify_all();
+        }
+    }
+}
+
+void DrawPipe::ForwardReady() {
+    // Dispatcher: the prepared jobs at the front go to the recorder, in order.
+    while (!window.empty() && window.front()->done.load(std::memory_order_acquire)) {
+        auto item = std::move(window.front());
+        window.pop_front();
+        Forward(std::move(item->job.run));
+        ++forwarded;
+        if (!item->ok) {
+            // The jobs after a refused plan see what the recorder does for it only once it ran
+            // it: their plans are made again then.
+            stage_syncs.fetch_add(1, std::memory_order_relaxed);
+            const auto sync_start = std::chrono::steady_clock::now();
+            WaitFinished(forwarded);
+            stage_sync_us.fetch_add(MicrosecondsSince(sync_start), std::memory_order_relaxed);
+            RedoWindow();
+        }
+    }
+}
+
+void DrawPipe::RedoWindow() {
+    if (worker_init) {
+        worker_init(0); // the dispatcher redoes plans with worker 0's rings (idle meanwhile)
+    }
+    for (auto& item : window) {
+        if (!item->done.load(std::memory_order_acquire)) {
+            std::unique_lock lk{stage_mutex};
+            stage_cv.wait(lk, [&] { return item->done.load(std::memory_order_acquire); });
+        }
+    }
+    for (auto& item : window) {
+        const auto prepare_start = std::chrono::steady_clock::now();
+        item->ok = item->job.prepare();
+        stage_prepare_us.fetch_add(MicrosecondsSince(prepare_start), std::memory_order_relaxed);
+        if (!item->ok) {
+            break; // the jobs after it are made again once this one is recorded
+        }
+    }
+}
+
+void DrawPipe::RunDispatcher(std::stop_token stop) {
+    Common::SetCurrentThreadName("shadGT:GpuBufferStage");
+    Common::PreferPerformanceCores();
+    constexpr u64 MaxLead = 256;
+    const size_t max_window = 16 * worker_count;
+    while (true) {
+        ForwardReady();
+        StageJob job;
+        {
+            const auto idle_start = std::chrono::steady_clock::now();
+            std::unique_lock lk{stage_mutex};
+            stage_cv.wait(lk, stop, [&] {
+                return (!stage_queue.empty() && window.size() < max_window) ||
+                       (!window.empty() && window.front()->done.load(std::memory_order_acquire));
+            });
+            stage_idle_us.fetch_add(MicrosecondsSince(idle_start), std::memory_order_relaxed);
+            if (stop.stop_requested() && stage_queue.empty() && window.empty()) {
+                return;
+            }
+            if (stage_queue.empty() || window.size() >= max_window) {
+                continue; // a prepared job to forward
+            }
+            job = std::move(stage_queue.front());
+            stage_queue.pop_front();
+        }
+        if (job.kind == JobKind::Barrier || !job.prepare) {
+            // Everything before it goes to the recorder first; a barrier is then waited for.
+            while (!window.empty()) {
+                if (!window.front()->done.load(std::memory_order_acquire)) {
+                    std::unique_lock lk{stage_mutex};
+                    stage_cv.wait(lk, [&] {
+                        return window.front()->done.load(std::memory_order_acquire);
+                    });
+                }
+                ForwardReady();
+            }
+            const bool sync = job.kind == JobKind::Barrier;
+            if (sync) {
+                stage_barriers.fetch_add(1, std::memory_order_relaxed);
+            }
+            Forward(std::move(job.run));
+            ++forwarded;
+            if (sync) {
+                stage_syncs.fetch_add(1, std::memory_order_relaxed);
+                const auto sync_start = std::chrono::steady_clock::now();
+                WaitFinished(forwarded);
+                stage_sync_us.fetch_add(MicrosecondsSince(sync_start), std::memory_order_relaxed);
+            }
+            continue;
+        }
+        if (forwarded > MaxLead) {
+            const auto lead_start = std::chrono::steady_clock::now();
+            WaitFinished(forwarded - MaxLead);
+            stage_lead_us.fetch_add(MicrosecondsSince(lead_start), std::memory_order_relaxed);
+        }
+        if (job.order) {
+            job.order();
+        }
+        auto item = std::make_unique<InFlight>();
+        item->job = std::move(job);
+        InFlight* raw = item.get();
+        window.push_back(std::move(item));
+        {
+            std::scoped_lock lk{work_mutex};
+            work_items.push_back(raw);
+        }
+        work_items_cv.notify_one();
     }
 }
 
@@ -287,11 +460,17 @@ void DrawPipe::Run(std::stop_token stop) {
             std::unique_lock lk{mutex};
             if (queue.empty()) {
                 recorder_waiting = true;
+                const auto idle_from = std::chrono::steady_clock::now();
                 work_cv.wait(lk, [&] {
                     return !queue.empty() || (!urgent.empty() && !exclusive) ||
                            stop.stop_requested();
                 });
                 recorder_waiting = false;
+                const auto idle_to = std::chrono::steady_clock::now();
+                if (idle_to - idle_from > std::chrono::microseconds{50}) {
+                    std::scoped_lock idle_lk{idle_mutex};
+                    idle_ring[idle_next++ % idle_ring.size()] = {idle_from, idle_to};
+                }
             }
             if (queue.empty()) {
                 if (!urgent.empty() && !stop.stop_requested()) {

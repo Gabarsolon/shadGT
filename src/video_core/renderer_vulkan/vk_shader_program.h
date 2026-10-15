@@ -41,6 +41,8 @@ struct Program {
         std::vector<u32> user_data;
         std::vector<std::vector<u32>> flats;
     } match_memo;
+    /// R7: the permutation the last search found; tried first next time.
+    size_t last_match{~size_t{0}};
 
     void AddPermut(vk::ShaderModule module, Shader::StageSpecialization&& spec,
                    std::unique_ptr<Shader::Info> info) {

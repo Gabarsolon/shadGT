@@ -132,6 +132,12 @@ public:
                                                              bool is_texel_buffer = false);
     std::pair<const Buffer*, u64> ObtainBufferImpl(VAddr device_addr, u32 size, bool is_written,
                                                    bool is_texel_buffer);
+    /// R6
+    std::optional<std::pair<const Buffer*, u64>> ObtainBufferShared(VAddr device_addr, u32 size,
+                                                                    bool is_written,
+                                                                    bool is_texel_buffer);
+    std::optional<bool> ImagesOverQuick(VAddr device_addr, u32 size) const;
+    std::atomic<u64> shared_obtains{};
 
     /// Attempts to obtain a buffer without modifying the cache contents.
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBufferForImage(VAddr device_addr, u32 size);
@@ -488,6 +494,39 @@ private:
     // PERF-067: rings the buffer stage fills ahead of the recorder.
     StreamBuffer ahead_stream;
     StreamBuffer ahead_staging;
+public:
+    /// R5: buffer stage workers (SHADGT_STAGE_WORKERS, 1-4). Each has its own rings; worker 0
+    /// uses the ones above.
+    static constexpr u32 MaxStageWorkers = 4;
+    static u32 StageWorkerCount();
+    /// R5 (stage worker thread): which worker this thread is.
+    static void SetStageWorker(u32 index) noexcept {
+        t_stage_worker = index;
+    }
+    /// R6: called on the recorder thread when it starts (its obtains may run shared).
+    static void MarkRecorderThread() noexcept {
+        t_recorder_thread = true;
+    }
+    /// R5 (recorder, before using a buffer obtained ahead): waits until no stage worker is
+    /// synchronizing memory over the range, then records the uploads prepared over it, so a
+    /// range another worker found dirty and uploads for a later draw is current for this one.
+    void SettleAheadRange(VAddr device_addr, u64 size);
+private:
+    static inline thread_local u32 t_stage_worker{};
+    static inline thread_local bool t_recorder_thread{};
+    StreamBuffer& AheadStream() noexcept {
+        return t_stage_worker == 0 ? ahead_stream : *worker_streams[t_stage_worker];
+    }
+    StreamBuffer& AheadStaging() noexcept {
+        return t_stage_worker == 0 ? ahead_staging : *worker_stagings[t_stage_worker];
+    }
+    std::array<std::unique_ptr<StreamBuffer>, MaxStageWorkers> worker_streams;
+    std::array<std::unique_ptr<StreamBuffer>, MaxStageWorkers> worker_stagings;
+    struct WorkerSync {
+        std::atomic<VAddr> begin{};
+        std::atomic<VAddr> end{};
+    };
+    std::array<WorkerSync, MaxStageWorkers> worker_syncs;
     static thread_local AheadUploads* ahead_uploads; // set while ObtainBufferAhead runs
 public:
     /// PERF-067: why the stage left buffers to the recorder (texel read, image, stream ring,

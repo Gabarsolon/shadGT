@@ -166,7 +166,10 @@ public:
     /// buffers. False when it stopped early (the recorder obtains the rest, and must have
     /// recorded this draw before the stage goes on).
     bool PrepareBuffersAhead(const SelectedPipeline& selected, BufferPlan& plan,
-                             VAddr index_address = 0, u32 index_bytes = 0);
+                             VAddr index_address = 0, u32 index_bytes = 0,
+                             bool order_only = false);
+    /// R5 (stage dispatcher, in job order): numbers the job and lists the ranges it writes.
+    void OrderBuffersAhead(const SelectedPipeline& selected, BufferPlan& plan);
     /// PERF-067 (recorder): around the draw the plan was made for.
     void SetBufferPlan(BufferPlan* plan) {
         if (!plan && buffer_plan && buffer_plan->seq) {
@@ -408,6 +411,7 @@ private:
         VAddr end;
     };
     std::deque<PendingWrite> pending_writes;
+    std::mutex pending_writes_mutex; // R5: the dispatcher adds, the workers read
     u64 stage_seq{};
     std::atomic<u64> recorded_seq{};
     std::array<std::atomic<u64>, 4> plan_refusals{};

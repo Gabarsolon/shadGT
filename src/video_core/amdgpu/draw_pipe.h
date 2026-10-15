@@ -3,7 +3,9 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
+#include <vector>
 #include <condition_variable>
 #include <chrono>
 #include <deque>
@@ -49,7 +51,17 @@ public:
     void Push(Work&& work);
     /// PERF-067: the same, with the job's kind and the work the buffer stage does for it first
     /// (only with the stage on; otherwise `prepare` is dropped and the recorder does it all).
-    void Push(Work&& work, JobKind kind, Prepare&& prepare = {});
+    void Push(Work&& work, JobKind kind, Prepare&& prepare = {}, Work&& order = {});
+
+    /// DIAG-114: the recorder's recent waits for work (longer than 50 us).
+    struct Idle {
+        std::chrono::steady_clock::time_point from;
+        std::chrono::steady_clock::time_point to;
+    };
+    std::vector<Idle> RecentIdle();
+
+    /// R5: runs first on each stage worker thread, with the worker's index.
+    static inline void (*worker_init)(u32 index) = nullptr;
 
     /// PERF-067: whether the buffer stage thread runs (SHADGT_BUFFER_STAGE=1).
     bool HasStage() const noexcept {
@@ -132,7 +144,25 @@ private:
         Work run;
         Prepare prepare;
         JobKind kind;
+        Work order; // R5: run by the dispatcher in job order before `prepare`
     };
+    // R5: SHADGT_STAGE_WORKERS > 1: the stage thread dispatches jobs to worker threads that
+    // prepare them in parallel, and forwards them to the recorder in order.
+    struct InFlight {
+        StageJob job;
+        std::atomic<bool> done{};
+        bool ok{true};
+    };
+    void RunDispatcher(std::stop_token stop);
+    void RunWorker(std::stop_token stop, u32 index);
+    void ForwardReady();
+    void RedoWindow();
+    u32 worker_count{1};
+    std::deque<std::unique_ptr<InFlight>> window; // dispatcher only
+    std::mutex work_mutex;
+    std::condition_variable_any work_items_cv;
+    std::deque<InFlight*> work_items;
+    std::vector<std::jthread> workers;
     bool stage_enabled{};
     std::mutex stage_mutex;
     std::condition_variable_any stage_cv;
@@ -172,6 +202,9 @@ private:
     std::function<void()> thread_init;
     Stats stats{};
     std::jthread recorder;
+    std::mutex idle_mutex; // DIAG-114
+    std::array<Idle, 512> idle_ring{};
+    u32 idle_next{};
 };
 
 } // namespace AmdGpu

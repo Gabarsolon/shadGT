@@ -2968,6 +2968,32 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
             flats.push_back(i < memo.flats.size() ? memo.flats[i] : std::vector<u32>{});
         }
     };
+    // R7: the permutation the last search found is tried first; a program has up to dozens and
+    // each one tried builds a specialization (the command thread's largest cost per draw).
+    // -DisablePerf 133 searches from the first every time.
+    static const bool last_first = Common::PerfFeatureEnabled(133);
+    if (last_first && !memo_usable && hw_stage != HwStage::Hull &&
+        program->last_match < program->modules.size()) {
+        auto& permutation = program->modules[program->last_match];
+        if (permutation.info && !permutation.stored) {
+            auto& info = *permutation.info;
+            info.pgm_base = params.Base();
+            info.user_data = params.user_data;
+            info.RefreshFlatBuf();
+            if (permutation.spec == Shader::StageSpecialization(info, runtime_info, profile, binding)) {
+                if (!info.attribute_flags_known && IsTessEmulatedDraw()) {
+                    RecoverAttributeFlags(info, permutation.spec, params, runtime_info,
+                                          program->last_match);
+                }
+                info.AddBindings(binding);
+                if (auto& fetch = permutation.spec.fetch_shader_data; !fetch.Empty()) {
+                    fetch_shader = &fetch;
+                }
+                return std::make_tuple(&info, permutation.module,
+                                       HashCombine(params.hash, program->last_match));
+            }
+        }
+    }
     bool tess_checked = false;
     for (size_t perm_idx = 0; perm_idx < program->modules.size(); ++perm_idx) {
         auto& permutation = program->modules[perm_idx];
@@ -3036,6 +3062,7 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
             memo.user_data.assign(params.user_data.begin(), params.user_data.end());
             memo.flats.assign(flats.begin(), flats.end());
         }
+        program->last_match = perm_idx; // R7
         if (!info.attribute_flags_known && IsTessEmulatedDraw()) {
             RecoverAttributeFlags(info, permutation.spec, params, runtime_info, perm_idx);
         }

@@ -29,6 +29,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/amdgpu/draw_pipe.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
@@ -58,6 +59,8 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
       pipeline_cache{instance, scheduler, liverpool, buffer_cache.GetSparsePageShift()},
       host_markers_enabled{EmulatorSettings.IsVkHostMarkersEnabled()},
       guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()} {
+    // R5: buffer stage workers use their own rings.
+    AmdGpu::DrawPipe::worker_init = [](u32 index) { VideoCore::BufferCache::SetStageWorker(index); };
     if (!EmulatorSettings.IsNullGPU()) {
         liverpool->BindRasterizer(this);
     }
@@ -599,8 +602,19 @@ bool Rasterizer::CaptureDrawReads(const SelectedPipeline& selected,
     return complete;
 }
 
+void Rasterizer::OrderBuffersAhead(const SelectedPipeline& selected, BufferPlan& plan) {
+    // R5 (stage dispatcher, in job order): the job's number and the ranges it writes, before
+    // any worker plans a later job.
+    static const bool track_writes = Common::PerfFeatureEnabled(129);
+    if (!track_writes) {
+        return;
+    }
+    plan.seq = ++stage_seq;
+    PrepareBuffersAhead(selected, plan, 0, 0, true);
+}
+
 bool Rasterizer::PrepareBuffersAhead(const SelectedPipeline& selected, BufferPlan& plan,
-                                     VAddr index_address, u32 index_bytes) {
+                                     VAddr index_address, u32 index_bytes, bool order_only) {
     const Pipeline* pipeline = selected.is_compute
                                    ? static_cast<const Pipeline*>(selected.compute)
                                    : static_cast<const Pipeline*>(selected.pipeline);
@@ -608,31 +622,39 @@ bool Rasterizer::PrepareBuffersAhead(const SelectedPipeline& selected, BufferPla
         IsComputeImageClear(pipeline)) {
         return true; // Nothing to obtain, or BindResources is not reached.
     }
-    plan.generation = texture_cache.RegistryGeneration();
-    plan.labels_done = liverpool->LabelsDone(); // PERF-082
-    plan.labels_pushed = liverpool->LabelsPushed();
     // MT-007: reads over a range an earlier planned job writes are left to the recorder.
     static const bool track_writes = Common::PerfFeatureEnabled(129);
-    if (track_writes) {
-        plan.seq = ++stage_seq;
+    boost::container::small_vector<PendingWrite, 4> job_writes;
+    if (order_only) {
         const u64 recorded = recorded_seq.load(std::memory_order_acquire);
+        std::scoped_lock lk{pending_writes_mutex};
         while (!pending_writes.empty() && pending_writes.front().seq <= recorded) {
             pending_writes.pop_front();
         }
+    } else {
+        // R5: a plan redone after a refusal starts over (its uploads stay: they are recorded
+        // with the job).
+        plan.entries.clear();
+        plan.next = 0;
+        plan.vertices = false;
+        plan.index = false;
+        plan.generation = texture_cache.RegistryGeneration();
+        plan.labels_done = liverpool->LabelsDone(); // PERF-082
+        plan.labels_pushed = liverpool->LabelsPushed();
     }
     const auto pending_overlap = [&](VAddr begin, u64 size) {
+        std::scoped_lock lk{pending_writes_mutex};
         for (const auto& write : pending_writes) {
-            if (write.begin < begin + size && begin < write.end) {
+            if (write.seq < plan.seq && write.begin < begin + size && begin < write.end) {
                 return true;
             }
         }
         return false;
     };
-    boost::container::small_vector<PendingWrite, 4> job_writes;
     // MT-004: the vertex buffers too, merged as BindVertexBuffers merges them (it takes these
     // entries first). Quad lists refresh their pages first and are left to the recorder.
     static const bool plan_vertices = Common::PerfFeatureEnabled(126);
-    if (plan_vertices && !selected.is_compute && !selected.is_quad_list && selected.pipeline) {
+    if (!order_only && plan_vertices && !selected.is_compute && !selected.is_quad_list && selected.pipeline) {
         const auto& fetch = selected.pipeline->GetFetchShader();
         const auto& vs = selected.stages[u32(Shader::SwStage::Vertex)];
         if (!fetch.Empty() && !fetch.attributes.empty()) {
@@ -696,7 +718,7 @@ bool Rasterizer::PrepareBuffersAhead(const SelectedPipeline& selected, BufferPla
         }
     }
     static const bool plan_index = Common::PerfFeatureEnabled(127);
-    if (plan_index && index_bytes != 0 && index_address != 0 && !selected.is_compute &&
+    if (!order_only && plan_index && index_bytes != 0 && index_address != 0 && !selected.is_compute &&
         !selected.is_quad_list) {
         bool overlapped = false;
         if (track_writes && pending_overlap(index_address, index_bytes)) {
@@ -728,7 +750,7 @@ bool Rasterizer::PrepareBuffersAhead(const SelectedPipeline& selected, BufferPla
         if (!info || !sel.present) {
             continue;
         }
-        if (IsWatchedShader(info->pgm_hash)) {
+        if (!order_only && IsWatchedShader(info->pgm_hash)) {
             ++plan_refusals[0];
             return false; // Its read pages are checked again before each use (FIX-017).
         }
@@ -744,13 +766,19 @@ bool Rasterizer::PrepareBuffersAhead(const SelectedPipeline& selected, BufferPla
             if (desc.IsSpecial()) {
                 continue;
             }
-            if (written_to_recorder && desc.is_written) {
+            if (order_only && !desc.is_written) {
+                continue;
+            }
+            if (!order_only && written_to_recorder && desc.is_written) {
                 ++plan_refusals[3];
                 if (!skip_written) {
                     return false;
                 }
             }
             if (!desc.sharp_fetch.FitsIn(sel.flattened.size())) {
+                if (order_only) {
+                    continue;
+                }
                 ++plan_refusals[1];
                 return false;
             }
@@ -769,16 +797,17 @@ bool Rasterizer::PrepareBuffersAhead(const SelectedPipeline& selected, BufferPla
             }
             const u32 size =
                 static_cast<u32>(memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize()));
+            if (order_only) {
+                job_writes.push_back({plan.seq, vsharp.base_address, vsharp.base_address + size});
+                continue;
+            }
             if (written_to_recorder && desc.is_written) {
                 // MT-006: the buffer is left to the recorder (an entry without a buffer), the
                 // draw's other buffers are still planned, and the stage waits after the draw
                 // (MT-007: or remembers the range and goes on).
                 plan.entries.push_back(
                     {vsharp.base_address, 0, true, desc.is_formatted, nullptr, 0, false});
-                if (track_writes) {
-                    job_writes.push_back({plan.seq, vsharp.base_address,
-                                          vsharp.base_address + size});
-                } else {
+                if (!track_writes) {
                     barrier_after = true;
                 }
                 continue;
@@ -800,7 +829,10 @@ bool Rasterizer::PrepareBuffersAhead(const SelectedPipeline& selected, BufferPla
                                     result->first, result->second, overlapped});
         }
     }
-    pending_writes.insert(pending_writes.end(), job_writes.begin(), job_writes.end());
+    if (order_only && !job_writes.empty()) {
+        std::scoped_lock lk{pending_writes_mutex};
+        pending_writes.insert(pending_writes.end(), job_writes.begin(), job_writes.end());
+    }
     return !barrier_after;
 }
 
@@ -843,6 +875,11 @@ std::optional<std::pair<const VideoCore::Buffer*, u64>> Rasterizer::TakePlannedB
         // PERF-079: an image over it had to be exported first; obtained again after it.
         ++plan_stats.redone;
         return std::nullopt;
+    }
+    // R5: with several stage workers, another may have found the range dirty for a later job.
+    static const bool settle = VideoCore::BufferCache::StageWorkerCount() > 1;
+    if (settle) {
+        buffer_cache.SettleAheadRange(address, size);
     }
     ++plan_stats.used;
     return std::pair<const VideoCore::Buffer*, u64>{entry.buffer, entry.offset};

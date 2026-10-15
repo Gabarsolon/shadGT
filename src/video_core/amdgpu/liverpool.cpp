@@ -30,6 +30,7 @@
 #include "core/platform.h"
 #include "video_core/amdgpu/ce_de_counter.h"
 #include "video_core/amdgpu/draw_pipe.h"
+#include "video_core/buffer_cache/buffer_cache.h"
 #include <xxhash.h>
 
 #include "video_core/amdgpu/liverpool.h"
@@ -378,6 +379,7 @@ void Liverpool::StartDrawPipe() {
     }
     draw_pipe = std::make_unique<DrawPipe>([this] {
         Common::SetCurrentThreadName("shadGT:GpuRecorder");
+        VideoCore::BufferCache::MarkRecorderThread(); // R6
         Common::SamplingProfiler::RegisterCurrentThread("GpuRecorder"); // DIAG-048
         // FIX-044: shader and pipeline compiles on this thread hold the guest clocks too.
         Common::GuestClock::MarkGpuCommandThread();
@@ -838,6 +840,10 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
         DrawPipe::SetPushTag(compute ? (direct_draw ? "dispatch not selected" : "indirect dispatch")
                                      : (direct_draw ? "draw not selected" : "indirect draw"));
     }
+    DrawPipe::Work order;
+    if (staged) {
+        order = [this, staged] { rasterizer->OrderBuffersAhead(*staged->selected, staged->plan); };
+    }
     draw_pipe->Push([this, delta = std::move(delta), cs, cb_extent = last_cb_extent,
                      db_extent = last_db_extent, expected = std::move(expected),
                      selected = std::move(selected), draw = std::move(draw),
@@ -866,7 +872,7 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
         if (sel) {
             rasterizer->RecycleSelectedPipeline(std::move(*sel));
         }
-    }, kind, std::move(prepare));
+    }, kind, std::move(prepare), std::move(order));
     if (read_ahead_states && !compute) {
         OfferDrawState();
     }
@@ -1370,6 +1376,58 @@ void Liverpool::Process(std::stop_token stoken) {
                     }
                     if (submitted && rasterizer) {
                         const auto recorded = std::chrono::steady_clock::now();
+                        // DIAG-114 (SHADGT_DIAG_TIMELINE=1): 40 consecutive gfx submits after
+                        // 200 s, times relative to the first one (ms): submit, decoded,
+                        // recorded, GPU done, and the jobs pushed and finished by then.
+                        static const bool timeline = [] {
+                            const char* env = std::getenv("SHADGT_DIAG_TIMELINE");
+                            return env && env[0] == '1';
+                        }();
+                        if (timeline) {
+                            struct Row {
+                                std::chrono::steady_clock::time_point submit, decoded, recorded;
+                                std::atomic<s64> gpu_ns{};
+                                u64 pushed, finished;
+                            };
+                            static std::array<Row, 40> rows;
+                            static std::atomic<u32> next{};
+                            static const auto start = std::chrono::steady_clock::now();
+                            if (recorded - start > std::chrono::seconds{200} && next < rows.size()) {
+                                const u32 i = next++;
+                                auto& row = rows[i];
+                                row.submit = *submitted;
+                                row.decoded = decoded;
+                                row.recorded = recorded;
+                                row.pushed = draw_pipe ? draw_pipe->PushedJobs() : 0;
+                                row.finished = draw_pipe ? draw_pipe->FinishedJobs() : 0;
+                                rasterizer->WhenGpuDone([this, i] {
+                                    rows[i].gpu_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                        std::chrono::steady_clock::now().time_since_epoch()).count();
+                                    if (i + 1 == rows.size()) {
+                                        std::string text;
+                                        const auto t0 = rows[0].submit;
+                                        const auto ms = [&](auto t) {
+                                            return std::chrono::duration<double, std::milli>(t - t0).count();
+                                        };
+                                        for (u32 k = 0; k < rows.size(); ++k) {
+                                            const auto& r = rows[k];
+                                            const double gpu =
+                                                (r.gpu_ns.load() - std::chrono::duration_cast<std::chrono::nanoseconds>(t0.time_since_epoch()).count()) / 1e6;
+                                            text += fmt::format("\n  #{:2} submit {:8.2f} decoded {:8.2f} recorded {:8.2f} gpu {:8.2f} jobs {}",
+                                                                k, ms(r.submit), ms(r.decoded), ms(r.recorded), gpu,
+                                                                k ? r.finished - rows[k - 1].finished : 0);
+                                        }
+                                        text += "\n  recorder idle (ms):";
+                                        for (const auto& idle : draw_pipe->RecentIdle()) {
+                                            if (idle.from >= t0) {
+                                                text += fmt::format(" {:.2f}-{:.2f}", ms(idle.from), ms(idle.to));
+                                            }
+                                        }
+                                        LOG_WARNING(Render, "DIAG-114: gfx submit timeline:{}", text);
+                                    }
+                                });
+                            }
+                        }
                         const auto us = [&](auto d) {
                             return static_cast<u64>(
                                 std::chrono::duration_cast<std::chrono::microseconds>(d).count());
