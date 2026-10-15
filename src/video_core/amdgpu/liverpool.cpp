@@ -812,7 +812,16 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
     }
     // A draw whose buffers the stage does not obtain is obtained by the recorder: the stage
     // must not run past it.
-    const auto kind = staged ? DrawPipe::JobKind::Neutral : DrawPipe::JobKind::Barrier;
+    // EXP-122 (SHADGT_FILTERED_NEUTRAL=1): clears, resolves and depth copies (filtered draws,
+    // no pipeline selected) do not stop the buffer stage.
+    static const bool filtered_neutral = [] {
+        const char* env = std::getenv("SHADGT_FILTERED_NEUTRAL");
+        return env && env[0] == '1';
+    }();
+    const bool neutral_filtered =
+        filtered_neutral && !staged && direct_draw && !compute && FilteredDraw(regs);
+    const auto kind = staged || neutral_filtered ? DrawPipe::JobKind::Neutral
+                                                 : DrawPipe::JobKind::Barrier;
     if (!staged) {
         // DIAG-069
         DrawPipe::SetPushTag(compute ? (direct_draw ? "dispatch not selected" : "indirect dispatch")

@@ -1697,6 +1697,18 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
 std::pair<const Buffer*, u64> BufferCache::ObtainBufferImpl(VAddr device_addr, u32 size,
                                                             bool is_written, bool is_texel_buffer) {
     std::scoped_lock buffer_lock{mutex}; // PERF-067
+    // EXP-124 (SHADGT_CEIL_STREAMFAST=1, measurement only): small read-only ranges are copied
+    // into the stream ring with no other bookkeeping (no image or GPU-write checks).
+    static const bool ceil_stream = [] {
+        const char* env = std::getenv("SHADGT_CEIL_STREAMFAST");
+        return env && env[0] == '1';
+    }();
+    if (ceil_stream && !is_written && size <= STREAM_THRESHOLD && !read_capture) {
+        const auto [data, offset] = stream_buffer.Map(size, instance.UniformMinAlignment());
+        memory->CopySparseMemory(device_addr, data, size);
+        stream_buffer.Commit();
+        return {&stream_buffer, offset};
+    }
     RecordPendingAheadUploads(device_addr, size);
     if (is_written) {
         InvalidateAsyncReadbacks(device_addr, size);
@@ -1765,9 +1777,12 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferImpl(VAddr device_addr, u
     }();
     ArenaMemo* memo_lookup_slot = nullptr;
     u64 memo_versions = 0;
-    if (arena_memo_enabled && !is_written && size > STREAM_THRESHOLD && !read_capture) {
+    bool memo_skip_sync = false;
+    // Written ranges too (compute dispatches write the same buffers every frame): their
+    // synchronization is skipped, the GPU-write bookkeeping below still runs.
+    if (arena_memo_enabled && (is_written || size > STREAM_THRESHOLD) && !read_capture) {
         memo_lookup_slot = &arena_memos[((device_addr >> 6) ^ (device_addr >> 22) ^ size ^
-                                         (u64(is_texel_buffer) << 5)) %
+                                         (u64(is_texel_buffer) << 5) ^ (u64(is_written) << 4)) %
                                         arena_memos.size()];
         memo_versions = memory_tracker->CpuVersionSum(device_addr, size);
         const auto& m = *memo_lookup_slot;
@@ -1777,24 +1792,28 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferImpl(VAddr device_addr, u
             const char* env = std::getenv("SHADGT_CEIL_NOSYNC");
             return env && env[0] == '1';
         }();
-        if (ceil_nosync && m.address == device_addr && m.size == size &&
-            m.texel == is_texel_buffer) {
+        if (ceil_nosync && !is_written && m.address == device_addr && m.size == size &&
+            m.texel == is_texel_buffer && !m.written) {
             ++arena_memo_hits;
             return {m.arena, m.arena->Offset(device_addr)};
         }
         if (m.address == device_addr && m.size == size && m.texel == is_texel_buffer &&
+            m.written == is_written &&
             m.arena == GetArena(device_addr >> block_shift, (device_addr + size - 1) >> block_shift) &&
             m.epoch == g_upload_epoch.load(std::memory_order_acquire) &&
             m.versions == memo_versions && m.registry == texture_cache.RegistryGeneration() &&
             m.export_state == g_image_export_state.load(std::memory_order_relaxed)) {
             ++arena_memo_hits;
-            return {m.arena, m.arena->Offset(device_addr)};
+            if (!is_written) {
+                return {m.arena, m.arena->Offset(device_addr)};
+            }
+            memo_skip_sync = true;
         }
     }
     const u32 memo_epoch = g_upload_epoch.load(std::memory_order_acquire);
     const u64 memo_registry = texture_cache.RegistryGeneration();
     const u64 memo_export_state = g_image_export_state.load(std::memory_order_relaxed);
-    const bool images_overlap = SynchronizeMemoryFromImage(device_addr, size);
+    const bool images_overlap = !memo_skip_sync && SynchronizeMemoryFromImage(device_addr, size);
     // PERF-043: with no image over the range, it has no GPU image alias either; the texture
     // cache is not walked again. -DisablePerf 55 walks it again.
     static const bool skip_alias_walk = Common::PerfFeatureEnabled(55);
@@ -1812,13 +1831,15 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferImpl(VAddr device_addr, u
     const auto* arena = GetArena(first_block, last_block);
     ArenaMemo* arena_memo = memo_lookup_slot;
     const u64 versions = memo_versions;
-    EnsureResident(arena, first_block, last_block);
-    SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
-    if (arena_memo) {
+    if (!memo_skip_sync) {
+        EnsureResident(arena, first_block, last_block);
+        SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
+    }
+    if (arena_memo && !memo_skip_sync) {
         // The state from before this synchronization: anything it changed shows up as a
         // different version or generation, and the next lookup synchronizes again.
-        *arena_memo = {device_addr, size,     is_texel_buffer, arena,
-                       memo_epoch,  versions, memo_registry,  memo_export_state};
+        *arena_memo = {device_addr, size,     is_texel_buffer, is_written, arena,
+                       memo_epoch,  versions, memo_registry,   memo_export_state};
         ++arena_memo_stores;
     }
     if (is_written) {

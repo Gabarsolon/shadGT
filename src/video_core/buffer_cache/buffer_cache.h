@@ -392,6 +392,7 @@ private:
         VAddr address{};
         u32 size{};
         bool texel{};
+        bool written{};
         const Buffer* arena{};
         u32 epoch{};
         u64 versions{};
