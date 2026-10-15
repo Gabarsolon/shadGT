@@ -2120,7 +2120,7 @@ std::optional<std::pair<const Buffer*, u64>> BufferCache::ObtainBufferAhead(
             t_stage_prehash.clear();
         }
     } clear_prehash;
-    std::scoped_lock lk{mutex};
+    std::unique_lock lk{mutex};
     // PERF-079: a range under images is obtained ahead through the arena as well; the recorder
     // exports the images before using it (ExportImagesOver). In GT Sport's races a third of the
     // buffers the stage was given lie under images, and each stopped it. -DisablePerf 84 leaves
@@ -2148,6 +2148,12 @@ std::optional<std::pair<const Buffer*, u64>> BufferCache::ObtainBufferAhead(
     ++Common::GetWorkCounters().obtain_buffer;
     if (!is_written && size <= STREAM_THRESHOLD && !overlapped &&
         !IsRegionGpuModified(device_addr, size)) {
+        // MT-008: the ring is the stage's own, so it is filled without the lock (the recorder
+        // waited on it for these copies). -DisablePerf 130 fills it under the lock.
+        static const bool copy_unlocked = Common::PerfFeatureEnabled(130);
+        if (copy_unlocked) {
+            lk.unlock();
+        }
         const auto [data, offset] = ahead_stream.Map(size, instance.UniformMinAlignment(), false);
         if (!data) {
             ++ahead_refusals[2];
