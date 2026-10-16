@@ -348,14 +348,38 @@ vk::CommandBuffer Scheduler::OpenUploadCommandBuffer() {
     return upload_cmdbuf;
 }
 
-void Scheduler::Flush(SubmitInfo& info) {
+// DIAG-118: where submits come from, every 2 s.
+static void NoteFlush(const std::source_location& loc) {
+    static std::mutex diag_mutex;
+    static std::map<std::pair<std::string_view, u32>, u64> sites;
+    static auto since = std::chrono::steady_clock::now();
+    std::scoped_lock lk{diag_mutex};
+    std::string_view file = loc.file_name();
+    if (const auto slash = file.find_last_of("/\\"); slash != std::string_view::npos) {
+        file.remove_prefix(slash + 1);
+    }
+    ++sites[{file, loc.line()}];
+    const auto now = std::chrono::steady_clock::now();
+    if (now - since >= std::chrono::seconds{2}) {
+        std::string text;
+        for (const auto& [site, count] : sites) {
+            text += fmt::format(" {}:{}={}", site.first, site.second, count);
+        }
+        LOG_WARNING(Render_Vulkan, "DIAG-118: submits in 2 s by caller:{}", text);
+        sites.clear();
+        since = now;
+    }
+}
+
+void Scheduler::Flush(SubmitInfo& info, std::source_location loc) {
+    NoteFlush(loc);
     // When flushing, we only send data to the driver; no waiting is necessary.
     SubmitExecution(info);
 }
 
-void Scheduler::Flush() {
+void Scheduler::Flush(std::source_location loc) {
     SubmitInfo info{};
-    Flush(info);
+    Flush(info, loc);
 }
 
 void Scheduler::Finish(std::source_location loc) {

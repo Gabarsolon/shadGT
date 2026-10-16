@@ -362,11 +362,11 @@ public:
 
     /// Sends the current execution context to the GPU
     /// and increments the scheduler timeline semaphore.
-    void Flush(SubmitInfo& info);
+    void Flush(SubmitInfo& info, std::source_location loc = std::source_location::current());
 
     /// Sends the current execution context to the GPU
     /// and increments the scheduler timeline semaphore.
-    void Flush();
+    void Flush(std::source_location loc = std::source_location::current());
 
     /// Sends the current execution context to the GPU and waits for it to complete.
     void Finish(std::source_location loc = std::source_location::current());
