@@ -148,6 +148,13 @@ public:
         return FindImage(desc, false, &memo);
     }
 
+    /// PERF-123: an image bound again without a lookup is used (LRU and access tick).
+    void NoteImageUsed(ImageId image_id) {
+        Image& image = slot_images[image_id];
+        image.tick_accessed_last = scheduler.CurrentTick();
+        TouchImage(image);
+    }
+
     /// Retrieves image whose address matches provided
     [[nodiscard]] ImageId FindImageFromRange(VAddr address, size_t size, bool ensure_valid = true);
 

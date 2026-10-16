@@ -3724,7 +3724,63 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         }
     }
     std::optional<Common::PhaseTimer> pass1_timer{std::in_place, Common::Phase::TexPass1};
-    for (const auto& image_desc : stage.images) {
+    u64 stage_tex_hash = 0xcbf29ce484222325ULL ^ u64(stage.pgm_hash); // DIAG-120
+    // PERF-123: the stage reads the same T#s as in its previous draw and no image was registered
+    // or unregistered since: the bindings found then are bound again without decoding or lookups.
+    static const bool stage_memo_enabled = [] {
+        const char* env = std::getenv("SHADGT_STAGE_IMAGE_MEMO");
+        return Common::PerfFeatureEnabled(123) && (!env || env[0] != '0');
+    }();
+    auto& stage_memo = ctx->stage_image_memos[u32(stage.hw_stage) & 7];
+    u64 memo_hash = 0;
+    const u64 memo_generation = texture_cache.RegistryGeneration();
+    const u64 memo_epoch = ctx->decoded_epoch;
+    bool memo_hit = false;
+    if (stage_memo_enabled && decode_once && !stage.images.empty()) {
+        memo_hash = 0xcbf29ce484222325ULL;
+        for (const auto& image_desc : stage.images) {
+            const auto tsharp = image_desc.GetSharp(stage);
+            std::array<u32, 8> words;
+            std::memcpy(words.data(), &tsharp, sizeof(words));
+            const u8 flags = u8(image_desc.is_depth) | u8(image_desc.is_written) << 1 |
+                             u8(image_desc.is_array) << 2;
+            memo_hash = (memo_hash ^ XXH3_64bits(words.data(), sizeof(words)) ^ flags) *
+                        0x100000001b3ULL;
+        }
+        memo_hit = stage_memo.valid && stage_memo.stage == &stage &&
+                   stage_memo.hash == memo_hash && stage_memo.generation == memo_generation &&
+                   stage_memo.epoch == memo_epoch &&
+                   num_images + stage_memo.bindings.size() <= ctx->image_bindings.size();
+    }
+    static std::atomic<u64> memo_hits{}, memo_misses{};
+    if (memo_hit) {
+        if (const u64 n = ++memo_hits; n % 200000 == 0) {
+            LOG_WARNING(Render_Vulkan, "PERF-123: {} stage image sets reused, {} looked up", n,
+                        memo_misses.load());
+        }
+        for (const auto& cached : stage_memo.bindings) {
+            auto& entry = ctx->image_bindings[num_images++];
+            entry.image_id = cached.image_id;
+            std::construct_at(&entry.desc, cached.desc);
+            if (cached.image_id) {
+                auto& image = texture_cache.GetImage(cached.image_id);
+                if (image.binding.is_bound) {
+                    image.binding.force_general |=
+                        cached.desc.type == VideoCore::TextureCache::BindingType::Storage;
+                }
+                image.binding.is_bound = 1u;
+                texture_cache.NoteImageUsed(cached.image_id);
+            }
+        }
+        image_descriptor_array_sizes.assign(stage_memo.array_sizes.begin(),
+                                            stage_memo.array_sizes.end());
+    } else if (memo_hash != 0) {
+        ++memo_misses;
+    }
+    for (const auto& image_desc :
+         memo_hit ? std::span<const Shader::ImageResource>{}
+                  : std::span<const Shader::ImageResource>{stage.images.data(),
+                                                           stage.images.size()}) {
         const auto tsharp = image_desc.GetSharp(stage);
         const auto data_fmt = tsharp.GetDataFmt();
         const auto num_fmt = tsharp.GetNumberFmt();
@@ -3738,6 +3794,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                              u8(image_desc.is_array) << 2;
             u64 hash = XXH3_64bits(words.data(), sizeof(words));
             hash ^= u64(flags) * 0x9E3779B97F4A7C15ull;
+            stage_tex_hash = (stage_tex_hash ^ hash) * 0x100000001b3ULL; // DIAG-120
             decoded = &ctx->decoded_tsharps[hash & (ctx->decoded_tsharps.size() - 1)];
             decoded_hit = decoded->valid && decoded->flags == flags && decoded->sharp == words;
             if (!decoded_hit) {
@@ -3915,6 +3972,35 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     }
 
     pass1_timer.reset();
+    if (stage_memo_enabled && memo_hash != 0 && !memo_hit) {
+        // PERF-123: kept when no image was (un)registered while looking them up.
+        stage_memo.valid = texture_cache.RegistryGeneration() == memo_generation;
+        stage_memo.stage = &stage;
+        stage_memo.hash = memo_hash;
+        stage_memo.generation = memo_generation;
+        stage_memo.epoch = memo_epoch;
+        stage_memo.bindings.assign(ctx->image_bindings.begin() + first_binding,
+                                   ctx->image_bindings.begin() + num_images);
+        stage_memo.array_sizes.assign(image_descriptor_array_sizes.begin(),
+                                      image_descriptor_array_sizes.end());
+    }
+    {
+        // DIAG-120: how often a stage binds exactly the T#s it bound in the previous draw.
+        static std::array<u64, 8> last_hash{};
+        static u64 same = 0, total = 0;
+        static auto since = std::chrono::steady_clock::now();
+        auto& last = last_hash[u32(stage.hw_stage) & 7];
+        same += last == stage_tex_hash;
+        ++total;
+        last = stage_tex_hash;
+        if (const auto now = std::chrono::steady_clock::now();
+            now - since >= std::chrono::seconds{2}) {
+            LOG_WARNING(Render_Vulkan, "DIAG-120: texture sets in 2 s: {} of {} same as the "
+                        "stage's previous draw", same, total);
+            same = total = 0;
+            since = now;
+        }
+    }
     // Second pass to re-bind images that were updated after binding
     for (u32 i = first_binding; i < num_images; ++i) {
         auto& [image_id, desc] = ctx->image_bindings[i];

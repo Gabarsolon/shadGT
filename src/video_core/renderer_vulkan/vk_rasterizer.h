@@ -482,6 +482,18 @@ private:
     struct DrawContext {
         std::array<ImageBinding, Shader::NUM_IMAGES> image_bindings;
         u32 image_binding_base = 0; // PERF-121: next free entry across the draw's stages
+        /// PERF-123: each hardware stage's last image bindings, reused when the next draw's
+        /// stage reads the same T#s and no image was (un)registered since.
+        struct StageImageMemo {
+            const Shader::Info* stage{};
+            u64 hash{};
+            u64 generation{};
+            u64 epoch{};
+            bool valid{};
+            std::vector<ImageBinding> bindings;
+            std::vector<u32> array_sizes;
+        };
+        std::array<StageImageMemo, 8> stage_image_memos;
         std::vector<DecodedTsharp> decoded_tsharps;
         u64 decoded_epoch{};
         std::array<ImageBinding, AmdGpu::NUM_COLOR_BUFFERS> cb_descs;
