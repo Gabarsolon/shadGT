@@ -53,7 +53,7 @@ struct PendingRelease {
     u64 tick;
     void* alias;
     VkDeviceMemory memory;
-    VkBuffer buffer;
+    std::shared_ptr<Buffer> wrapper; // owns the VkBuffer (D6)
 };
 std::mutex g_pending_mutex;
 std::vector<PendingRelease> g_pending;
@@ -104,11 +104,19 @@ void DirectMemory::MarkVolatile(VAddr address, u64 size) {
 bool DirectMemory::IsVolatile(VAddr address, u64 size) const {
     const u64 first = address >> PageBits;
     const u64 last = (address + std::max<u64>(size, 1) - 1) >> PageBits;
-    for (u64 page = first; page <= last; ++page) {
-        if ((page >> 6) >= VolatileWords) {
-            return true;
+    if ((last >> 6) >= VolatileWords) {
+        return true;
+    }
+    // A word (64 pages, 1 MiB) at a time.
+    for (u64 word = first >> 6; word <= (last >> 6); ++word) {
+        u64 mask = ~u64{0};
+        if (word == (first >> 6)) {
+            mask &= ~u64{0} << (first & 63);
         }
-        if (volatile_bits[page >> 6].load(std::memory_order_relaxed) & (u64{1} << (page & 63))) {
+        if (word == (last >> 6)) {
+            mask &= ~u64{0} >> (63 - (last & 63));
+        }
+        if (volatile_bits[word].load(std::memory_order_relaxed) & mask) {
             return true;
         }
     }
@@ -176,6 +184,20 @@ bool DirectMemory::Covered(VAddr address, u64 size) const {
     return true;
 }
 
+std::optional<std::pair<const Buffer*, u64>> DirectMemory::FindBuffer(VAddr address,
+                                                                     u64 size) const {
+    std::scoped_lock lk{mutex};
+    auto it = views.upper_bound(address);
+    if (it == views.begin()) {
+        return std::nullopt;
+    }
+    const View& view = std::prev(it)->second;
+    if (address < view.begin || address + size > view.end || !view.wrapper) {
+        return std::nullopt;
+    }
+    return std::make_pair(static_cast<const Buffer*>(view.wrapper.get()), address - view.begin);
+}
+
 bool DirectMemory::ImportView(VAddr address) {
 #ifdef _WIN32
     const VAddr base = GuestViewBase(address);
@@ -236,7 +258,8 @@ bool DirectMemory::ImportView(VAddr address) {
     buffer_info.size = end - base;
     buffer_info.usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
                         VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+                        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
     VkBuffer buffer{};
     if (d.vkCreateBuffer(device, &buffer_info, nullptr, &buffer) != VK_SUCCESS ||
         d.vkBindBufferMemory(device, buffer, memory, 0) != VK_SUCCESS) {
@@ -248,7 +271,8 @@ bool DirectMemory::ImportView(VAddr address) {
                                            buffer};
     const vk::DeviceAddress device_address = d.vkGetBufferDeviceAddress(device, &address_info);
     MapPages(base, end, device_address);
-    views.emplace(base, View{base, end, alias, memory, buffer, device_address});
+    auto wrapper = std::make_shared<Buffer>(instance, base, end - base, vk::Buffer{buffer});
+    views.emplace(base, View{base, end, alias, memory, buffer, device_address, std::move(wrapper)});
     imported_bytes += end - base;
     if (views.size() <= 20 || views.size() % 100 == 0) {
         LOG_WARNING(Render_Vulkan, "D1: imported view {:#x}+{:#x} ({} views, {} MiB)", base,
@@ -265,11 +289,11 @@ bool DirectMemory::EnsureImported(VAddr address, u64 size) {
         // Aliases of unmapped views the GPU no longer uses.
         std::scoped_lock lk{g_pending_mutex};
         const auto& d = VULKAN_HPP_DEFAULT_DISPATCHER;
-        std::erase_if(g_pending, [&](const PendingRelease& p) {
+        std::erase_if(g_pending, [&](PendingRelease& p) {
             if (!scheduler.IsFree(p.tick)) {
                 return false;
             }
-            d.vkDestroyBuffer(instance.GetDevice(), p.buffer, nullptr);
+            p.wrapper.reset();
             d.vkFreeMemory(instance.GetDevice(), p.memory, nullptr);
             UnmapAlias()(p.alias);
             return true;
@@ -312,7 +336,7 @@ void DirectMemory::OnUnmap(VAddr address, u64 size) {
         imported_bytes -= view.end - view.begin;
         {
             std::scoped_lock pending_lk{g_pending_mutex};
-            g_pending.push_back({tick, view.alias, view.memory, view.buffer});
+            g_pending.push_back({tick, view.alias, view.memory, std::move(view.wrapper)});
             g_has_pending.store(true, std::memory_order_relaxed);
         }
         it = views.erase(it);
@@ -328,7 +352,7 @@ DirectMemory::Stats DirectMemory::GetStats() const {
 
 void DirectMemory::Release(View& view) {
     const auto& d = VULKAN_HPP_DEFAULT_DISPATCHER;
-    d.vkDestroyBuffer(instance.GetDevice(), view.buffer, nullptr);
+    view.wrapper.reset();
     d.vkFreeMemory(instance.GetDevice(), view.memory, nullptr);
     UnmapAlias()(view.alias);
 }

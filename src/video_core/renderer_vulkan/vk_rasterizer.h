@@ -262,10 +262,17 @@ public:
     /// another fence is already deferred. Returns false if the caller should signal now.
     /// value: the bytes the fence will write, when known when it is processed (PERF-014).
     bool DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& signal,
-                          bool compute_queue = false, std::span<const u8> value = {});
+                          bool compute_queue = false, std::span<const u8> value = {},
+                          bool flush = true);
+    /// D5: submits fences deferred without a submit of their own (recorder out of work).
+    void FlushDeferredFences();
+    /// D6: the imported guest memory holding a range read in place, when direct mode can.
+    std::optional<std::pair<const VideoCore::Buffer*, u64>> DirectReadBuffer(VAddr address,
+                                                                             u64 size);
     /// FIX-019: a WRITE_DATA packet whose guest write was deferred also writes the GPU copy of
     /// the memory now, in command order, as hardware does.
     void InlineDeferredWrite(VAddr address, std::span<const u8> data);
+    std::atomic<bool> deferred_unflushed{false}; // D5
     /// PERF-014: the dword at address once all deferred fence writes that cover it land.
     std::optional<u32> PendingFenceDword(VAddr address);
     [[nodiscard]] bool HasReadbackFences() const {

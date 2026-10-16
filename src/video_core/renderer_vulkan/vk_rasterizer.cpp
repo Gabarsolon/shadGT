@@ -2324,9 +2324,28 @@ void Rasterizer::RecordDrain(DrainSource source, std::chrono::steady_clock::time
 extern std::atomic<u64> g_defer_readbacks; // DIAG-068
 extern std::atomic<u64> g_defer_address;
 extern std::atomic<u64> g_defer_order;
+extern std::atomic<u64> g_defer_unflushed; // D5
+
+std::optional<std::pair<const VideoCore::Buffer*, u64>> Rasterizer::DirectReadBuffer(VAddr address,
+                                                                                    u64 size) {
+    // D6: a range only the CPU writes, read by the GPU in place (vertex and index buffers).
+    auto* direct = buffer_cache.GetDirectMemory();
+    if (!direct || size == 0 || direct->IsVolatile(address, size) ||
+        !direct->EnsureImported(address, size) || buffer_cache.IsRegionGpuModified(address, size)) {
+        return std::nullopt;
+    }
+    return direct->FindBuffer(address, size);
+}
+
+void Rasterizer::FlushDeferredFences() {
+    if (deferred_unflushed.exchange(false, std::memory_order_acq_rel)) {
+        scheduler.Flush();
+    }
+}
 
 bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& signal,
-                                  bool compute_queue, std::span<const u8> value) {
+                                  bool compute_queue, std::span<const u8> value,
+                                  bool flush) {
     // Hardware writes a fence when the work before it has finished. With readbacks pending,
     // signal after the GPU completes instead of draining the GPU now. A later write to an address
     // that already has a deferred write is deferred too, so that address keeps its order;
@@ -2433,7 +2452,16 @@ bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& 
             }
         });
     // Submit so the deferred tick can complete; the GPU thread does not wait.
-    scheduler.Flush();
+    // D5: in direct mode most fences are held only to keep order (labels written by WRITE_DATA
+    // between draws). Those ride the next submit, the next EOP's or the one the recorder makes
+    // when it runs out of work (a game waiting for one stops sending work).
+    if (flush || readbacks_pending || address_pending || !direct_hold) {
+        scheduler.Flush();
+        deferred_unflushed.store(false, std::memory_order_relaxed);
+    } else {
+        deferred_unflushed.store(true, std::memory_order_release);
+        ++g_defer_unflushed;
+    }
     return true;
 }
 
@@ -2482,6 +2510,7 @@ std::optional<u32> Rasterizer::PendingFenceDword(VAddr address) {
 std::atomic<u64> g_defer_readbacks{};
 std::atomic<u64> g_defer_address{};
 std::atomic<u64> g_defer_order{};
+std::atomic<u64> g_defer_unflushed{};
 
 void Rasterizer::RecordDeferredFenceLatency(std::chrono::steady_clock::time_point deferred_at) {
     // DIAG-015: how long the guest waits on a deferred fence, reported every 2 seconds.
@@ -2503,10 +2532,10 @@ void Rasterizer::RecordDeferredFenceLatency(std::chrono::steady_clock::time_poin
             Render_Vulkan,
             "Deferred fences: {} in {} frames, latency avg {:.2f} ms max {:.2f} ms; DIAG-068: "
             "deferred for image readbacks {}, same address {}, behind an earlier one {}; FIX-070: "
-            "{} small readbacks without a fence",
+            "{} small readbacks without a fence; D5: {} without a submit of their own",
             stats.count, frames, stats.total_us / 1000.0 / stats.count, stats.max_us / 1000.0,
             g_defer_readbacks.exchange(0), g_defer_address.exchange(0), g_defer_order.exchange(0),
-            background_readbacks.exchange(0));
+            background_readbacks.exchange(0), g_defer_unflushed.exchange(0));
         stats = {};
         stats.window_start = now;
         stats.window_frame = u64(DebugState.GetFrameNum());
@@ -2775,6 +2804,16 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
                                           pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash,
                                           true);
         }
+        // D6: vertices read in place from imported guest memory.
+        // Off by default: vertex fetch over PCIe made the GPU the limit (90% busy, 27 fps).
+        static const bool direct_vertices = [] {
+            const char* env = std::getenv("SHADGT_DIRECT_VB");
+            return env && env[0] == '1';
+        }();
+        if (const auto direct =
+                direct_vertices ? DirectReadBuffer(range.base_address, size) : std::nullopt) {
+            std::tie(range.buffer, range.offset) = *direct;
+        } else
         // MT-004: obtained ahead by the buffer stage when it planned this draw's vertex buffers.
         if (const auto planned =
                 buffer_plan && buffer_plan->vertices
@@ -2847,8 +2886,17 @@ void Rasterizer::BindIndexBuffer(u32 index_offset) {
     const auto planned = buffer_plan && buffer_plan->index
                              ? TakePlannedBuffer(index_address, index_buffer_size, false, false)
                              : std::nullopt;
+    static const bool direct_indices = [] { // D6: SHADGT_DIRECT_IB=0 turns it off
+        const char* env = std::getenv("SHADGT_DIRECT_IB");
+        return !env || env[0] != '0';
+    }();
+    const auto direct = planned || !direct_indices
+                            ? std::nullopt
+                            : DirectReadBuffer(index_address, index_buffer_size);
     const auto [buffer, offset] =
-        planned ? *planned : buffer_cache.ObtainBuffer(index_address, index_buffer_size, false);
+        planned  ? *planned
+        : direct ? *direct
+                 : buffer_cache.ObtainBuffer(index_address, index_buffer_size, false);
     ctx->needs_barrier |= runtime.IsBufferAccessed(buffer, offset, index_buffer_size);
     ctx->bound_buffers.emplace_back(buffer, offset, index_buffer_size, false); // FIX-016
     const auto cmdbuf = scheduler.CommandBuffer();

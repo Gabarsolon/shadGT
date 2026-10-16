@@ -6,6 +6,7 @@
 #include <atomic>
 #include <map>
 #include <memory>
+#include <optional>
 #include <mutex>
 #include <vector>
 
@@ -52,6 +53,10 @@ public:
     /// page of the range is now mapped for the GPU.
     bool EnsureImported(VAddr address, u64 size);
 
+    /// D6: the imported buffer holding the whole range and the range's offset in it, when one
+    /// view holds it (call EnsureImported first).
+    std::optional<std::pair<const Buffer*, u64>> FindBuffer(VAddr address, u64 size) const;
+
     /// Whether every page of the range is mapped for the GPU (no import attempted).
     bool Covered(VAddr address, u64 size) const;
 
@@ -85,6 +90,7 @@ private:
         VkDeviceMemory memory;
         VkBuffer buffer;
         vk::DeviceAddress device_address;
+        std::shared_ptr<Buffer> wrapper; // D6: owns `buffer`; bound as vertex/index buffer
     };
     bool ImportView(VAddr address);
     void MapPages(VAddr begin, VAddr end, vk::DeviceAddress device_address);

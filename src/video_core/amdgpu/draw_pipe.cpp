@@ -456,6 +456,16 @@ void DrawPipe::Run(std::stop_token stop) {
     std::deque<Work> batch;
     while (true) {
         RunUrgent();
+        if (idle_hook) {
+            bool empty;
+            {
+                std::scoped_lock lk{mutex};
+                empty = queue.empty();
+            }
+            if (empty) {
+                idle_hook(); // D5
+            }
+        }
         {
             std::unique_lock lk{mutex};
             if (queue.empty()) {

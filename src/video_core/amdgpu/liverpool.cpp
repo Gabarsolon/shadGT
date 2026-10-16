@@ -2245,7 +2245,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                     });
                                 },
                                 false,
-                                FenceValueBytes(DataSelect::Data32Low, event_eos->DataDWord(), 0));
+                                FenceValueBytes(DataSelect::Data32Low, event_eos->DataDWord(), 0),
+                                false); // D5: rides the next submit
                         if (!deferred) {
                             if (rasterizer) {
                                 rasterizer->OnFence(Vulkan::Rasterizer::DrainSource::GfxEos);
@@ -2311,7 +2312,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                 },
                                 false,
                                 FenceValueBytes(event_eop->data_sel.Value(), event_eop->DataDWord(),
-                                                event_eop->DataQWord()));
+                                                event_eop->DataQWord()),
+                                true); // D5: EOP submits; labels before it ride along
                         if (!deferred) {
                             if (rasterizer) {
                                 rasterizer->OnFence(Vulkan::Rasterizer::DrainSource::GfxEop);
@@ -2421,7 +2423,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                     [address, data = std::move(data)] {
                                         WriteDeferredFence(address, data.data(), u32(data.size()));
                                     },
-                                    false, value);
+                                    false, value, false); // D5: rides the next submit
                             if (!deferred) {
                                 if (rasterizer) {
                                     rasterizer->OnFence(

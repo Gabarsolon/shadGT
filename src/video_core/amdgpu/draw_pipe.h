@@ -42,6 +42,11 @@ public:
 
     /// `thread_init` runs first on the recorder thread (thread name, thread-local state).
     explicit DrawPipe(std::function<void()> thread_init, size_t max_pending = 4096);
+
+    /// D5: runs on the recorder each time it runs out of work, before it waits.
+    void SetIdleHook(std::function<void()>&& hook) {
+        idle_hook = std::move(hook);
+    }
     ~DrawPipe();
 
     DrawPipe(const DrawPipe&) = delete;
@@ -200,6 +205,7 @@ private:
     const size_t max_pending;
     std::atomic<std::thread::id> recorder_id{};
     std::function<void()> thread_init;
+    std::function<void()> idle_hook; // D5
     Stats stats{};
     std::jthread recorder;
     std::mutex idle_mutex; // DIAG-114
