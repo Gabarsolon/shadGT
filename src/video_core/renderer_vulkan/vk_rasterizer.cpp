@@ -1101,6 +1101,101 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
     } else {
         ctx->db_desc.first = {};
     }
+    // DIAG-116 (SHADGT_DIAG_PASSES=1): draws per render pass (color target 0 and depth target,
+    // with their sizes), every 4 s: where a frame's draws go.
+    static const bool diag_passes = [] {
+        const char* env = std::getenv("SHADGT_DIAG_PASSES");
+        return env && (env[0] == '1' || env[0] == '2');
+    }();
+    if (diag_passes) {
+        struct PassStats {
+            u64 draws{};
+            u64 first_seen{};
+            u32 cb_w{}, cb_h{}, db_w{}, db_h{};
+            u32 cbs{};
+        };
+        static std::unordered_map<u64, PassStats> passes;
+        static u64 sequence = 0;
+        static auto window = std::chrono::steady_clock::now();
+        static u64 frames_at_start = DebugState.GetFrameNum();
+        VAddr cb_addr = 0, db_addr = 0;
+        u32 cb_w = 0, cb_h = 0, db_w = 0, db_h = 0, cbs = 0;
+        for (s32 cb = 0; cb < std::bit_width(key.mrt_mask); ++cb) {
+            if (ctx->cb_descs[cb].image_id) {
+                const auto& info = texture_cache.GetImage(ctx->cb_descs[cb].image_id).info;
+                if (cbs++ == 0) {
+                    cb_addr = info.guest_address;
+                    cb_w = info.size.width;
+                    cb_h = info.size.height;
+                }
+            }
+        }
+        if (ctx->db_desc.first) {
+            const auto& info = texture_cache.GetImage(ctx->db_desc.first).info;
+            db_addr = info.guest_address;
+            db_w = info.size.width;
+            db_h = info.size.height;
+        }
+        // Once, 230 s in: the color targets of the other passes are written to user\log
+        // (pass_<w>x<h>_<format>.bin) when the main view starts drawing again.
+        static std::unordered_map<u64, VideoCore::ImageId> to_dump;
+        static bool dumped = false;
+        static const auto dump_start = std::chrono::steady_clock::now();
+        static const bool dump_passes = std::getenv("SHADGT_DIAG_PASSES")[0] == '2';
+        static bool cleared = !dump_passes;
+        if (!cleared && std::chrono::steady_clock::now() - dump_start > std::chrono::seconds{229}) {
+            cleared = true; // only targets of the last second before the dump
+            to_dump.clear();
+        }
+        if (dump_passes && !dumped && cleared && cbs != 0 && !(cb_w == 1920 && cb_h == 1080)) {
+            to_dump[(u64(cb_w) << 32) | cb_h] = ctx->cb_descs[0].image_id;
+        }
+        if (dump_passes && !dumped && cb_w == 1920 && cb_h == 1080 && !to_dump.empty() &&
+            std::chrono::steady_clock::now() - dump_start > std::chrono::seconds{230}) {
+            dumped = true;
+            const auto dir = Common::FS::GetUserPath(Common::FS::PathType::LogDir);
+            for (const auto& [size_key, id] : to_dump) {
+                if (!id) {
+                    continue;
+                }
+                const auto& info = texture_cache.GetImage(id).info;
+                LOG_WARNING(Render_Vulkan, "DIAG-116: pass target {}x{} -> image {}x{} {} {} bits depth {}",
+                            size_key >> 32, size_key & 0xffffffff, info.size.width, info.size.height,
+                            vk::to_string(info.pixel_format), info.num_bits, info.props.is_depth);
+                texture_cache.DumpImage(
+                    id, dir / fmt::format("pass_{}x{}_{}_{}bit.bin", info.size.width,
+                                          info.size.height, vk::to_string(info.pixel_format),
+                                          info.num_bits));
+            }
+            LOG_WARNING(Render_Vulkan, "DIAG-116: dumped {} pass targets", to_dump.size());
+        }
+        auto& stats = passes[cb_addr * 31 + db_addr];
+        if (stats.draws++ == 0) {
+            stats.first_seen = sequence++;
+            stats = {1, stats.first_seen, cb_w, cb_h, db_w, db_h, cbs};
+        }
+        if (const auto now = std::chrono::steady_clock::now(); now - window >= std::chrono::seconds{4}) {
+            const u64 frames = std::max<u64>(1, DebugState.GetFrameNum() - frames_at_start);
+            std::vector<std::pair<u64, PassStats>> list(passes.begin(), passes.end());
+            std::ranges::sort(list, std::greater{}, [](const auto& e) { return e.second.draws; });
+            u64 total = 0;
+            for (const auto& [k, p] : list) {
+                total += p.draws;
+            }
+            std::string text;
+            for (size_t i = 0; i < std::min<size_t>(list.size(), 20); ++i) {
+                const auto& p = list[i].second;
+                text += fmt::format("\n  {:5.0f} draws/frame ({:4.1f}%): {} color {}x{}, depth {}x{}",
+                                    double(p.draws) / frames, 100.0 * p.draws / total, p.cbs, p.cb_w,
+                                    p.cb_h, p.db_w, p.db_h);
+            }
+            LOG_WARNING(Render_Vulkan, "DIAG-116: {:.0f} draws/frame over {} frames in {} passes:{}",
+                        double(total) / frames, frames, list.size(), text);
+            passes.clear();
+            window = now;
+            frames_at_start = DebugState.GetFrameNum();
+        }
+    }
 }
 
 // PERF-028: quad lists are drawn as triangle lists through generated indices instead of the
@@ -1570,6 +1665,36 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
                     shape.blend = regs.blend_control[i].enable;
                 }
                 ++shape.targets;
+            }
+        }
+    }
+    // EXP-128 (SHADGT_PASS_SKIP=<w>x<h>:<n>,...): draws into a color target of that size are
+    // recorded only every n-th frame; the target keeps its last contents in between (a pass the
+    // game redraws every frame, such as a reflection or mirror view, updated at a lower rate).
+    static const auto pass_skips = [] {
+        std::vector<std::array<u32, 3>> rules;
+        if (const char* env = std::getenv("SHADGT_PASS_SKIP")) {
+            std::string text = env;
+            size_t at = 0;
+            while (at < text.size()) {
+                u32 w = 0, h = 0, n = 0;
+                if (std::sscanf(text.c_str() + at, "%ux%u:%u", &w, &h, &n) == 3 && n > 1) {
+                    rules.push_back({w, h, n});
+                }
+                const size_t comma = text.find(',', at);
+                if (comma == std::string::npos) {
+                    break;
+                }
+                at = comma + 1;
+            }
+        }
+        return rules;
+    }();
+    if (!pass_skips.empty() && regs.color_buffers[0]) {
+        const auto& cb = regs.color_buffers[0];
+        for (const auto& [w, h, n] : pass_skips) {
+            if (cb.Pitch() == w && cb.Height() == h && DebugState.GetFrameNum() % n != 0) {
+                return;
             }
         }
     }

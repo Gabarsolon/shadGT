@@ -718,7 +718,46 @@ void SyncDecals() {
     std::fprintf(stderr, "[patch] GTS-006 %d custom decal(s) from decals\\\n", count);
 }
 
+// GTS-007: wet-road reflections off. In the rain GT Sport renders the scene a second time into a
+// 1024x512 reflection of the wet track (ReflectSetting.enableIfWet of the course settings, checked
+// at eboot 0xab27d2): ~24% of a Tokyo rain frame's draws. Ignoring "wet" leaves the pass out
+// (Tokyo rain, 3 races each: 40.6 fps vs 31.1). Off when GPU.wet_reflections is false in
+// user\custom_configs\CUSA03220.json (the launcher's option) or RYGT_WET_REFLECTIONS=0.
+bool WetReflectionsWanted() {
+    if (const char* env = std::getenv("RYGT_WET_REFLECTIONS")) {
+        return env[0] != '0';
+    }
+    char path[MAX_PATH];
+    const DWORD length = GetModuleFileNameA(nullptr, path, MAX_PATH);
+    if (length == 0 || length >= MAX_PATH) {
+        return true;
+    }
+    std::string config{path, length};
+    config = config.substr(0, config.find_last_of("\\/") + 1) + "user\\custom_configs\\CUSA03220.json";
+    std::FILE* file = std::fopen(config.c_str(), "rb");
+    if (!file) {
+        return true;
+    }
+    std::string text;
+    char chunk[4096];
+    while (const size_t n = std::fread(chunk, 1, sizeof(chunk), file)) {
+        text.append(chunk, n);
+    }
+    std::fclose(file);
+    const size_t key = text.find("\"wet_reflections\"");
+    if (key == std::string::npos) {
+        return true;
+    }
+    const size_t value = text.find_first_not_of(" \t\r\n:", key + 17);
+    return value == std::string::npos || text.compare(value, 5, "false") != 0;
+}
+
 void RytyApplyGamePatches() {
+    if (!WetReflectionsWanted()) {
+        // jne (reflect when wet) -> two nops
+        Apply(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)),
+              Patch{0xac27db, {0x75, 0x77}, {0x90, 0x90}, "GTS-007 wet-road reflections off"});
+    }
     InstallMiscHooks(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallLewisChallenge(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallScriptPatches(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
