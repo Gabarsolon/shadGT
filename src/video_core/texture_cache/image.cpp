@@ -14,6 +14,7 @@
 #include <string>
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/ryty_config.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -219,7 +220,19 @@ u64 g_recycle_seq = 0;
 std::mutex g_recycle_mutex;
 std::unordered_map<RecycleKey, std::vector<RecycledImage>, RecycleKeyHash> g_recycled;
 u64 g_recycled_bytes = 0;
-constexpr u64 RecycleBudget = 512ULL << 20;
+// GPU.image_recycle_mb (launcher quality preset) or SHADGT_IMAGE_RECYCLE_MB; 512 by default.
+u64 RecycleBudgetBytes() {
+    static const u64 budget = [] {
+        if (const char* env = std::getenv("SHADGT_IMAGE_RECYCLE_MB"); env && *env) {
+            return std::strtoull(env, nullptr, 10) << 20;
+        }
+        if (const auto value = Common::RytyGameConfigValue("image_recycle_mb")) {
+            return std::strtoull(value->c_str(), nullptr, 10) << 20;
+        }
+        return u64{512} << 20;
+    }();
+    return budget;
+}
 constexpr size_t RecyclePerKey = 8;
 std::atomic<u64> g_recycle_hits{}, g_recycle_misses{}, g_recycle_dropped{};
 
@@ -240,7 +253,7 @@ RecycleKey KeyOf(const vk::ImageCreateInfo& ci) {
 /// Keeps the image for reuse; false when it should be destroyed instead.
 bool Recycle(VmaAllocator allocator, const vk::ImageCreateInfo& ci, VmaAllocation allocation,
              vk::Image image, vk::DeviceSize size_bytes) {
-    if (!RecycleEnabled() || ci.pNext != nullptr || size_bytes > (64ULL << 20)) {
+    if (!RecycleEnabled() || ci.pNext != nullptr || size_bytes > (64ULL << 20) || RecycleBudgetBytes() == 0) {
         return false;
     }
     std::scoped_lock lk{g_recycle_mutex};
@@ -251,7 +264,7 @@ bool Recycle(VmaAllocator allocator, const vk::ImageCreateInfo& ci, VmaAllocatio
         return false;
     }
     // Over budget: the images waiting longest go (most were made once, e.g. while loading).
-    while (g_recycled_bytes + size_bytes > RecycleBudget && !g_recycle_order.empty()) {
+    while (g_recycled_bytes + size_bytes > RecycleBudgetBytes() && !g_recycle_order.empty()) {
         const auto [old_key, old_seq] = g_recycle_order.front();
         g_recycle_order.pop_front();
         auto& old_list = g_recycled[old_key];
