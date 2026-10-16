@@ -81,6 +81,8 @@ enum class Phase : u32 {
     BufDirect,
     VtxBind,
     IdxBind,
+    SelFlatten, ///< DIAG-121: RefreshFlatBuf during program matching
+    SelSpec,    ///< DIAG-121: StageSpecialization built during program matching
     Count,
 };
 std::array<std::atomic<u64>, size_t(Phase::Count)>& GetPhaseTicks();

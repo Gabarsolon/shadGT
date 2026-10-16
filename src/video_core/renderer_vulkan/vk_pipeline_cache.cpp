@@ -2784,7 +2784,7 @@ bool PipelineCache::TakeReadyTranslation(HwStage hw_stage, SwStage sw_stage, u64
         auto& info = *job->info;
         info.pgm_base = params.Base();
         info.user_data = params.user_data;
-        info.RefreshFlatBuf();
+        { Common::PhaseTimer flat_timer{Common::Phase::SelFlatten}; info.RefreshFlatBuf(); }
         if (job->hw_stage != hw_stage || job->sw_stage != sw_stage ||
             Shader::StageSpecialization(info, runtime_info, profile, binding) != job->spec) {
             continue;
@@ -2983,8 +2983,11 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
             auto& info = *permutation.info;
             info.pgm_base = params.Base();
             info.user_data = params.user_data;
-            info.RefreshFlatBuf();
-            if (permutation.spec == Shader::StageSpecialization(info, runtime_info, profile, binding)) {
+            { Common::PhaseTimer flat_timer{Common::Phase::SelFlatten}; info.RefreshFlatBuf(); }
+            if (permutation.spec == [&] {
+                    Common::PhaseTimer spec_timer{Common::Phase::SelSpec};
+                    return Shader::StageSpecialization(info, runtime_info, profile, binding);
+                }()) {
                 if (!info.attribute_flags_known && IsTessEmulatedDraw()) {
                     RecoverAttributeFlags(info, permutation.spec, params, runtime_info,
                                           program->last_match);
@@ -3010,7 +3013,7 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
         auto& info = *permutation.info;
         info.pgm_base = params.Base();
         info.user_data = params.user_data;
-        info.RefreshFlatBuf();
+        { Common::PhaseTimer flat_timer{Common::Phase::SelFlatten}; info.RefreshFlatBuf(); }
         if (hw_stage == HwStage::Hull && !tess_checked) {
             // FIX-058: checked with the first translation's info, before a new permutation
             // could be made from garbage constants.
@@ -3030,7 +3033,9 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
         if (memo_usable) {
             matches = perm_idx == memo.perm;
         } else {
+            std::optional<Common::PhaseTimer> spec_timer{std::in_place, Common::Phase::SelSpec};
             const auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding);
+            spec_timer.reset();
             matches = permutation.spec == spec;
             if (!matches && program->modules.size() >= 4 && mismatch_reasons.size() < 600) {
                 u32 index{};

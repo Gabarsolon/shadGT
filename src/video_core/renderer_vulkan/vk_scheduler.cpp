@@ -145,7 +145,13 @@ void CommandRing::WaitForSpace(size_t needed) {
 
 void CommandRing::WaitForWork(u64 seen, const std::stop_token& stoken) {
     // The recorder hands over commands steadily while it works; spin briefly before sleeping.
-    for (u32 i = 0; i < 2048; ++i) {
+    // PERF-125: SHADGT_CMD_SPIN pauses (default 2048). The spin was most of this thread's
+    // CPU time (replay itself ~23% busy).
+    static const u32 spin = [] {
+        const char* env = std::getenv("SHADGT_CMD_SPIN");
+        return env && *env ? u32(std::strtoul(env, nullptr, 10)) : 2048u;
+    }();
+    for (u32 i = 0; i < spin; ++i) {
         if (head.load(std::memory_order_acquire) != seen) {
             return;
         }
