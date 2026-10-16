@@ -10,6 +10,7 @@
 
 #include <cstdio>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -17,6 +18,7 @@
 #include <iterator>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 #include <windows.h>
@@ -571,6 +573,39 @@ void LoadScriptReplacements() {
     FindClose(find);
 }
 
+// FIX-110: whether a race (any race_* project) or the menus (gtmode, arcade and the other menu
+// projects) run, from the project script the game loads when it switches. Overlays a race loads
+// (dialogs, the meter, the pause menu) don't change it. The renderer skips draws for new
+// pipelines only in races; in the menus some scenes draw once into a texture they keep showing.
+std::atomic<bool> g_in_race{false};
+
+void NoteProjectScript(const u8* data, s64 read) {
+    if (read < 16 || std::memcmp(data, "ADCH012", 8) != 0) {
+        return;
+    }
+    const std::string_view head{reinterpret_cast<const char*>(data),
+                                static_cast<size_t>(std::min<s64>(read, 200))};
+    const auto at = head.find("projects/gt7sp/");
+    if (at == std::string_view::npos) {
+        return;
+    }
+    std::string_view name = head.substr(at + 15);
+    name = name.substr(0, name.find('/'));
+    static constexpr std::string_view menus[] = {
+        "gtmode", "arcade", "campaign", "garage", "brand_central", "gallery", "livery2",
+        "photo", "play_photo", "option", "ps_store", "car_select", "course_select",
+        "event_setting", "preview", "car_preview", "online", "boot", "demo"};
+    const bool race = name.starts_with("race");
+    if (!race && std::find(std::begin(menus), std::end(menus), name) == std::end(menus)) {
+        return;
+    }
+    if (g_in_race.exchange(race) != race) {
+        std::fprintf(stderr, "[patch] FIX-110 %.*s: %s\n", static_cast<int>(name.size()),
+                     name.data(), race ? "race, new pipelines are built in the background"
+                                       : "menus, draws wait for new pipelines");
+    }
+}
+
 s64 PS4_SYSV_ABI StreamRefillHook(void* file, GuestIoVec* iov) {
     const s64 read = g_file_read(file, iov);
     if (read <= 0 || !iov || !iov->base) {
@@ -581,6 +616,7 @@ s64 PS4_SYSV_ABI StreamRefillHook(void* file, GuestIoVec* iov) {
     if (!g_script_replacements.empty()) {
         ServeReplacement(file, begin, read);
     }
+    NoteProjectScript(begin, read); // FIX-110
     static const bool log_scripts = std::getenv("RYGT_LOG_SCRIPTS") != nullptr;
     if (log_scripts) {
         // DIAG-107: the start of each script chunk read (first 48 printable bytes).
@@ -615,9 +651,7 @@ void InstallScriptPatches(u8* base) {
     if (!(std::getenv("RYGT_SCRIPTS") && std::getenv("RYGT_SCRIPTS")[0] == '0')) {
         LoadScriptReplacements();
     }
-    if (g_script_patches.empty() && g_script_replacements.empty()) {
-        return;
-    }
+    // The hook stays in without patches too: FIX-110 reads which project the game loads.
     u8* stubs = AllocNear(base);
     if (!stubs) {
         std::fprintf(stderr, "[patch] GTS-003: no memory near the game's code for the hooks\n");
@@ -921,3 +955,10 @@ void RytyApplyGamePatches() {
         start = end + 1;
     }
 }
+
+namespace Vulkan {
+// FIX-110: true while a race project runs (see NoteProjectScript).
+bool RytyGtsInRace() {
+    return g_in_race.load(std::memory_order_relaxed);
+}
+} // namespace Vulkan

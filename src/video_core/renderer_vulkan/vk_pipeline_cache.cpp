@@ -923,6 +923,24 @@ std::shared_ptr<PipelineCache::PipelineBuild> PipelineCache::StartPipelineBuild(
     return build;
 }
 
+#ifdef RYTY_GPU
+bool RytyGtsInRace(); // FIX-110, ryty_game_patch.cpp
+#endif
+
+bool PipelineCache::MenusWait() {
+    // FIX-110: in GT Sport's menus a draw waits for its new pipeline (the guest clocks are held
+    // meanwhile, as in the "pause" compile mode); only races skip draws. Some menu scenes draw
+    // once into a texture they keep showing: the GR86 slide of the home screen played on black
+    // instead of the Fuji pit straight when its scenery draws were skipped while they built.
+    // -DisablePerf 134 skips in the menus too.
+#ifdef RYTY_GPU
+    static const bool enabled = Common::PerfFeatureEnabled(134);
+    return enabled && !RytyGtsInRace();
+#else
+    return false;
+#endif
+}
+
 bool PipelineCache::CancelBuild(PipelineBuild& build) {
     // A worker may already have taken the job and wait in FinishBuild for whoever claimed the
     // build; release it, the build stays empty.
@@ -1387,7 +1405,8 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
                 }
                 return it->second.get();
             }
-            if (stored->async && !key_uses_legacy && !WritesMemory(infos) && !NeverSkipped(infos)) {
+            if (stored->async && !key_uses_legacy && !WritesMemory(infos) && !NeverSkipped(infos) &&
+                !MenusWait()) {
                 // PERF-076: still building; this draw is skipped, the next ones look again.
                 graphics_pipelines.erase(it);
                 ++async_stats.skipped_draws;
@@ -1443,7 +1462,7 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
         // D10: a pipeline of old translations is built right away (the driver usually has it
         // from the old renderer's sessions, so it takes milliseconds).
         if (build && AsyncPipelines() && !key_uses_legacy && !WritesMemory(infos) &&
-            !NeverSkipped(infos) &&
+            !NeverSkipped(infos) && !MenusWait() &&
             build->done.wait_for(std::chrono::seconds{0}) != std::future_status::ready) {
             build->async = true;
             pending_builds[graphics_key] = build;

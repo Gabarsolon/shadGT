@@ -151,6 +151,8 @@ private:
     void BuildQueuedStates(const DrawIndirectParams params, bool restore);
     /// PERF-038: claims a build nobody started, so it is never built; false if one started.
     static bool CancelBuild(PipelineBuild& build);
+    /// FIX-110: in the menus draws wait for new pipelines instead of being skipped.
+    static bool MenusWait();
     /// PERF-038: queues a stored pipeline's build behind all other builds.
     void QueueBackgroundBuild(const std::shared_ptr<PipelineBuild>& build);
     /// PERF-038: on this thread, between draws: takes stored pipelines the reader thread
