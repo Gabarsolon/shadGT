@@ -1932,7 +1932,12 @@ const Buffer* BufferCache::TryImportView(VAddr device_addr, u32 size) {
 std::pair<const Buffer*, u64> BufferCache::ObtainBufferImpl(VAddr device_addr, u32 size,
                                                             bool is_written, bool is_texel_buffer) {
     // D1: guest memory obtained here is imported for the GPU (coverage logged every 2 s).
-    if (direct_memory && !is_texel_buffer) {
+    // Diagnostic only (SHADGT_DIAG_D1=1): it imports memory on every obtain.
+    static const bool diag_d1 = [] {
+        const char* env = std::getenv("SHADGT_DIAG_D1");
+        return env && env[0] == '1';
+    }();
+    if (diag_d1 && direct_memory && !is_texel_buffer) {
         static u64 covered = 0, missed = 0;
         static auto window = std::chrono::steady_clock::now();
         if (direct_memory->EnsureImported(device_addr, size)) {

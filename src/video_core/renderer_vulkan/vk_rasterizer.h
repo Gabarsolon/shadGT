@@ -465,7 +465,7 @@ private:
     struct BoundTexture {
         u32 descriptor_index;
         VideoCore::ImageId image_id;
-        VideoCore::TextureCache::ImageDesc desc;
+        VideoCore::TextureCache::ImageDesc* desc; // PERF-121: points into image_bindings
         vk::Image backing_image;
     };
 
@@ -481,6 +481,7 @@ private:
     /// worker threads of the multithreaded recorder get their own.
     struct DrawContext {
         std::array<ImageBinding, Shader::NUM_IMAGES> image_bindings;
+        u32 image_binding_base = 0; // PERF-121: next free entry across the draw's stages
         std::vector<DecodedTsharp> decoded_tsharps;
         u64 decoded_epoch{};
         std::array<ImageBinding, AmdGpu::NUM_COLOR_BUFFERS> cb_descs;

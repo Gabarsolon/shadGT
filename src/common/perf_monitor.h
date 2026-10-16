@@ -75,6 +75,12 @@ enum class Phase : u32 {
     ReadAheadEval,
     ProgramMatch,
     SelectAhead, ///< PERF-047: pipeline selection on the command thread (not part of draws)
+    // DIAG-119: finer parts of textures, buffers and vertex/index binding.
+    TexPass1,
+    TexSamplers,
+    BufDirect,
+    VtxBind,
+    IdxBind,
     Count,
 };
 std::array<std::atomic<u64>, size_t(Phase::Count)>& GetPhaseTicks();

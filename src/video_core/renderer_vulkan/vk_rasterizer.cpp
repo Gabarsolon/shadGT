@@ -2400,7 +2400,18 @@ bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& 
     const bool earlier_deferred = keep_order && deferred_fences.load() != 0;
     // D3: with direct memory the GPU reads guest memory in place, so the game may only reuse
     // it once the GPU has finished: graphics fences wait for the GPU.
-    const bool direct_hold = !compute_queue && buffer_cache.GetDirectMemory() != nullptr;
+    // EXP-129 (SHADGT_DIRECT_NOHOLD=1, measurement only, may render wrong): no hold.
+    // =<seconds>: only after that many seconds (the race, past menus and loading).
+    static const u64 no_hold_after = [] {
+        const char* env = std::getenv("SHADGT_DIRECT_NOHOLD");
+        return env && *env ? std::strtoull(env, nullptr, 10) : ~u64{0};
+    }();
+    static const auto hold_start = std::chrono::steady_clock::now();
+    const bool no_hold =
+        no_hold_after != ~u64{0} &&
+        std::chrono::steady_clock::now() - hold_start > std::chrono::seconds(no_hold_after);
+    const bool direct_hold =
+        !no_hold && !compute_queue && buffer_cache.GetDirectMemory() != nullptr;
     if (!readbacks_pending && !address_pending && !earlier_deferred && !direct_hold) {
         return false;
     }
@@ -2600,6 +2611,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     ctx->buffer_infos.clear();
     ctx->image_infos.clear();
     ctx->bound_textures.clear();
+    ctx->image_binding_base = 0; // PERF-121
 
     if (buffer_plan && !buffer_plan->uploads.empty()) {
         // PERF-067: the uploads the buffer stage prepared for this draw's buffers.
@@ -2657,6 +2669,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
 }
 
 void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
+    Common::PhaseTimer vtx_timer{Common::Phase::VtxBind}; // DIAG-119
     const auto& regs = liverpool->DrawRegs();
     VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
     VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
@@ -2806,12 +2819,14 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
         }
         // D6: vertices read in place from imported guest memory.
         // Off by default: vertex fetch over PCIe made the GPU the limit (90% busy, 27 fps).
-        static const bool direct_vertices = [] {
+        // SHADGT_DIRECT_VB=<max KB>: only ranges up to that size (small, often rewritten ones).
+        static const u64 direct_vertex_limit = [] {
             const char* env = std::getenv("SHADGT_DIRECT_VB");
-            return env && env[0] == '1';
+            return env && *env ? std::strtoull(env, nullptr, 10) * 1024 : u64{0};
         }();
-        if (const auto direct =
-                direct_vertices ? DirectReadBuffer(range.base_address, size) : std::nullopt) {
+        if (const auto direct = size <= direct_vertex_limit
+                                    ? DirectReadBuffer(range.base_address, size)
+                                    : std::nullopt) {
             std::tie(range.buffer, range.offset) = *direct;
         } else
         // MT-004: obtained ahead by the buffer stage when it planned this draw's vertex buffers.
@@ -2821,6 +2836,7 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
                     : std::nullopt) {
             std::tie(range.buffer, range.offset) = *planned;
         } else {
+            Common::PhaseTimer obtain_timer{Common::Phase::BufObtain}; // DIAG-119
             std::tie(range.buffer, range.offset) =
                 buffer_cache.ObtainBuffer(range.base_address, size, false);
         }
@@ -2871,6 +2887,7 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
 }
 
 void Rasterizer::BindIndexBuffer(u32 index_offset) {
+    Common::PhaseTimer idx_timer{Common::Phase::IdxBind}; // DIAG-119
     const auto& regs = liverpool->DrawRegs();
 
     // Figure out index type and size.
@@ -3398,10 +3415,17 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     const char* env = std::getenv("SHADGT_DIRECT_READS");
                     return !env || env[0] != '0';
                 }();
-                if (direct && direct_reads && desc.IsDirectEligible() && size < (u64{1} << 32) &&
-                    !direct->IsVolatile(vsharp.base_address, size) &&
-                    direct->EnsureImported(vsharp.base_address, size) &&
-                    !buffer_cache.IsRegionGpuModified(vsharp.base_address, size)) {
+                const bool read_in_place = [&] {
+                    if (!direct || !direct_reads || !desc.IsDirectEligible() ||
+                        size >= (u64{1} << 32)) {
+                        return false;
+                    }
+                    Common::PhaseTimer direct_timer{Common::Phase::BufDirect}; // DIAG-119
+                    return !direct->IsVolatile(vsharp.base_address, size) &&
+                           direct->EnsureImported(vsharp.base_address, size) &&
+                           !buffer_cache.IsRegionGpuModified(vsharp.base_address, size);
+                }();
+                if (read_in_place) {
                     direct_entries[buffer_index - 1] = {u32(vsharp.base_address),
                                                         u32(u64(vsharp.base_address) >> 32),
                                                         u32(size), 1u};
@@ -3684,7 +3708,10 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     // To emulate storing to explicit mip levels, build a descriptor array with each mip level.
     boost::container::small_vector<u32, 8> image_descriptor_array_sizes;
 
-    u32 num_images{};
+    // PERF-121: stages fill image_bindings one after the other, so bound_textures can point at
+    // their descriptions instead of copying them.
+    u32 num_images = ctx->image_binding_base;
+    const u32 first_binding = num_images;
     static const bool decode_once = Common::PerfFeatureEnabled(54);
     if (decode_once && ctx->decoded_tsharps.empty()) {
         ctx->decoded_tsharps.resize(4096);
@@ -3696,6 +3723,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             entry.valid = false;
         }
     }
+    std::optional<Common::PhaseTimer> pass1_timer{std::in_place, Common::Phase::TexPass1};
     for (const auto& image_desc : stage.images) {
         const auto tsharp = image_desc.GetSharp(stage);
         const auto data_fmt = tsharp.GetDataFmt();
@@ -3886,8 +3914,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         image_descriptor_array_sizes.push_back(num_bindings);
     }
 
+    pass1_timer.reset();
     // Second pass to re-bind images that were updated after binding
-    for (u32 i = 0; i < num_images; ++i) {
+    for (u32 i = first_binding; i < num_images; ++i) {
         auto& [image_id, desc] = ctx->image_bindings[i];
         bool is_storage = desc.type == VideoCore::TextureCache::BindingType::Storage;
         if (!image_id) {
@@ -3954,12 +3983,13 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
             ctx->image_infos.emplace_back(VK_NULL_HANDLE, *image_view.image_view,
                                      image.backing->state.layout);
-            ctx->bound_textures.emplace_back(ctx->image_infos.size() - 1, image_id, desc, image.GetImage());
+            ctx->bound_textures.emplace_back(ctx->image_infos.size() - 1, image_id, &desc, image.GetImage());
         }
     }
 
     u32 image_info_idx = first_image_idx;
-    u32 image_binding_idx = 0;
+    u32 image_binding_idx = first_binding;
+    ctx->image_binding_base = num_images;
     for (u32 array_size : image_descriptor_array_sizes) {
         const auto& [_, desc] = ctx->image_bindings[image_binding_idx];
         const bool is_storage = desc.type == VideoCore::TextureCache::BindingType::Storage;
@@ -3977,6 +4007,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         binding.unified += array_size;
     }
 
+    Common::PhaseTimer samplers_timer{Common::Phase::TexSamplers};
     for (const auto& sampler : stage.samplers) {
         auto ssharp = sampler.GetSharp(stage);
         if (!ssharp.Valid() || (ssharp.border_color_type.Value() == AmdGpu::BorderColor::Custom &&
@@ -4045,7 +4076,7 @@ void Rasterizer::RebindTextures(bool is_compute, u32 num_color_targets) {
     for (auto& bound : ctx->bound_textures) {
         const auto old_binding = texture_cache.GetImage(bound.image_id).binding;
         if (old_binding.needs_rebind) {
-            bound.image_id = texture_cache.FindImage(bound.desc);
+            bound.image_id = texture_cache.FindImage(*bound.desc);
             auto* image = &texture_cache.GetImage(bound.image_id);
             if (const auto depth_id = texture_cache.GetAssociatedDepth(*image)) {
                 bound.image_id = depth_id;
@@ -4057,7 +4088,7 @@ void Rasterizer::RebindTextures(bool is_compute, u32 num_color_targets) {
         }
         auto& image = texture_cache.GetImage(bound.image_id);
         image.binding.is_bound = 1u;
-        const auto& view = texture_cache.FindTexture(bound.image_id, bound.desc);
+        const auto& view = texture_cache.FindTexture(bound.image_id, *bound.desc);
         ctx->image_infos[bound.descriptor_index].imageView = *view.image_view;
         bound.backing_image = image.GetImage();
     }
@@ -4071,7 +4102,7 @@ void Rasterizer::RebindTextures(bool is_compute, u32 num_color_targets) {
         if (False(image.flags & VideoCore::ImageFlagBits::GpuDirty)) {
             continue;
         }
-        const auto& view = texture_cache.FindTexture(bound.image_id, bound.desc);
+        const auto& view = texture_cache.FindTexture(bound.image_id, *bound.desc);
         ctx->image_infos[bound.descriptor_index].imageView = *view.image_view;
         bound.backing_image = image.GetImage();
     }
@@ -4102,7 +4133,7 @@ void Rasterizer::FinalizeTextureLayouts(RenderState* render_state) {
         for (const auto& other : ctx->bound_textures) {
             if (other.image_id == bound.image_id && other.backing_image == bound.backing_image) {
                 requirements.is_storage |=
-                    other.desc.type == VideoCore::TextureCache::BindingType::Storage;
+                    other.desc->type == VideoCore::TextureCache::BindingType::Storage;
             }
         }
         // The image may have separate single- and multi-sample backings. Attachment layout

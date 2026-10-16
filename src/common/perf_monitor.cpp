@@ -154,7 +154,8 @@ static std::string TakePhaseTimes() {
         "textures", "rebind",     "begin-rendering", "descriptors", "dynamic",
         "record",   "draw-total", "dispatch-total",  "submit",      "[tex-find]",
         "[tex-view]", "[tex-transit]", "[buf-obtain]", "[read-ahead-eval]",
-        "[program-match]", "[select-ahead]"};
+        "[program-match]", "[select-ahead]", "[tex-pass1]", "[tex-samplers]",
+        "[buf-direct]", "[vtx-bind]", "[idx-bind]"};
     static u64 last_tsc = PhaseTimer::ReadTsc();
     static auto last_time = std::chrono::steady_clock::now();
     const u64 tsc = PhaseTimer::ReadTsc();
