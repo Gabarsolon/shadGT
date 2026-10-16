@@ -29,6 +29,10 @@ void ProtoImportTest(const Vulkan::Instance& instance, Vulkan::Scheduler& schedu
 /// which kinds of memory import.
 void ProtoImportSurvey(const Vulkan::Instance& instance, VAddr lo, VAddr hi);
 
+/// N2 (SHADGT_PROTO_IMPORT=3): a writable alias of a guest view, imported, read by the GPU while
+/// the game's view is protected.
+void ProtoAliasTest(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler, VAddr address);
+
 /// P2 (SHADGT_PROTO_INPLACE=1, prototype): guest views imported into Vulkan. The GPU reads and
 /// writes them in place: the renderer never write-protects them (the GPU faults on protected
 /// imported pages) and does not track their changes.

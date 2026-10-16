@@ -234,6 +234,9 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       // came with exploded vertices. The drain's wait for all earlier GPU work is what the game
       // relies on there.
       split_gds_write_faults{false} {
+    if (DirectMemory::Enabled() && instance.IsExternalMemoryHostSupported()) { // D1
+        direct_memory = std::make_unique<DirectMemory>(instance, scheduler);
+    }
     for (u32 i = 1; i < StageWorkerCount(); ++i) { // R5
         worker_streams[i] = std::make_unique<StreamBuffer>(instance, scheduler, MemoryType::Stream,
                                                            STREAM_BUFFER_SIZE / 2);
@@ -1928,6 +1931,22 @@ const Buffer* BufferCache::TryImportView(VAddr device_addr, u32 size) {
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBufferImpl(VAddr device_addr, u32 size,
                                                             bool is_written, bool is_texel_buffer) {
+    // D1: guest memory obtained here is imported for the GPU (coverage logged every 2 s).
+    if (direct_memory && !is_texel_buffer) {
+        static u64 covered = 0, missed = 0;
+        static auto window = std::chrono::steady_clock::now();
+        if (direct_memory->EnsureImported(device_addr, size)) {
+            ++covered;
+        } else {
+            ++missed;
+        }
+        if (const auto now = std::chrono::steady_clock::now(); now - window >= std::chrono::seconds{2}) {
+            window = now;
+            const auto stats = direct_memory->GetStats();
+            LOG_WARNING(Render_Vulkan, "D1: obtains in 2 s: {} in imported memory, {} not; {} views ({} MiB), {} refused",
+                        std::exchange(covered, 0), std::exchange(missed, 0), stats.views, stats.bytes >> 20, stats.failed);
+        }
+    }
     // EXP-125 (SHADGT_CEIL_REGION=<lo hex>-<hi hex>, measurement only, rendering goes wrong):
     // obtains inside the region skip every synchronization and use the arena as it is: the frame
     // rate if that memory were read in place.
@@ -2123,7 +2142,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferImpl(VAddr device_addr, u
     // P1 (SHADGT_PROTO_IMPORT=1): once, 200 s in, on a read range of 64 KB or more.
     static const bool proto_import = [] {
         const char* env = std::getenv("SHADGT_PROTO_IMPORT");
-        return env && (env[0] == '1' || env[0] == '2');
+        return env && (env[0] == '1' || env[0] == '2' || env[0] == '3');
     }();
     if (proto_import && !is_written && size >= 64_KB) {
         static const auto start = std::chrono::steady_clock::now();
@@ -2131,7 +2150,10 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferImpl(VAddr device_addr, u
         if (!done && std::chrono::steady_clock::now() - start > std::chrono::seconds{200}) {
             done = true;
             const char* mode = std::getenv("SHADGT_PROTO_IMPORT");
-            if (mode && mode[0] == '2') {
+            if (mode && mode[0] == '3') {
+                scheduler.Finish();
+                ProtoAliasTest(instance, scheduler, device_addr);
+            } else if (mode && mode[0] == '2') {
                 scheduler.Finish();
                 ProtoImportSurvey(instance, 0x200000000ULL, 0x10000000000ULL);
             } else {

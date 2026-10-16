@@ -396,6 +396,145 @@ void ProtoImportSurvey(const Vulkan::Instance& instance, VAddr lo, VAddr hi) {
 #endif
 }
 
+/// N2 (SHADGT_PROTO_IMPORT=3): a writable alias of the guest view holding the address is imported;
+/// the GPU copies it while the game's own view is write-protected and again while it is made
+/// inaccessible, and the copies are compared with the CPU's bytes.
+void ProtoAliasTest(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler, VAddr address) {
+#ifdef _WIN32
+    using MapAliasFn = void* (*)(std::uintptr_t, std::size_t);
+    HMODULE libc = GetModuleHandleA("libc.prx");
+    const auto map_alias =
+        libc ? reinterpret_cast<MapAliasFn>(GetProcAddress(libc, "TXQU8CpoEtI")) : nullptr;
+    if (!map_alias) {
+        LOG_WARNING(Render_Vulkan, "N2: GuestArenaMapAlias not found");
+        return;
+    }
+    const VAddr base = GuestViewBase(address);
+    const VAddr end = GuestViewEnd(base, 64_MB);
+    if (base == 0 || end <= base) {
+        LOG_WARNING(Render_Vulkan, "N2: no view at {:#x}", address);
+        return;
+    }
+    const u64 length = end - base;
+    void* alias = map_alias(base, length);
+    LOG_WARNING(Render_Vulkan, "N2: view {:#x}+{:#x}, alias {}", base, length, alias);
+    if (!alias) {
+        return;
+    }
+    const auto& d = VULKAN_HPP_DEFAULT_DISPATCHER;
+    const VkDevice device = instance.GetDevice();
+    VkMemoryHostPointerPropertiesEXT ptr_props{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+    d.vkGetMemoryHostPointerPropertiesEXT(device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+                                          alias, &ptr_props);
+    const u32 type_index = static_cast<u32>(std::countr_zero(ptr_props.memoryTypeBits));
+    VkImportMemoryHostPointerInfoEXT import{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
+                                            nullptr,
+                                            VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+                                            alias};
+    VkMemoryAllocateInfo info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &import, length, type_index};
+    VkDeviceMemory memory{};
+    const VkResult alloc = d.vkAllocateMemory(device, &info, nullptr, &memory);
+    LOG_WARNING(Render_Vulkan, "N2: alias import: {}", int(alloc));
+    if (alloc != VK_SUCCESS) {
+        return;
+    }
+    // Readback target: private memory imported the same way.
+    void* readback = VirtualAlloc(nullptr, length, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    VkImportMemoryHostPointerInfoEXT rb_import{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
+                                               nullptr,
+                                               VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+                                               readback};
+    VkMemoryAllocateInfo rb_info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &rb_import, length, type_index};
+    VkDeviceMemory rb_memory{};
+    d.vkAllocateMemory(device, &rb_info, nullptr, &rb_memory);
+    const auto make_buffer = [&](VkDeviceMemory mem) {
+        VkExternalMemoryBufferCreateInfo ext{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
+                                             nullptr,
+                                             VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT};
+        VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &ext};
+        bi.size = length;
+        bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        VkBuffer buffer{};
+        d.vkCreateBuffer(device, &bi, nullptr, &buffer);
+        d.vkBindBufferMemory(device, buffer, mem, 0);
+        return buffer;
+    };
+    const VkBuffer src = make_buffer(memory);
+    const VkBuffer dst = make_buffer(rb_memory);
+    const auto copy_and_compare = [&](const char* what) {
+        scheduler.EndRendering();
+        scheduler.CommandBuffer().copyBuffer(vk::Buffer{src}, vk::Buffer{dst},
+                                             vk::BufferCopy{0, 0, length});
+        scheduler.Finish();
+        u64 differing = 0;
+        for (u64 off = 0; off < length; off += 4096) {
+            differing += std::memcmp(static_cast<const u8*>(alias) + off,
+                                     static_cast<const u8*>(readback) + off, 4096) != 0;
+        }
+        LOG_WARNING(Render_Vulkan, "N2: {}: GPU copy differs from the alias on {} of {} pages",
+                    what, differing, length / 4096);
+    };
+    // The game's view's protections, to put back.
+    std::vector<std::pair<VAddr, std::pair<u64, DWORD>>> saved;
+    for (VAddr at = base; at < end;) {
+        MEMORY_BASIC_INFORMATION run{};
+        VirtualQuery(reinterpret_cast<void*>(at), &run, sizeof(run));
+        const u64 bytes = std::min<u64>(
+            run.RegionSize - (at - reinterpret_cast<VAddr>(run.BaseAddress)), end - at);
+        saved.push_back({at, {bytes, run.Protect}});
+        at += bytes;
+    }
+    copy_and_compare("as the game left its view");
+    DWORD old;
+    VirtualProtect(reinterpret_cast<void*>(base), length, PAGE_READONLY, &old);
+    copy_and_compare("game's view read-only");
+    VirtualProtect(reinterpret_cast<void*>(base), length, PAGE_NOACCESS, &old);
+    copy_and_compare("game's view inaccessible");
+    for (const auto& [at, run] : saved) {
+        VirtualProtect(reinterpret_cast<void*>(at), run.first, run.second, &old);
+    }
+    d.vkDestroyBuffer(device, src, nullptr);
+    d.vkDestroyBuffer(device, dst, nullptr);
+    d.vkFreeMemory(device, memory, nullptr);
+    d.vkFreeMemory(device, rb_memory, nullptr);
+    // N3: one import across two adjacent views (both writable for the attempt).
+    {
+        const VAddr next_end = GuestViewEnd(end, 64_MB);
+        if (next_end > end) {
+            std::vector<std::pair<VAddr, std::pair<u64, DWORD>>> runs;
+            for (VAddr at = base; at < next_end;) {
+                MEMORY_BASIC_INFORMATION run{};
+                VirtualQuery(reinterpret_cast<void*>(at), &run, sizeof(run));
+                const u64 bytes = std::min<u64>(
+                    run.RegionSize - (at - reinterpret_cast<VAddr>(run.BaseAddress)), next_end - at);
+                runs.push_back({at, {bytes, run.Protect}});
+                at += bytes;
+            }
+            DWORD old2;
+            VirtualProtect(reinterpret_cast<void*>(base), next_end - base, PAGE_READWRITE, &old2);
+            VkImportMemoryHostPointerInfoEXT span_import{
+                VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT, nullptr,
+                VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, reinterpret_cast<void*>(base)};
+            VkMemoryAllocateInfo span_info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &span_import,
+                                           next_end - base, type_index};
+            VkDeviceMemory span{};
+            const VkResult r = d.vkAllocateMemory(device, &span_info, nullptr, &span);
+            if (r == VK_SUCCESS) {
+                d.vkFreeMemory(device, span, nullptr);
+            }
+            for (const auto& [at, run] : runs) {
+                VirtualProtect(reinterpret_cast<void*>(at), run.first, run.second, &old2);
+            }
+            LOG_WARNING(Render_Vulkan, "N3: import across views {:#x}-{:#x}-{:#x}: {}", base, end,
+                        next_end, int(r));
+        } else {
+            LOG_WARNING(Render_Vulkan, "N3: no view right after {:#x}", end);
+        }
+    }
+    LOG_WARNING(Render_Vulkan, "N2: done");
+#endif
+}
+
 VAddr GuestViewBase(VAddr address) {
 #ifdef _WIN32
     MEMORY_BASIC_INFORMATION mbi{};

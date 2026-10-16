@@ -4441,6 +4441,9 @@ bool Rasterizer::IsMappedStart(VAddr address) {
 
 void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
     tsharp_epoch.fetch_add(1, std::memory_order_release); // FIX-046
+    if (auto* direct = buffer_cache.GetDirectMemory()) {
+        direct->OnUnmap(addr, size); // D1
+    }
     buffer_cache.InvalidateMemory(addr, size);
     // FIX-026: the texture cache has no cache-wide lock since upstream #5219; freeing images here
     // on a game thread raced with the GPU thread freeing the same image ("Trying to unregister an

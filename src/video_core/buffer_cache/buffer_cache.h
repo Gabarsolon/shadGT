@@ -26,6 +26,7 @@
 #include "video_core/texture_cache/types.h"
 #include "common/read_capture.h"
 #include "common/recursive_shared_mutex.h"
+#include "video_core/buffer_cache/direct_memory.h"
 #include "video_core/buffer_cache/page_hash_table.h"
 #include "video_core/buffer_cache/range_set.h"
 #include "video_core/buffer_cache/uploaded_pages.h"
@@ -508,6 +509,11 @@ public:
     /// uses the ones above.
     static constexpr u32 MaxStageWorkers = 4;
     static u32 StageWorkerCount();
+    /// D1: the direct memory model (null unless SHADGT_DIRECT=1).
+    DirectMemory* GetDirectMemory() noexcept {
+        return direct_memory.get();
+    }
+
     /// R5 (stage worker thread): which worker this thread is.
     static void SetStageWorker(u32 index) noexcept {
         t_stage_worker = index;
@@ -539,6 +545,7 @@ private:
         std::atomic<VAddr> end{};
     };
     std::array<WorkerSync, MaxStageWorkers> worker_syncs;
+    std::unique_ptr<DirectMemory> direct_memory; // D1
     static thread_local AheadUploads* ahead_uploads; // set while ObtainBufferAhead runs
 public:
     /// PERF-067: why the stage left buffers to the recorder (texel read, image, stream ring,
