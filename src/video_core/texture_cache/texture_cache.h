@@ -4,6 +4,7 @@
 #pragma once
 
 #include <span>
+#include <source_location>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
@@ -380,7 +381,9 @@ private:
     }
 
     /// Removes image from the cache and schedules it for deletion.
-    void FreeImage(ImageId image_id) {
+    void FreeImage(ImageId image_id,
+                   std::source_location where = std::source_location::current()) {
+        NoteImageFree(image_id, where.line()); // DIAG-117
         {
             std::scoped_lock lk{slot_images[image_id].mutex};
             UntrackImage(image_id);
@@ -390,6 +393,8 @@ private:
     }
 
     void GarbageCollectImages();
+    /// DIAG-117: why images are freed (call line), with a sample image, every 2 s.
+    void NoteImageFree(ImageId image_id, u32 line);
     void GarbageCollectSamplers();
 
 private:

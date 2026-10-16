@@ -7,6 +7,8 @@
 #include <cstdlib>
 #include <deque>
 #include <mutex>
+#include <optional>
+#include <unordered_map>
 #include <vector>
 #include <memory>
 #include <string>
@@ -187,15 +189,126 @@ static vk::FormatFeatureFlags2 FormatFeatureFlags(const vk::ImageUsageFlags usag
     return feature_flags;
 }
 
-UniqueImage::~UniqueImage() {
-    if (image) {
-        vmaDestroyImage(allocator, image, allocation);
+namespace {
+// PERF-104: GT Sport places a different render target in its scratch memory pass after pass, so
+// the cache frees and makes about 1,100 images a second (allocations, driver calls and image
+// destruction on the recorder). Freed images (the GPU is done with them by then) wait here and
+// are handed out again for an identical create info. SHADGT_IMAGE_RECYCLE=0 turns it off.
+struct RecycleKey {
+    u32 flags, type, format, width, height, depth, mips, layers, samples, usage;
+    bool operator==(const RecycleKey&) const = default;
+};
+struct RecycleKeyHash {
+    size_t operator()(const RecycleKey& k) const noexcept {
+        u64 h = 0xcbf29ce484222325ULL;
+        for (const u32 v : {k.flags, k.type, k.format, k.width, k.height, k.depth, k.mips,
+                            k.layers, k.samples, k.usage}) {
+            h = (h ^ v) * 0x100000001b3ULL;
+        }
+        return size_t(h);
     }
+};
+struct RecycledImage {
+    VmaAllocation allocation;
+    vk::Image image;
+    vk::DeviceSize size_bytes;
+    u64 seq;
+};
+std::deque<std::pair<RecycleKey, u64>> g_recycle_order; // oldest first, for eviction
+u64 g_recycle_seq = 0;
+std::mutex g_recycle_mutex;
+std::unordered_map<RecycleKey, std::vector<RecycledImage>, RecycleKeyHash> g_recycled;
+u64 g_recycled_bytes = 0;
+constexpr u64 RecycleBudget = 512ULL << 20;
+constexpr size_t RecyclePerKey = 8;
+std::atomic<u64> g_recycle_hits{}, g_recycle_misses{}, g_recycle_dropped{};
+
+bool RecycleEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("SHADGT_IMAGE_RECYCLE");
+        return !env || env[0] != '0';
+    }();
+    return enabled;
+}
+
+RecycleKey KeyOf(const vk::ImageCreateInfo& ci) {
+    return {u32(VkImageCreateFlags(ci.flags)), u32(ci.imageType), u32(ci.format),
+            ci.extent.width, ci.extent.height, ci.extent.depth, ci.mipLevels, ci.arrayLayers,
+            u32(ci.samples), u32(VkImageUsageFlags(ci.usage))};
+}
+
+/// Keeps the image for reuse; false when it should be destroyed instead.
+bool Recycle(VmaAllocator allocator, const vk::ImageCreateInfo& ci, VmaAllocation allocation,
+             vk::Image image, vk::DeviceSize size_bytes) {
+    if (!RecycleEnabled() || ci.pNext != nullptr || size_bytes > (64ULL << 20)) {
+        return false;
+    }
+    std::scoped_lock lk{g_recycle_mutex};
+    const RecycleKey key = KeyOf(ci);
+    auto& list = g_recycled[key];
+    if (list.size() >= RecyclePerKey) {
+        ++g_recycle_dropped;
+        return false;
+    }
+    // Over budget: the images waiting longest go (most were made once, e.g. while loading).
+    while (g_recycled_bytes + size_bytes > RecycleBudget && !g_recycle_order.empty()) {
+        const auto [old_key, old_seq] = g_recycle_order.front();
+        g_recycle_order.pop_front();
+        auto& old_list = g_recycled[old_key];
+        const auto it = std::ranges::find(old_list, old_seq, &RecycledImage::seq);
+        if (it != old_list.end()) {
+            vmaDestroyImage(allocator, it->image, it->allocation);
+            g_recycled_bytes -= it->size_bytes;
+            old_list.erase(it);
+            ++g_recycle_dropped;
+        }
+    }
+    if (g_recycle_order.size() > 65536) {
+        // Entries of images taken again stay until reached; drop them now and then.
+        std::erase_if(g_recycle_order, [](const auto& entry) {
+            const auto& entries = g_recycled[entry.first];
+            return std::ranges::find(entries, entry.second, &RecycledImage::seq) == entries.end();
+        });
+    }
+    const u64 seq = ++g_recycle_seq;
+    g_recycled[key].push_back({allocation, image, size_bytes, seq});
+    g_recycle_order.emplace_back(key, seq);
+    g_recycled_bytes += size_bytes;
+    return true;
+}
+
+std::optional<RecycledImage> TakeRecycled(const vk::ImageCreateInfo& ci) {
+    if (!RecycleEnabled() || ci.pNext != nullptr) {
+        return std::nullopt;
+    }
+    std::scoped_lock lk{g_recycle_mutex};
+    const auto it = g_recycled.find(KeyOf(ci));
+    if (it == g_recycled.end() || it->second.empty()) {
+        ++g_recycle_misses;
+        return std::nullopt;
+    }
+    const RecycledImage taken = it->second.back();
+    it->second.pop_back();
+    g_recycled_bytes -= taken.size_bytes;
+    if (const u64 n = ++g_recycle_hits; n == 1 || n % 20000 == 0) {
+        LOG_WARNING(Render_Vulkan,
+                    "PERF-104: {} images reused, {} made new, {} not kept; {} MiB waiting",
+                    n, g_recycle_misses.load(), g_recycle_dropped.load(),
+                    g_recycled_bytes >> 20);
+    }
+    return taken;
+}
+} // namespace
+
+UniqueImage::~UniqueImage() {
+    Destroy();
 }
 
 void UniqueImage::Destroy() {
     if (image) {
-        vmaDestroyImage(allocator, image, allocation);
+        if (!Recycle(allocator, image_ci, allocation, image, size_bytes)) {
+            vmaDestroyImage(allocator, image, allocation);
+        }
         image = vk::Image{};
         allocation = {};
     }
@@ -204,6 +317,12 @@ void UniqueImage::Destroy() {
 void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
     this->image_ci = image_ci;
     ASSERT(!image);
+    if (const auto recycled = TakeRecycled(image_ci)) {
+        allocation = recycled->allocation;
+        image = recycled->image;
+        size_bytes = recycled->size_bytes;
+        return;
+    }
     const VmaAllocationCreateInfo alloc_ci = {
         .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT,
         .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
@@ -268,16 +387,36 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
         .usage = usage_flags,
         .flags = flags,
     };
-    const auto image_format_properties =
-        instance.GetPhysicalDevice().getImageFormatProperties2(format_info);
-    if (image_format_properties.result == vk::Result::eErrorFormatNotSupported) {
-        LOG_ERROR(Render_Vulkan, "image format {} type {} is not supported (flags {}, usage {})",
-                  vk::to_string(supported_format), vk::to_string(format_info.type),
-                  vk::to_string(format_info.flags), vk::to_string(format_info.usage));
+    // PERF-104: the answer only depends on these four, and images are made often.
+    static std::mutex samples_mutex;
+    static std::unordered_map<u64, vk::SampleCountFlags> samples_cache;
+    const u64 samples_key = (u64(supported_format) << 40) ^ (u64(format_info.type) << 36) ^
+                            (u64(VkImageUsageFlags(usage_flags)) << 16) ^
+                            u64(VkImageCreateFlags(flags));
+    std::optional<vk::SampleCountFlags> cached_samples;
+    {
+        std::scoped_lock lk{samples_mutex};
+        if (const auto it = samples_cache.find(samples_key); it != samples_cache.end()) {
+            cached_samples = it->second;
+        }
     }
-    supported_samples = image_format_properties.result == vk::Result::eSuccess
-                            ? image_format_properties.value.imageFormatProperties.sampleCounts
-                            : vk::SampleCountFlagBits::e1;
+    if (cached_samples) {
+        supported_samples = *cached_samples;
+    } else {
+        const auto image_format_properties =
+            instance.GetPhysicalDevice().getImageFormatProperties2(format_info);
+        if (image_format_properties.result == vk::Result::eErrorFormatNotSupported) {
+            LOG_ERROR(Render_Vulkan,
+                      "image format {} type {} is not supported (flags {}, usage {})",
+                      vk::to_string(supported_format), vk::to_string(format_info.type),
+                      vk::to_string(format_info.flags), vk::to_string(format_info.usage));
+        }
+        supported_samples = image_format_properties.result == vk::Result::eSuccess
+                                ? image_format_properties.value.imageFormatProperties.sampleCounts
+                                : vk::SampleCountFlagBits::e1;
+        std::scoped_lock lk{samples_mutex};
+        samples_cache.emplace(samples_key, supported_samples);
+    }
 
     const vk::ImageCreateInfo image_ci = {
         .flags = flags,

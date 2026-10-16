@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <map>
 #include <algorithm>
 #include <cstring>
 #include <boost/container/small_vector.hpp>
@@ -1596,6 +1597,31 @@ void TextureCache::RunGarbageCollector() {
     GarbageCollectImages();
     GarbageCollectSamplers();
     ++gc_tick;
+}
+
+void TextureCache::NoteImageFree(ImageId image_id, u32 line) {
+    static std::mutex diag_mutex;
+    static std::map<u32, std::pair<u64, std::string>> by_line;
+    static auto since = std::chrono::steady_clock::now();
+    std::scoped_lock lk{diag_mutex};
+    auto& [count, sample] = by_line[line];
+    if (++count == 1) {
+        const auto& info = slot_images[image_id].info;
+        sample = fmt::format("{}x{}x{} fmt {} tile {} at {:#x} mips {} layers {}", info.size.width,
+                             info.size.height, info.size.depth, vk::to_string(info.pixel_format),
+                             u32(info.tile_mode), info.guest_address, info.resources.levels,
+                             info.resources.layers);
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - since >= std::chrono::seconds{2}) {
+        std::string text;
+        for (const auto& [l, entry] : by_line) {
+            text += fmt::format(" | line {}: {} (e.g. {})", l, entry.first, entry.second);
+        }
+        LOG_WARNING(Render_Vulkan, "DIAG-117: images freed in 2 s{}", text);
+        by_line.clear();
+        since = now;
+    }
 }
 
 void TextureCache::DeleteImage(ImageId image_id) {
