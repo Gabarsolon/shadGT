@@ -2379,7 +2379,10 @@ bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& 
     // -DisablePerf 68 signals other addresses at once as before.
     static const bool keep_order = Common::PerfFeatureEnabled(68);
     const bool earlier_deferred = keep_order && deferred_fences.load() != 0;
-    if (!readbacks_pending && !address_pending && !earlier_deferred) {
+    // D3: with direct memory the GPU reads guest memory in place, so the game may only reuse
+    // it once the GPU has finished: graphics fences wait for the GPU.
+    const bool direct_hold = !compute_queue && buffer_cache.GetDirectMemory() != nullptr;
+    if (!readbacks_pending && !address_pending && !earlier_deferred && !direct_hold) {
         return false;
     }
     // DIAG-068: why fences wait for the GPU.
@@ -3191,6 +3194,13 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     dump_at, dir.string());
     }
     u32 buffer_index = 0;
+    // D3: guest addresses of the buffers this stage reads through the direct-memory page table
+    // (base low, base high, size, valid per buffer), written into its table at the end.
+    auto* direct = stage.uses_direct ? buffer_cache.GetDirectMemory() : nullptr;
+    static thread_local std::vector<std::array<u32, 4>> direct_entries;
+    if (direct) {
+        direct_entries.assign(stage.buffers.size(), {});
+    }
     for (const auto& desc : stage.buffers) {
         ++buffer_index;
         if (desc.IsSpecial()) {
@@ -3229,6 +3239,24 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             } else if (desc.buffer_type == Shader::BufferType::BdaPagetable) {
                 const auto* bda_buffer = buffer_cache.GetBdaPageTableBuffer();
                 ctx->buffer_infos.emplace_back(bda_buffer->Handle(), 0, bda_buffer->SizeBytes());
+            } else if (desc.buffer_type == Shader::BufferType::DirectTable) {
+                // D3: page table L1, zero page, then the entries.
+                std::vector<u32> table(4 + stage.buffers.size() * 4, 0u);
+                if (direct) {
+                    const u64 l1 = direct->L1Address();
+                    const u64 zero = direct->ZeroPageAddress();
+                    table[0] = u32(l1);
+                    table[1] = u32(l1 >> 32);
+                    table[2] = u32(zero);
+                    table[3] = u32(zero >> 32);
+                    for (size_t i = 0; i < stage.buffers.size(); ++i) {
+                        std::memcpy(&table[4 + i * 4], direct_entries[i].data(), 16);
+                    }
+                }
+                auto& vk_buffer = buffer_cache.GetStreamBuffer();
+                const u32 table_size = static_cast<u32>(table.size() * sizeof(u32));
+                const u64 offset = vk_buffer.Copy(table.data(), table_size, alignment);
+                ctx->buffer_infos.emplace_back(vk_buffer.Handle(), offset, table_size);
             } else if (desc.buffer_type == Shader::BufferType::FaultBuffer) {
                 const auto* fault_buffer = buffer_cache.GetFaultBuffer();
                 ctx->buffer_infos.emplace_back(fault_buffer->Handle(), 0, fault_buffer->SizeBytes());
@@ -3316,6 +3344,21 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 ctx->buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
             } else {
                 const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
+                // D3: a read-only buffer the GPU reads in place: no obtain, a null binding.
+                // Ranges with GPU-written bytes only the arena holds take the usual path.
+                static const bool direct_reads = [] { // D3 bisect: SHADGT_DIRECT_READS=0
+                    const char* env = std::getenv("SHADGT_DIRECT_READS");
+                    return !env || env[0] != '0';
+                }();
+                if (direct && direct_reads && desc.IsDirectEligible() && size < (u64{1} << 32) &&
+                    !direct->IsVolatile(vsharp.base_address, size) &&
+                    direct->EnsureImported(vsharp.base_address, size) &&
+                    !buffer_cache.IsRegionGpuModified(vsharp.base_address, size)) {
+                    direct_entries[buffer_index - 1] = {u32(vsharp.base_address),
+                                                        u32(u64(vsharp.base_address) >> 32),
+                                                        u32(size), 1u};
+                    ctx->buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
+                } else {
                 // Max-record descriptors intentionally expose an open-ended guest range.
                 // Clamp it to mapped memory before creating a finite Vulkan binding.
                 if (size != vsharp.GetSize() && vsharp.num_records != UINT32_MAX) {
@@ -3452,6 +3495,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size);
                 }
                 ctx->needs_barrier |= runtime.IsBufferAccessed(buffer, offset, size, desc.is_written);
+                } // D3
             }
         }
 

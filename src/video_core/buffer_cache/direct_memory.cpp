@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cstdlib>
 #include <cstring>
@@ -56,6 +57,7 @@ struct PendingRelease {
 };
 std::mutex g_pending_mutex;
 std::vector<PendingRelease> g_pending;
+std::atomic<bool> g_has_pending{false}; // checked on every bind without the lock
 
 } // namespace
 
@@ -65,8 +67,12 @@ DirectMemory::DirectMemory(const Vulkan::Instance& instance_, Vulkan::Scheduler&
                                   "D1 page table L1");
     l2_pool = std::make_unique<Buffer>(instance, 0, MaxL2Tables * L2Entries * sizeof(u64),
                                        MemoryType::Stream, "D1 page table L2");
+    zero_page = std::make_unique<Buffer>(instance, 0, 2 * PageSize, MemoryType::Stream,
+                                         "D1 zero page");
+    std::memset(zero_page->mapped_data.data(), 0, zero_page->mapped_data.size());
     std::memset(l1->mapped_data.data(), 0, l1->mapped_data.size());
     l2_index.assign(L1Entries, 0);
+    volatile_bits = std::make_unique<std::atomic<u64>[]>(VolatileWords);
     LOG_WARNING(Render_Vulkan, "D1: direct memory on (page table L1 at {:#x})",
                 l1->BufferDeviceAddress());
 }
@@ -79,6 +85,38 @@ bool DirectMemory::Enabled() {
         return env && env[0] == '1';
     }();
     return enabled;
+}
+
+void DirectMemory::MarkVolatile(VAddr address, u64 size) {
+    const u64 first = address >> PageBits;
+    const u64 last = (address + std::max<u64>(size, 1) - 1) >> PageBits;
+    for (u64 page = first; page <= last && (page >> 6) < VolatileWords; ++page) {
+        const u64 bit = u64{1} << (page & 63);
+        if (!(volatile_bits[page >> 6].fetch_or(bit, std::memory_order_relaxed) & bit)) {
+            if (const u64 n = ++volatile_pages; n <= 20 || n % 100 == 0) {
+                LOG_WARNING(Render_Vulkan, "D4: page {:#x} is volatile ({} pages)",
+                            page << PageBits, n);
+            }
+        }
+    }
+}
+
+bool DirectMemory::IsVolatile(VAddr address, u64 size) const {
+    const u64 first = address >> PageBits;
+    const u64 last = (address + std::max<u64>(size, 1) - 1) >> PageBits;
+    for (u64 page = first; page <= last; ++page) {
+        if ((page >> 6) >= VolatileWords) {
+            return true;
+        }
+        if (volatile_bits[page >> 6].load(std::memory_order_relaxed) & (u64{1} << (page & 63))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+vk::DeviceAddress DirectMemory::ZeroPageAddress() const {
+    return zero_page->BufferDeviceAddress();
 }
 
 vk::DeviceAddress DirectMemory::L1Address() const {
@@ -223,7 +261,7 @@ bool DirectMemory::ImportView(VAddr address) {
 }
 
 bool DirectMemory::EnsureImported(VAddr address, u64 size) {
-    {
+    if (g_has_pending.load(std::memory_order_relaxed)) {
         // Aliases of unmapped views the GPU no longer uses.
         std::scoped_lock lk{g_pending_mutex};
         const auto& d = VULKAN_HPP_DEFAULT_DISPATCHER;
@@ -236,6 +274,7 @@ bool DirectMemory::EnsureImported(VAddr address, u64 size) {
             UnmapAlias()(p.alias);
             return true;
         });
+        g_has_pending.store(!g_pending.empty(), std::memory_order_relaxed);
     }
     std::scoped_lock lk{mutex};
     const VAddr end = address + size;
@@ -274,6 +313,7 @@ void DirectMemory::OnUnmap(VAddr address, u64 size) {
         {
             std::scoped_lock pending_lk{g_pending_mutex};
             g_pending.push_back({tick, view.alias, view.memory, view.buffer});
+            g_has_pending.store(true, std::memory_order_relaxed);
         }
         it = views.erase(it);
     }

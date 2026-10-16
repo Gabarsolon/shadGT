@@ -34,6 +34,7 @@ struct Buffer;
 class DirectMemory {
 public:
     static constexpr u32 PageBits = 14;
+    static constexpr u64 VolatileWords = (u64{1} << (40 - PageBits)) / 64;
     static constexpr u64 PageSize = u64{1} << PageBits;
     static constexpr u32 L2Bits = 11; // 2048 pages = 32 MiB per L1 entry
     static constexpr u32 L1Bits = 40 - PageBits - L2Bits;
@@ -58,8 +59,16 @@ public:
     /// released once the GPU has finished the work recorded so far.
     void OnUnmap(VAddr address, u64 size);
 
+    /// D4: the command processor rewrites this range while queued draws may still read it (CE
+    /// dumps, WriteData): its buffers keep the copy path, which snapshots at bind time.
+    void MarkVolatile(VAddr address, u64 size);
+    /// Whether any page of the range was marked volatile.
+    bool IsVolatile(VAddr address, u64 size) const;
+
     /// Device address of the L1 table, for the shaders.
     vk::DeviceAddress L1Address() const;
+    /// A page of zeros: where unmapped addresses resolve.
+    vk::DeviceAddress ZeroPageAddress() const;
 
     struct Stats {
         u64 views;
@@ -90,10 +99,13 @@ private:
     std::vector<VAddr> failed;   // view bases that could not be imported (sorted)
     std::unique_ptr<Buffer> l1;
     std::unique_ptr<Buffer> l2_pool;
+    std::unique_ptr<Buffer> zero_page;
+    std::unique_ptr<std::atomic<u64>[]> volatile_bits; // D4: one bit per 16 KiB page, 2^40 bytes
     u32 l2_used{};
     std::vector<u32> l2_index; // L1 entry -> L2 table + 1 (0: none)
     std::atomic<u64> imported_bytes{};
     std::atomic<u64> failed_count{};
+    std::atomic<u64> volatile_pages{};
 };
 
 } // namespace VideoCore

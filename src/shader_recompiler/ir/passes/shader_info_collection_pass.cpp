@@ -185,6 +185,17 @@ void CollectShaderInfoPass(IR::Program& program, const Profile& profile) {
         info.readconst_types = Info::ReadConstType::None;
     }
 
+    // D2: the per-draw table of direct buffers (their guest addresses and the page table).
+    if (profile.direct_buffers &&
+        std::ranges::any_of(info.buffers, [](const auto& b) { return b.IsDirectEligible(); })) {
+        info.uses_direct = true;
+        info.buffers.push_back({
+            .used_types = IR::Type::U32,
+            .buffer_type = BufferType::DirectTable,
+            .is_written = false,
+        });
+    }
+
     if (info.uses_dma) {
         info.buffers.push_back({
             .used_types = IR::Type::U64,

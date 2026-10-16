@@ -100,6 +100,7 @@ enum class BufferType : u8 {
     GdsBuffer,
     SharedMemory,
     ClipPlanes,
+    DirectTable, // D2: per-draw guest addresses of the direct buffers + page table
 };
 
 struct BufferResource {
@@ -110,6 +111,11 @@ struct BufferResource {
     bool is_formatted{};
     SharpFetchPostOp post_op{};
     u32 post_op_dw1_mask{};
+
+    /// D2: read through the direct-memory page table when the draw's table says so.
+    bool IsDirectEligible() const noexcept {
+        return buffer_type == BufferType::Guest && !is_written && !is_formatted;
+    }
 
     bool IsSpecial() const noexcept {
         return buffer_type != BufferType::Guest;

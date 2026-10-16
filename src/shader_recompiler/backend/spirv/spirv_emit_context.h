@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <functional>
 #include <array>
 #include <unordered_map>
 #include <sirit/sirit.h>
@@ -360,6 +361,18 @@ public:
     size_t bda_pagetable_index{};
     size_t fault_buffer_index{};
     Id physical_pointer_type_u32;
+    Id physical_pointer_type_f32;
+    Id physical_pointer_type_u64;
+    Id physical_pointer_type_u8;
+    Id physical_pointer_type_u16;
+    size_t direct_table_index{}; // D2
+    Id direct_translate{};
+    bool IsDirectBuffer(u32 handle) const;
+    Id EmitDirectLoad(u32 handle, Id byte_offset, u32 bytes, Id result_type,
+                      Id physical_pointer_type, const std::function<Id()>& fallback);
+    Id DirectTableWord(u32 index);
+    Id DirectTableAddress(u32 index);
+    Id DefineDirectTranslate();
 
     Id sampler_type{};
     Id sampler_pointer_type{};

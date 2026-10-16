@@ -34,6 +34,7 @@
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/recompiler.h"
 #include "shader_recompiler/runtime_info.h"
+#include "video_core/buffer_cache/direct_memory.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/build_queue.h"
@@ -637,6 +638,9 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .needs_clip_distance_emulation = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
         .supports_shader_stencil_export = instance_.IsShaderStencilExportSupported(),
     };
+    // D2: read-only guest buffers are read in place through the direct-memory page table.
+    profile.direct_buffers =
+        VideoCore::DirectMemory::Enabled() && instance.IsExternalMemoryHostSupported();
     CreateDriverCache();
     LoadElseScopeFixed();
     // PERF-032: the shader store is used again, without the startup precompile Lance had removed:

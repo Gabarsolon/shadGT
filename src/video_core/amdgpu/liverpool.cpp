@@ -1500,6 +1500,11 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
             const auto* dump_const = reinterpret_cast<const PM4DumpConstRam*>(header);
             // PERF-031: queued draws may still read the memory this overwrites.
             SyncRecorder("ce dump");
+            if (rasterizer) {
+                if (auto* direct = rasterizer->GetBufferCache().GetDirectMemory()) {
+                    direct->MarkVolatile(dump_const->Address<VAddr>(), dump_const->Size()); // D4
+                }
+            }
             memcpy(dump_const->Address<void*>(),
                    cblock.constants_heap.data() + dump_const->Offset(), dump_const->Size());
             // DIAG-009: remember recent dump destinations for the tonemap trace.
@@ -2385,6 +2390,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
                 const u32 data_size = (header->type3.count.Value() - 2) * 4;
                 u64* address = write_data->Address<u64*>();
+                if (rasterizer) {
+                    if (auto* direct = rasterizer->GetBufferCache().GetDirectMemory()) {
+                        direct->MarkVolatile(reinterpret_cast<VAddr>(address), data_size); // D4
+                    }
+                }
                 if (!write_data->wr_one_addr.Value()) {
                     // Keep guest-visible writes in order behind deferred fences.
                     std::vector<u8> data(data_size);
@@ -3142,6 +3152,11 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             const auto* write_data = reinterpret_cast<const PM4CmdWriteData*>(header);
             ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
             const u32 data_size = (header->type3.count.Value() - 2) * 4;
+            if (rasterizer) {
+                if (auto* direct = rasterizer->GetBufferCache().GetDirectMemory()) {
+                    direct->MarkVolatile(write_data->Address<VAddr>(), data_size); // D4
+                }
+            }
             if (!write_data->wr_one_addr.Value()) {
                 std::vector<u8> data(data_size);
                 std::memcpy(data.data(), write_data->data, data_size);

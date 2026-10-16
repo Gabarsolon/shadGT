@@ -73,7 +73,7 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
                          Bindings& binding_)
     : Sirit::Module(profile_.supported_spirv), info{info_}, runtime_info{runtime_info_},
       profile{profile_}, hw_stage{info.hw_stage}, sw_stage{info.sw_stage}, binding{binding_} {
-    if (info.uses_dma) {
+    if (info.uses_dma || info.uses_direct) {
         SetMemoryModel(spv::AddressingModel::PhysicalStorageBuffer64, spv::MemoryModel::GLSL450);
     } else {
         SetMemoryModel(spv::AddressingModel::Logical, spv::MemoryModel::GLSL450);
@@ -173,8 +173,18 @@ void EmitContext::DefineArithmeticTypes() {
     if (info.uses_fp64) {
         frexp_result_f64 = Name(TypeStruct(F64[1], S32[1]), "frexp_result_f64");
     }
-    if (info.uses_dma) {
+    if (info.uses_dma || info.uses_direct) {
         physical_pointer_type_u32 = TypePointer(spv::StorageClass::PhysicalStorageBuffer, U32[1]);
+    }
+    if (info.uses_direct) {
+        physical_pointer_type_f32 = TypePointer(spv::StorageClass::PhysicalStorageBuffer, F32[1]);
+        physical_pointer_type_u64 = TypePointer(spv::StorageClass::PhysicalStorageBuffer, U64);
+        if (profile.support_int8) {
+            physical_pointer_type_u8 = TypePointer(spv::StorageClass::PhysicalStorageBuffer, U8);
+        }
+        if (profile.support_int16) {
+            physical_pointer_type_u16 = TypePointer(spv::StorageClass::PhysicalStorageBuffer, U16);
+        }
     }
 }
 
@@ -845,6 +855,9 @@ EmitContext::BufferSpv EmitContext::DefineBuffer(bool is_written, bool is_cohere
     case BufferType::FaultBuffer:
         Name(id, "fault_buffer");
         break;
+    case BufferType::DirectTable:
+        Name(id, "direct_table");
+        break;
     case BufferType::SharedMemory:
         Name(id, "ssbo_shmem");
         break;
@@ -871,6 +884,8 @@ void EmitContext::DefineBuffers() {
             bda_pagetable_index = buffers.size();
         } else if (desc.buffer_type == BufferType::FaultBuffer) {
             fault_buffer_index = buffers.size();
+        } else if (desc.buffer_type == BufferType::DirectTable) {
+            direct_table_index = buffers.size();
         }
 
         // Define aliases depending on the shader usage.
@@ -1197,6 +1212,84 @@ Id EmitContext::DefineUfloatM5ToFloat32(u32 mantissa_bits, const std::string_vie
     return func;
 }
 
+Id EmitContext::DirectTableWord(u32 index) {
+    const auto& table = buffers[direct_table_index];
+    const auto [id, pointer_type] = table.Alias(PointerType::U32);
+    return OpLoad(U32[1], OpAccessChain(pointer_type, id, u32_zero_value, ConstU32(index)));
+}
+
+Id EmitContext::DirectTableAddress(u32 index) {
+    const Id lo = OpUConvert(U64, DirectTableWord(index));
+    const Id hi = OpUConvert(U64, DirectTableWord(index + 1));
+    return OpBitwiseOr(U64, lo, OpShiftLeftLogical(U64, hi, ConstU32(32U)));
+}
+
+// D2: guest address -> device address through the two-level page table (16 KiB pages; L1
+// entries cover 32 MiB). Unmapped addresses resolve into a zero page, so loads give 0.
+Id EmitContext::DefineDirectTranslate() {
+    const auto func_type{TypeFunction(U64, U64)};
+    const auto func{OpFunction(U64, spv::FunctionControlMask::MaskNone, func_type)};
+    const auto address{OpFunctionParameter(U64)};
+    Name(func, "direct_translate");
+    AddLabel();
+    const Id l1 = DirectTableAddress(0);
+    const Id zero_page = DirectTableAddress(2);
+    const Id l1_index = OpBitwiseAnd(U64, OpShiftRightLogical(U64, address, ConstU32(25U)),
+                                     Constant(U64, u64{(1ULL << 15) - 1}));
+    const Id l1_entry = OpIAdd(U64, l1, OpShiftLeftLogical(U64, l1_index, ConstU32(3U)));
+    const Id l2 = OpLoad(U64, OpConvertUToPtr(physical_pointer_type_u64, l1_entry),
+                         spv::MemoryAccessMask::Aligned, 8u);
+    const Id l2_index = OpBitwiseAnd(U64, OpShiftRightLogical(U64, address, ConstU32(14U)),
+                                     Constant(U64, u64{2047}));
+    const Id l2_entry = OpSelect(U64, OpIEqual(U1[1], l2, u64_zero_value), zero_page,
+                                 OpIAdd(U64, l2, OpShiftLeftLogical(U64, l2_index, ConstU32(3U))));
+    const Id page = OpLoad(U64, OpConvertUToPtr(physical_pointer_type_u64, l2_entry),
+                           spv::MemoryAccessMask::Aligned, 8u);
+    const Id in_page = OpBitwiseAnd(U64, address, Constant(U64, u64{0x3fff}));
+    const Id result = OpSelect(U64, OpIEqual(U1[1], page, u64_zero_value), zero_page,
+                               OpIAdd(U64, page, in_page));
+    OpReturnValue(result);
+    OpFunctionEnd();
+    return func;
+}
+
+bool EmitContext::IsDirectBuffer(u32 handle) const {
+    return info.uses_direct && handle < info.buffers.size() &&
+           info.buffers[handle].IsDirectEligible();
+}
+
+Id EmitContext::EmitDirectLoad(u32 handle, Id byte_offset, u32 bytes, Id result_type,
+                               Id physical_pointer_type, const std::function<Id()>& fallback) {
+    // Table entry of the buffer: base address (2 words), size in bytes, valid.
+    const u32 entry = 4 + handle * 4;
+    const Id direct_label = OpLabel();
+    const Id fallback_label = OpLabel();
+    const Id merge_label = OpLabel();
+    const Id valid = OpINotEqual(U1[1], DirectTableWord(entry + 3), u32_zero_value);
+    OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
+    OpBranchConditional(valid, direct_label, fallback_label);
+
+    AddLabel(direct_label);
+    const Id base = DirectTableAddress(entry);
+    const Id size = DirectTableWord(entry + 2);
+    const Id end = OpIAdd(U32[1], byte_offset, ConstU32(bytes));
+    const Id in_bounds = OpLogicalAnd(U1[1], OpULessThanEqual(U1[1], end, size),
+                                      OpUGreaterThanEqual(U1[1], end, byte_offset));
+    const Id address = OpSelect(U64, in_bounds, OpIAdd(U64, base, OpUConvert(U64, byte_offset)),
+                                u64_zero_value);
+    const Id device = OpFunctionCall(U64, direct_translate, address);
+    const Id value = OpLoad(result_type, OpConvertUToPtr(physical_pointer_type, device),
+                            spv::MemoryAccessMask::Aligned, std::min(bytes, 4u));
+    OpBranch(merge_label);
+
+    AddLabel(fallback_label);
+    const Id fallback_value = fallback();
+    OpBranch(merge_label);
+
+    AddLabel(merge_label);
+    return OpPhi(result_type, value, direct_label, fallback_value, fallback_label);
+}
+
 Id EmitContext::DefineGetBdaPointer() {
     const auto caching_pagebits{Constant(U64, static_cast<u64>(profile.sparse_page_shift))};
     const auto caching_pagemask{
@@ -1297,6 +1390,9 @@ void EmitContext::DefineFunctions() {
     }
     if (info.uses_dma) {
         get_bda_pointer = DefineGetBdaPointer();
+    }
+    if (info.uses_direct) {
+        direct_translate = DefineDirectTranslate();
     }
 
     if (True(info.readconst_types & Info::ReadConstType::Immediate)) {
