@@ -75,6 +75,12 @@ void DumpThreadStacks(const wchar_t* file_name) {
 void DumpThreadStacks(const wchar_t*) {}
 #endif
 
+// FIX-104: pipeline creations in progress (frame generation pauses meanwhile).
+static std::atomic<u32> g_builds_running{0};
+u32 PipelineBuildsRunning() {
+    return g_builds_running.load(std::memory_order_relaxed);
+}
+
 namespace {
 
 // DIAG-049: graphics pipeline creations the driver takes long on, logged every 2 s while they
@@ -83,6 +89,7 @@ namespace {
 class BuildWatch {
 public:
     BuildWatch(std::string name_, const char* what_) : name{std::move(name_)}, what{what_} {
+        g_builds_running.fetch_add(1, std::memory_order_relaxed); // FIX-104
         auto& state = State();
         std::scoped_lock lk{state.mutex};
         id = ++state.next_id;
@@ -93,6 +100,7 @@ public:
         }
     }
     ~BuildWatch() {
+        g_builds_running.fetch_sub(1, std::memory_order_relaxed); // FIX-104
         auto& state = State();
         std::scoped_lock lk{state.mutex};
         const auto it = state.running.find(id);

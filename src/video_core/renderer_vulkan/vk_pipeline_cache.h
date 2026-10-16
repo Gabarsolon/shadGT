@@ -74,6 +74,8 @@ PrecompileProgress GetPrecompileProgress();
 bool PrecompileHoldsGame();
 /// PERF-103: the game runs in slow motion while pipelines it needs are compiled.
 bool CompileSlowMotion();
+/// FIX-104: pipeline creations in progress.
+u32 PipelineBuildsRunning();
 
 class PipelineCache {
 public:

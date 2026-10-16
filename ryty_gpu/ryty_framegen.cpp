@@ -11,7 +11,9 @@
 
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
+#include "common/guest_clock.h"
 #include "ryty_gpu/ryty_framegen.h"
+#include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "ryty_gpu/ryty_fsr3.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
@@ -345,6 +347,21 @@ void FrameGen::Prepare(vk::CommandBuffer cmdbuf, vk::SwapchainKHR swapchain, vk:
                      ab_frames[1] / std::max(0.001, ab_seconds[1]));
             ab_frames[0] = ab_frames[1] = 0;
             ab_seconds[0] = ab_seconds[1] = 0.0;
+        }
+    }
+    // FIX-104: no generated frames while new shaders compile (and for a second after). With
+    // generation on during heavy compiles the driver deadlocked: FFX's present thread waited in
+    // the driver while pipeline builds and the recorder waited on its locks (October 16, both
+    // renderers; the new one compiles its own shaders at first, so it met it at once).
+    {
+        static std::chrono::steady_clock::time_point last_compile{};
+        if (Common::GuestClock::IsPaused() || Vulkan::CompileSlowMotion() ||
+            Vulkan::PipelineBuildsRunning() > 0) {
+            last_compile = now;
+        }
+        if (last_compile != std::chrono::steady_clock::time_point{} &&
+            now - last_compile < std::chrono::seconds{1}) {
+            enabled = false;
         }
     }
     config.frameGenerationEnabled = enabled;
