@@ -6,7 +6,9 @@
 #include <atomic>
 #include <bit>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
+#include <string>
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -90,9 +92,40 @@ DirectMemory::DirectMemory(const Vulkan::Instance& instance_, Vulkan::Scheduler&
 DirectMemory::~DirectMemory() = default;
 
 bool DirectMemory::Enabled() {
+    // SHADGT_DIRECT=1/0 wins; otherwise the launcher's GPU.direct_renderer option (the game's
+    // custom config next to the exe), off when missing.
     static const bool enabled = [] {
-        const char* env = std::getenv("SHADGT_DIRECT");
-        return env && env[0] == '1';
+        if (const char* env = std::getenv("SHADGT_DIRECT"); env && *env) {
+            return env[0] == '1';
+        }
+#ifdef _WIN32
+        char path[MAX_PATH];
+        const DWORD length = GetModuleFileNameA(nullptr, path, MAX_PATH);
+        if (length == 0 || length >= MAX_PATH) {
+            return false;
+        }
+        std::string config{path, length};
+        config = config.substr(0, config.find_last_of("\\/") + 1) +
+                 "user\\custom_configs\\CUSA03220.json";
+        std::FILE* file = std::fopen(config.c_str(), "rb");
+        if (!file) {
+            return false;
+        }
+        std::string text;
+        char chunk[4096];
+        while (const size_t n = std::fread(chunk, 1, sizeof(chunk), file)) {
+            text.append(chunk, n);
+        }
+        std::fclose(file);
+        const size_t at = text.find("\"direct_renderer\"");
+        if (at == std::string::npos) {
+            return false;
+        }
+        const size_t value = text.find_first_not_of(" \t\r\n:", at + 17);
+        return value != std::string::npos && text.compare(value, 4, "true") == 0;
+#else
+        return false;
+#endif
     }();
     return enabled;
 }

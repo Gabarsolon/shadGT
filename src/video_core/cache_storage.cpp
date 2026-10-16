@@ -8,6 +8,7 @@
 #include "common/thread.h"
 #include "core/emulator_settings.h"
 
+#include "video_core/buffer_cache/direct_memory.h"
 #include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
@@ -113,7 +114,7 @@ void DataBase::Open() {
     } else {
         cache_path = GetUserPath(PathType::CacheDir) / game_info.GameSerial();
         // D2: direct-memory shaders differ from the stored ones, which load unchecked.
-        if (const char* direct = std::getenv("SHADGT_DIRECT"); direct && direct[0] == '1') {
+        if (VideoCore::DirectMemory::Enabled()) {
             cache_path += "-direct";
         }
         if (!std::filesystem::exists(cache_path)) {
