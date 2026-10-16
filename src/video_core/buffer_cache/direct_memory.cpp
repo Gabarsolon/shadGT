@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <cstdlib>
@@ -58,6 +59,15 @@ struct PendingRelease {
 std::mutex g_pending_mutex;
 std::vector<PendingRelease> g_pending;
 std::atomic<bool> g_has_pending{false}; // checked on every bind without the lock
+// D7: views a thread found lately, valid while no view was unmapped since (lock-free check).
+std::atomic<u64> g_unmap_generation{1};
+struct RecentView {
+    u64 generation;
+    VAddr begin;
+    VAddr end;
+};
+thread_local std::array<RecentView, 8> t_recent_views{};
+thread_local u32 t_recent_next = 0;
 
 } // namespace
 
@@ -300,13 +310,23 @@ bool DirectMemory::EnsureImported(VAddr address, u64 size) {
         });
         g_has_pending.store(!g_pending.empty(), std::memory_order_relaxed);
     }
-    std::scoped_lock lk{mutex};
     const VAddr end = address + size;
+    const u64 generation = g_unmap_generation.load(std::memory_order_acquire);
+    for (const RecentView& recent : t_recent_views) {
+        if (recent.generation == generation && address >= recent.begin && end <= recent.end) {
+            return true;
+        }
+    }
+    std::scoped_lock lk{mutex};
     for (VAddr page = address & ~(PageSize - 1); page < end;) {
         auto it = views.upper_bound(page);
         if (it != views.begin()) {
             const auto& view = std::prev(it)->second;
             if (page >= view.begin && page < view.end) {
+                if (address >= view.begin && end <= view.end) {
+                    t_recent_views[t_recent_next++ % t_recent_views.size()] = {
+                        generation, view.begin, view.end};
+                }
                 page = view.end;
                 continue;
             }
@@ -320,6 +340,7 @@ bool DirectMemory::EnsureImported(VAddr address, u64 size) {
 
 void DirectMemory::OnUnmap(VAddr address, u64 size) {
     std::scoped_lock lk{mutex};
+    g_unmap_generation.fetch_add(1, std::memory_order_acq_rel); // D7
     const VAddr end = address + size;
     auto it = views.upper_bound(address);
     if (it != views.begin()) {
