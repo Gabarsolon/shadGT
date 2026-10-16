@@ -506,6 +506,15 @@ void ServeReplacement(void* file, u8* begin, s64 read) {
     std::scoped_lock lock{g_replacement_mutex};
     auto it = std::find_if(g_active_replacements.begin(), g_active_replacements.end(),
                            [file](const auto& entry) { return entry.first == file; });
+    // FIX-105: the game stops reading a script once it has parsed it, so a replacement smaller than
+    // the original (zero padding at the end) can stay active. The next script read through the same
+    // stream object then got the padding (zeros) instead of its own bytes: GRIM.ADC with the
+    // livery ban checks replaced left NP.ADC empty ("stream is not adhoc script code") and the game
+    // crashed at boot. A read that starts with a script header is always a new script.
+    if (it != g_active_replacements.end() && read >= 8 && std::memcmp(begin, "ADCH012", 8) == 0) {
+        g_active_replacements.erase(it);
+        it = g_active_replacements.end();
+    }
     if (it == g_active_replacements.end()) {
         const u8* key = ScriptKey(begin, static_cast<size_t>(read));
         for (const auto& replacement : g_script_replacements) {
