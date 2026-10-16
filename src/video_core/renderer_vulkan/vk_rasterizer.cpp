@@ -769,6 +769,10 @@ bool Rasterizer::PrepareBuffersAhead(const SelectedPipeline& selected, BufferPla
             if (order_only && !desc.is_written) {
                 continue;
             }
+            // D9: read in place by the recorder (BindBuffers), not obtained.
+            if (info->uses_direct && desc.IsDirectEligible() && buffer_cache.GetDirectMemory()) {
+                continue;
+            }
             if (!order_only && written_to_recorder && desc.is_written) {
                 ++plan_refusals[3];
                 if (!skip_written) {

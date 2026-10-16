@@ -12,6 +12,7 @@
 #include "common/nvtx.h"
 #include "common/perf_monitor.h"
 #include "common/thread.h"
+#include "video_core/buffer_cache/direct_memory.h"
 #include "video_core/amdgpu/draw_pipe.h"
 
 namespace AmdGpu {
@@ -33,8 +34,12 @@ DrawPipe::DrawPipe(std::function<void()> thread_init_, size_t max_pending_)
     }
     // PERF-067: the buffer stage thread does each draw's buffer work ahead of the recorder.
     // -DisablePerf 74 keeps it off.
-    if (const char* env = std::getenv("SHADGT_BUFFER_STAGE");
-        env && env[0] == '1' && Common::PerfFeatureEnabled(74)) {
+    // D9: on by default with the direct renderer (its recorder obtains far fewer buffers, so the
+    // stage's plans are rarely refused: Tokyo rain 45.2 fps vs 43.4); =0 turns it off.
+    const char* stage_env = std::getenv("SHADGT_BUFFER_STAGE");
+    const bool stage_wanted = stage_env && *stage_env ? stage_env[0] == '1'
+                                                      : VideoCore::DirectMemory::Enabled();
+    if (stage_wanted && Common::PerfFeatureEnabled(74)) {
         stage_enabled = true;
         if (const char* workers_env = std::getenv("SHADGT_STAGE_WORKERS")) {
             worker_count = static_cast<u32>(std::clamp(std::atoi(workers_env), 1, 4));
