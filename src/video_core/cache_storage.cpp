@@ -126,6 +126,18 @@ void DataBase::Open() {
     opened = true;
 }
 
+void DataBase::OpenLegacy() {
+    if (opened || EmulatorSettings.IsPipelineCacheArchived()) {
+        return;
+    }
+    const auto& game_info = Common::ElfInfo::Instance();
+    cache_path = Common::FS::GetUserPath(Common::FS::PathType::CacheDir) / game_info.GameSerial();
+    std::error_code ec;
+    opened = std::filesystem::is_directory(cache_path, ec);
+    LOG_INFO(Render, "D10: old renderer's shader store {} at {}", opened ? "found" : "not found",
+             cache_path.string());
+}
+
 void DataBase::Close() {
     if (!IsOpened()) {
         return;

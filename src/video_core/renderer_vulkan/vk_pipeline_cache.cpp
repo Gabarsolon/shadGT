@@ -653,6 +653,18 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         } else {
             Storage::DataBase::Instance().Open();
             use_stored_shaders = true;
+            // D10: the old renderer's translations stand in while the new renderer's are built.
+            // SHADGT_LEGACY_FALLBACK=0 turns it off.
+            if (profile.direct_buffers) {
+                const char* fallback_env = std::getenv("SHADGT_LEGACY_FALLBACK");
+                if (!fallback_env || fallback_env[0] != '0') {
+                    Storage::DataBase::Legacy().OpenLegacy();
+                    legacy_fallback = Storage::DataBase::Legacy().IsOpened();
+                    legacy_stats.since = std::chrono::steady_clock::now();
+                    LOG_WARNING(Render_Vulkan, "D10: old-renderer shader fallback {}",
+                                legacy_fallback ? "on" : "off (no old shader store)");
+                }
+            }
             LOG_WARNING(Render_Vulkan,
                         "PERF-032: shader translations are loaded from the store on first use");
             // PERF-038: opt-in (SHADGT_PREWARM=1): the stored pipelines are built in the
@@ -1050,6 +1062,7 @@ void PipelineCache::BuildQueuedStates(const DrawIndirectParams params, bool rest
     }
     Common::PhaseTimer eval_timer{Common::Phase::ReadAheadEval};
     const auto key = graphics_key;
+    const bool key_was_legacy = key_uses_legacy; // D10: made again the same way below
     u32 evaluated = 0;
     u32 started = 0;
     // Before a draw, 2 ms at most, and while waiting for a build, 64 states between checks on
@@ -1085,7 +1098,10 @@ void PipelineCache::BuildQueuedStates(const DrawIndirectParams params, bool rest
     }
     draw_indirect_params = params;
     if (restore && evaluated > 0) {
+        const bool was_forced = force_legacy;
+        force_legacy = key_was_legacy && legacy_fallback;
         RefreshGraphicsKey();
+        force_legacy = was_forced;
         ASSERT_MSG(graphics_key == key, "Read-ahead changed the current pipeline key");
     }
     auto& stats = queued_state_stats;
@@ -1148,7 +1164,31 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     // for the workers' results (the slowest one, not their sum).
     defer_misses = AsyncTranslation();
     deferred_miss = false;
+    fallback_miss = false;
     bool key_valid = RefreshGraphicsKey();
+    // D10: a new translation this draw needs is being made; the old renderer's draw it.
+    if (!key_valid && fallback_miss) {
+        fallback_nested = true;
+        force_legacy = true;
+        const bool legacy_valid = RefreshGraphicsKey() && !legacy_failed;
+        force_legacy = false;
+        const GraphicsPipeline* legacy = legacy_valid ? PipelineForCurrentKey(params) : nullptr;
+        ++(legacy ? legacy_stats.fallback_ok : legacy_stats.fallback_none);
+        ReportLegacy();
+        if (legacy) {
+            fallback_nested = false;
+            return legacy;
+        }
+        // No old translations: the usual way (the queued translations are taken when ready).
+        deferred_miss = false;
+        key_valid = RefreshGraphicsKey();
+    }
+    struct NestedReset {
+        bool& flag;
+        ~NestedReset() {
+            flag = false;
+        }
+    } nested_reset{fallback_nested};
     // One stage is queued per pass (a stage's start bindings follow from the stages before it);
     // the read-ahead runs once, after the first.
     for (u32 pass = 0; !key_valid && deferred_miss && pass < 6; ++pass) {
@@ -1168,6 +1208,43 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     if (!key_valid) {
         return nullptr;
     }
+    // D10: a key of new translations whose pipeline is not built yet. It is built in the
+    // background; meanwhile the draw uses the key made of the old renderer's translations.
+    if (legacy_fallback && !fallback_nested && !key_uses_legacy && regs_override == nullptr &&
+        !graphics_pipelines.contains(graphics_key)) {
+        const auto pending = pending_builds.find(graphics_key);
+        const bool ready = pending != pending_builds.end() &&
+                           pending->second->done.wait_for(std::chrono::seconds{0}) ==
+                               std::future_status::ready;
+        if (!ready && graphics_key.num_color_attachments <= AmdGpu::NUM_COLOR_BUFFERS) {
+            if (pending == pending_builds.end()) {
+                auto build = StartPipelineBuild(false);
+                build->async = true;
+                pending_builds[graphics_key] = build;
+            }
+            fallback_nested = true;
+            force_legacy = true;
+            const bool legacy_valid = RefreshGraphicsKey() && !legacy_failed;
+            force_legacy = false;
+            const GraphicsPipeline* legacy =
+                legacy_valid ? PipelineForCurrentKey(params) : nullptr;
+            fallback_nested = false;
+            ++(legacy ? legacy_stats.fallback_ok
+                      : legacy_valid ? legacy_stats.fallback_unbuilt : legacy_stats.fallback_none);
+            ReportLegacy();
+            if (legacy) {
+                return legacy;
+            }
+            // No old translations for every stage: the new key again, the usual way.
+            if (!RefreshGraphicsKey()) {
+                return nullptr;
+            }
+        }
+    }
+    return PipelineForCurrentKey(params);
+}
+
+const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectParams params) {
     if (graphics_key.num_color_attachments > AmdGpu::NUM_COLOR_BUFFERS) {
         LOG_WARNING(Render_Vulkan, "Skipping draw with {} color attachments (MRT mask={:#x})",
                     graphics_key.num_color_attachments, graphics_key.mrt_mask);
@@ -1305,10 +1382,12 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
                 it.value() = std::move(stored->pipeline);
                 ++(stored->async ? async_stats.installed : prewarm_stats.hits);
                 // Stored again, so the next session builds it among the first.
-                RegisterPipelineData(graphics_key, pipeline_hash, sdata);
+                if (!key_uses_legacy) {
+                    RegisterPipelineData(graphics_key, pipeline_hash, sdata);
+                }
                 return it->second.get();
             }
-            if (stored->async && !WritesMemory(infos) && !NeverSkipped(infos)) {
+            if (stored->async && !key_uses_legacy && !WritesMemory(infos) && !NeverSkipped(infos)) {
                 // PERF-076: still building; this draw is skipped, the next ones look again.
                 graphics_pipelines.erase(it);
                 ++async_stats.skipped_draws;
@@ -1361,7 +1440,10 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         // or -DisablePerf 76 waits as before.
         // PERF-103: in slow-motion mode every new pipeline goes on in the background at once
         // and the game goes on in slow motion until it is built.
-        if (build && AsyncPipelines() && !WritesMemory(infos) && !NeverSkipped(infos) &&
+        // D10: a pipeline of old translations is built right away (the driver usually has it
+        // from the old renderer's sessions, so it takes milliseconds).
+        if (build && AsyncPipelines() && !key_uses_legacy && !WritesMemory(infos) &&
+            !NeverSkipped(infos) &&
             build->done.wait_for(std::chrono::seconds{0}) != std::future_status::ready) {
             build->async = true;
             pending_builds[graphics_key] = build;
@@ -1405,7 +1487,11 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
                 runtime_infos, fetch_shader, modules, sdata);
         }
 
-        RegisterPipelineData(graphics_key, pipeline_hash, sdata);
+        if (!key_uses_legacy) { // D10: old translations are not in this store
+            RegisterPipelineData(graphics_key, pipeline_hash, sdata);
+        } else {
+            ++legacy_stats.pipelines;
+        }
         ++num_new_pipelines;
         MaybeSaveDriverCache();
 
@@ -1422,7 +1508,21 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
 }
 
 const ComputePipeline* PipelineCache::GetComputePipeline() {
-    if (!RefreshComputeKey()) {
+    fallback_miss = false;
+    bool key_valid = RefreshComputeKey();
+    if (!key_valid && fallback_miss) {
+        // D10: as for graphics, the old translation while the new one is made.
+        fallback_nested = true;
+        force_legacy = true;
+        key_valid = RefreshComputeKey() && !legacy_failed;
+        force_legacy = false;
+        ++(key_valid ? legacy_stats.fallback_ok : legacy_stats.fallback_none);
+        if (!key_valid) {
+            key_valid = RefreshComputeKey();
+        }
+        fallback_nested = false;
+    }
+    if (!key_valid) {
         return nullptr;
     }
     const auto [it, is_new] = compute_pipelines.try_emplace(compute_key);
@@ -1437,7 +1537,9 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
         it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
                                                        *pipeline_cache, compute_key, *infos[0],
                                                        modules[0], sdata);
-        RegisterPipelineData(compute_key, sdata);
+        if (!key_uses_legacy) { // D10
+            RegisterPipelineData(compute_key, sdata);
+        }
         ++num_new_pipelines;
         MaybeSaveDriverCache();
 
@@ -1647,6 +1749,8 @@ bool PipelineCache::RefreshGraphicsStages() {
     auto& key = graphics_key;
     fetch_shader = nullptr;
     stage_deferred = false; // FIX-078
+    key_uses_legacy = false; // D10
+    legacy_failed = false;
 
     // FIX-027: a shader program register pointing outside guest memory (GT Sport's dealership had
     // a pixel shader at 0x100) crashed the emulator reading the program. Skip such a draw, like
@@ -1821,6 +1925,8 @@ bool PipelineCache::RefreshGraphicsStages() {
 }
 
 bool PipelineCache::RefreshComputeKey() {
+    key_uses_legacy = false; // D10
+    legacy_failed = false;
     Shader::Backend::Bindings binding{};
     const auto& cs_pgm = liverpool->DrawCsRegs();
     const auto cs_params = AmdGpu::GetParams(cs_pgm);
@@ -1906,12 +2012,16 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
 }
 
 PipelineCache::StoredListing PipelineCache::ReadStoredListing(u64 pgm_hash) {
+    return ReadStoredListing(pgm_hash, Storage::DataBase::Instance());
+}
+
+PipelineCache::StoredListing PipelineCache::ReadStoredListing(u64 pgm_hash,
+                                                              Storage::DataBase& store) {
     // Each permutation is stored as <perm hash>.meta (key and shader info) and
     // <program hash>_<index>.spv; indices are dense from 0 (PERF-013 numbers runtime ones after
     // the stored ones), so the listing stops after a run of missing indices. Only file reads, so
     // the PERF-038 reader thread can do it too.
     StoredListing listing{.pgm_hash = pgm_hash};
-    auto& store = Storage::DataBase::Instance();
     u32 missing = 0;
     for (size_t perm_idx = 0; perm_idx < 512 && missing < 8; ++perm_idx) {
         const auto name = fmt::format("{:#018x}", HashCombine(pgm_hash, perm_idx));
@@ -1953,6 +2063,10 @@ void PipelineCache::ApplyStoredListing(StoredListing&& listing, Program& program
             ++stale;
             continue;
         }
+        // D10: stored before D2, the byte uses_direct takes was padding.
+        info->uses_direct = std::ranges::any_of(info->buffers, [](const auto& buffer) {
+            return buffer.buffer_type == Shader::BufferType::DirectTable;
+        });
         auto& end = stored_perm_end[pgm_hash];
         end = std::max(end, perm_idx + 1);
         // FIX-018/020: translated before a translator fix this program needs.
@@ -2331,9 +2445,14 @@ void PipelineCache::ReportPrewarm(std::chrono::steady_clock::time_point now) {
 }
 
 vk::ShaderModule PipelineCache::LoadStoredModule(u64 pgm_hash, size_t perm_idx) {
+    return LoadStoredModule(pgm_hash, perm_idx, Storage::DataBase::Instance());
+}
+
+vk::ShaderModule PipelineCache::LoadStoredModule(u64 pgm_hash, size_t perm_idx,
+                                                 Storage::DataBase& store) {
     static u64 loaded = 0;
     std::vector<u32> spv;
-    Storage::DataBase::Instance().Load(Storage::BlobType::ShaderBinary,
+    store.Load(Storage::BlobType::ShaderBinary,
                                        fmt::format("{:#018x}_{}", pgm_hash, perm_idx), spv);
     if (!IsCompleteSpirv(spv)) {
         static u32 reports = 0;
@@ -2885,6 +3004,108 @@ void PipelineCache::HarvestTranslations(u64 hash, bool wait) {
     }
 }
 
+std::optional<PipelineCache::Result> PipelineCache::TryLegacyProgram(
+    HwStage hw_stage, const Shader::ShaderParams& params, const Shader::RuntimeInfo& runtime_info,
+    Shader::Backend::Bindings& binding) {
+    auto& store = Storage::DataBase::Legacy();
+    auto [it, is_new] = legacy_programs.try_emplace(params.hash);
+    if (is_new) {
+        it.value() = std::make_unique<Program>();
+        // Like ApplyStoredListing, without its bookkeeping of this store's indices.
+        auto listing = ReadStoredListing(params.hash, store);
+        for (auto& entry : listing.entries) {
+            if (!entry.has_spv) {
+                continue;
+            }
+            auto info = std::make_unique<Shader::Info>();
+            Shader::StageSpecialization spec{};
+            spec.info = info.get();
+            size_t stored_idx{};
+            Serialization::Archive ar{std::move(entry.meta)};
+            bool valid = false;
+            try {
+                Common::RecoverableScope recoverable;
+                valid = ar.SizeBytes() >= 24 && LoadShaderMeta(ar, *info, spec, stored_idx);
+            } catch (const Common::RecoverableFailure&) {
+                valid = false;
+            }
+            if (!valid || stored_idx != entry.perm_idx || info->pgm_hash != params.hash ||
+                std::ranges::any_of(info->buffers, [](const auto& buffer) {
+                    return buffer.buffer_type == Shader::BufferType::DirectTable;
+                })) {
+                continue;
+            }
+            info->uses_direct = false; // the byte was padding in old metas
+            it.value()->InsertPermut({}, std::move(spec), std::move(info), entry.perm_idx);
+            it.value()->modules[entry.perm_idx].stored = true;
+        }
+        ++legacy_stats.programs;
+    }
+    auto& program = *it.value();
+    for (size_t perm_idx = 0; perm_idx < program.modules.size(); ++perm_idx) {
+        auto& permutation = program.modules[perm_idx];
+        if (!permutation.info) {
+            continue;
+        }
+        auto& info = *permutation.info;
+        info.pgm_base = params.Base();
+        info.user_data = params.user_data;
+        info.RefreshFlatBuf();
+        const auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding);
+        if (permutation.spec != spec) {
+            static std::atomic<u32> logged{};
+            if (logged++ < 40) {
+                u32 index{};
+                const char* reason = permutation.spec.FirstDifference(spec, index);
+                LOG_WARNING(Render_Vulkan, "D10: old translation {} of {}_{:#x} differs: {}[{}]",
+                            perm_idx, hw_stage, params.hash, reason ? reason : "none", index);
+            }
+            continue;
+        }
+        if (!info.attribute_flags_known && IsTessEmulatedDraw()) {
+            continue; // FIX-012 would store it again: left to the new translation
+        }
+        if (permutation.stored) {
+            permutation.stored = false;
+            permutation.module = LoadStoredModule(params.hash, perm_idx, store);
+            if (!permutation.module) {
+                permutation.info.reset();
+                continue;
+            }
+        }
+        info.AddBindings(binding);
+        if (auto& fetch = permutation.spec.fetch_shader_data; !fetch.Empty()) {
+            fetch_shader = &fetch;
+        }
+        ++legacy_stats.draws;
+        ReportLegacy();
+        // Its own pipeline keys: the module hashes of old translations differ from new ones.
+        constexpr u64 LegacyTag = 0x4c45474143590000ULL;
+        return std::make_tuple(&info, permutation.module,
+                               HashCombine(params.hash, perm_idx) ^ LegacyTag);
+    }
+    return std::nullopt;
+}
+
+void PipelineCache::ReportLegacy() {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - legacy_stats.since < std::chrono::seconds{2}) {
+        return;
+    }
+    LOG_WARNING(Render_Vulkan,
+                "D10: old-renderer shaders in 2 s: {} stage lookups used one, {} new translations "
+                "queued for them, {} pipelines of old shaders, {} misses without one ({} programs "
+                "read from the old store); pipelines not built yet: {} drawn with old shaders, "
+                "{} old ones not built either, {} without old shaders",
+                legacy_stats.draws, legacy_stats.queued, legacy_stats.pipelines,
+                legacy_stats.no_legacy, legacy_stats.programs, legacy_stats.fallback_ok,
+                legacy_stats.fallback_unbuilt, legacy_stats.fallback_none);
+    const u64 programs = legacy_stats.programs;
+    legacy_stats = {};
+    legacy_stats.programs = programs;
+    legacy_stats.since = now;
+}
+
 PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_stage,
                                                 const Shader::ShaderParams& params,
                                                 Shader::Backend::Bindings& binding) {
@@ -2949,7 +3170,19 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     auto& program = it_pgm.value();
     // FIX-078: translations made on the workers become permutations; a draw (not a read-ahead)
     // first waits for any still running, as one of them is likely the permutation it needs.
-    HarvestTranslations(params.hash, regs_override == nullptr);
+    // D10: with the fallback a draw does not wait for translations in progress (the old
+    // translations draw meanwhile); only when there are none (fallback_nested).
+    HarvestTranslations(params.hash, regs_override == nullptr && !force_legacy &&
+                                         (!legacy_fallback || fallback_nested));
+    // D10: a key is made of new translations only, or (forced) of old ones only.
+    if (force_legacy) {
+        if (auto legacy = TryLegacyProgram(hw_stage, params, runtime_info, binding)) {
+            key_uses_legacy = true;
+            return *legacy;
+        }
+        legacy_failed = true;
+        return std::make_tuple(nullptr, vk::ShaderModule{}, u64{0});
+    }
     std::optional<Common::PhaseTimer> match_timer{std::in_place, Common::Phase::ProgramMatch};
     // Diagnostic for runaway permutations: why each existing permutation was rejected.
     std::string mismatch_reasons;
@@ -3093,6 +3326,16 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
                 return std::make_tuple(nullptr, vk::ShaderModule{}, u64{0});
             }
             return GetProgram(hw_stage, sw_stage, params, binding);
+        }
+        // D10: the new translation is made on a worker; meanwhile the draw's key is made of the
+        // old renderer's translations (GetGraphicsPipeline / GetComputePipeline). Without them,
+        // the usual way (fallback_nested).
+        if (legacy_fallback && !read_ahead && !fallback_nested) {
+            if (QueueTranslation(hw_stage, sw_stage, params, runtime_info, binding)) {
+                ++legacy_stats.queued;
+            }
+            fallback_miss = true;
+            return std::make_tuple(nullptr, vk::ShaderModule{}, u64{0});
         }
         if (read_ahead || defer_misses) {
             // A shader an upcoming draw needs (or this draw, which looks again once the next

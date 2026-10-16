@@ -11,6 +11,7 @@
 #include <deque>
 #include <filesystem>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -43,6 +44,10 @@ struct Archive;
 
 namespace Shader {
 struct Info;
+}
+
+namespace Storage {
+class DataBase;
 }
 
 namespace Vulkan {
@@ -86,6 +91,8 @@ public:
     void Sync();
 
     const GraphicsPipeline* GetGraphicsPipeline(const DrawIndirectParams params = {});
+    /// The pipeline of the key RefreshGraphicsKey made (built if needed).
+    const GraphicsPipeline* PipelineForCurrentKey(const DrawIndirectParams params);
 
     /// PERF-047: with pipelines selected on the command thread, both GPU threads look pipelines
     /// up; every GetGraphicsPipeline/GetComputePipeline call holds this lock, and so does any
@@ -230,8 +237,40 @@ private:
         std::vector<Entry> entries;
     };
     static StoredListing ReadStoredListing(u64 pgm_hash);
+    static StoredListing ReadStoredListing(u64 pgm_hash, Storage::DataBase& store);
     void ApplyStoredListing(StoredListing&& listing, Program& program);
     vk::ShaderModule LoadStoredModule(u64 pgm_hash, size_t perm_idx);
+    vk::ShaderModule LoadStoredModule(u64 pgm_hash, size_t perm_idx, Storage::DataBase& store);
+
+    // D10: while the new renderer's own translations of a draw's shaders, or its pipeline, are
+    // not built yet, the draw uses the old renderer's stored translations (its own store, read
+    // only). The new ones are built in the background meanwhile, so the game neither waits nor
+    // skips draws for them.
+    bool LegacyFallback() const {
+        return legacy_fallback;
+    }
+    std::optional<Result> TryLegacyProgram(Shader::HwStage hw_stage, const Shader::ShaderParams& params,
+                                           const Shader::RuntimeInfo& runtime_info,
+                                           Shader::Backend::Bindings& binding);
+    tsl::robin_map<size_t, std::unique_ptr<Program>> legacy_programs;
+    bool legacy_fallback{};
+    bool force_legacy{};      ///< making the key with the old translations only
+    bool legacy_failed{};     ///< a stage had none
+    bool key_uses_legacy{};   ///< the current key has a stage with an old translation
+    bool fallback_nested{};
+    bool fallback_miss{};     ///< a new translation was queued for the current key
+    struct LegacyStats {
+        u64 programs{};
+        u64 draws{};
+        u64 queued{};
+        u64 pipelines{};
+        u64 no_legacy{};
+        u64 fallback_ok{};
+        u64 fallback_unbuilt{};
+        u64 fallback_none{};
+        std::chrono::steady_clock::time_point since{};
+    } legacy_stats;
+    void ReportLegacy();
     tsl::robin_map<ComputePipelineKey, std::unique_ptr<ComputePipeline>> compute_pipelines;
     tsl::robin_map<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>> graphics_pipelines;
     std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};

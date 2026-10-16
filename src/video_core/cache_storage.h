@@ -27,6 +27,13 @@ public:
     }
 
     void Open();
+    /// D10: the store the old renderer fills, read-only next to the new renderer's own store.
+    static DataBase& Legacy() {
+        static DataBase legacy;
+        return legacy;
+    }
+    /// D10: opens Legacy() for reading (not with an archived cache).
+    void OpenLegacy();
     void Close();
     [[nodiscard]] bool IsOpened() const {
         return opened;
