@@ -207,6 +207,60 @@ void MiscMonitor() {
                 }
                 continue;
             }
+            // RYGT_ENV_SET=<hex offset>:<i|f|b><value>,...: fields of every EnvironmentSetting
+            // set to a value (graphics-option experiments: shadow splitCount at 0x3d8/0x42c...).
+            static const auto env_sets = [] {
+                struct Set {
+                    u32 offset;
+                    char type;
+                    double value;
+                };
+                std::vector<Set> sets;
+                if (const char* env = std::getenv("RYGT_ENV_SET")) {
+                    std::string text = env;
+                    size_t at = 0;
+                    while (at < text.size()) {
+                        const size_t end = std::min(text.find(',', at), text.size());
+                        const std::string item = text.substr(at, end - at);
+                        const size_t colon = item.find(':');
+                        if (colon != std::string::npos && colon + 2 <= item.size()) {
+                            sets.push_back({static_cast<u32>(std::strtoul(item.substr(0, colon).c_str(), nullptr, 16)),
+                                            item[colon + 1], std::atof(item.c_str() + colon + 2)});
+                        }
+                        at = end + 1;
+                    }
+                }
+                return sets;
+            }();
+            for (const auto& set : env_sets) {
+                if (!scale_on || set.offset + 4 > span) {
+                    continue;
+                }
+                u8* field = instance.base + set.offset;
+                if (set.type == 'i') {
+                    s32 old;
+                    std::memcpy(&old, field, 4);
+                    const s32 value = static_cast<s32>(set.value);
+                    if (old != value) {
+                        std::fprintf(stderr, "[env] RYGT_ENV_SET %p+%#x: %d -> %d\n", instance.base, set.offset, old, value);
+                        std::memcpy(field, &value, 4);
+                    }
+                } else if (set.type == 'f') {
+                    float old;
+                    std::memcpy(&old, field, 4);
+                    const float value = static_cast<float>(set.value);
+                    if (old != value) {
+                        std::fprintf(stderr, "[env] RYGT_ENV_SET %p+%#x: %g -> %g\n", instance.base, set.offset, old, value);
+                        std::memcpy(field, &value, 4);
+                    }
+                } else if (set.type == 'b') {
+                    const u8 value = static_cast<u8>(set.value);
+                    if (*field != value) {
+                        std::fprintf(stderr, "[env] RYGT_ENV_SET %p+%#x: %u -> %u\n", instance.base, set.offset, *field, value);
+                        *field = value;
+                    }
+                }
+            }
             std::string changes;
             for (size_t i = 0; i < std::size(kMiscFields); ++i) {
                 if (kMiscFields[i].offset >= span) {
@@ -570,7 +624,7 @@ void InstallScriptPatches(u8* base) {
 void InstallMiscHooks(u8* base) {
     const char* diag = std::getenv("RYGT_ENV_DIAG");
     const char* scale = std::getenv("RYGT_ENV_SCALE");
-    if (!(diag && diag[0] == '1') && !scale) {
+    if (!(diag && diag[0] == '1') && !scale && !std::getenv("RYGT_ENV_SET")) {
         return;
     }
     std::fill(std::begin(g_misc_scale), std::end(g_misc_scale), 1.0f);
@@ -752,7 +806,78 @@ bool WetReflectionsWanted() {
     return value == std::string::npos || text.compare(value, 5, "false") != 0;
 }
 
+// GTS-008: rear-view mirror at half rate. The frame render (eboot 0x10ff... ) renders the back
+// mirror in a block it skips when the mirror object is null or the scene's mirror-off flag
+// ([r13+0x5a8]) is set: "cmp byte ptr [r13+0x5a8], 0; jne skip" at eboot 0x110011a. The cmp becomes
+// a call to a stub that also skips every other time, so the mirror is redrawn every second frame
+// (its picture is kept in between). GPU.mirror_half_rate=true (launcher) or RYGT_MIRROR_HALF=1.
+bool ConfigFlag(const char* key, bool fallback) {
+    char path[MAX_PATH];
+    const DWORD length = GetModuleFileNameA(nullptr, path, MAX_PATH);
+    if (length == 0 || length >= MAX_PATH) {
+        return fallback;
+    }
+    std::string config{path, length};
+    config = config.substr(0, config.find_last_of("\\/") + 1) + "user\\custom_configs\\CUSA03220.json";
+    std::FILE* file = std::fopen(config.c_str(), "rb");
+    if (!file) {
+        return fallback;
+    }
+    std::string text;
+    char chunk[4096];
+    while (const size_t n = std::fread(chunk, 1, sizeof(chunk), file)) {
+        text.append(chunk, n);
+    }
+    std::fclose(file);
+    const std::string quoted = std::string{"\""} + key + "\"";
+    const size_t at = text.find(quoted);
+    if (at == std::string::npos) {
+        return fallback;
+    }
+    const size_t value = text.find_first_not_of(" \t\r\n:", at + quoted.size());
+    if (value == std::string::npos) {
+        return fallback;
+    }
+    return text.compare(value, 4, "true") == 0;
+}
+
+void InstallMirrorHalfRate(u8* base) {
+    bool wanted = ConfigFlag("mirror_half_rate", false);
+    if (const char* env = std::getenv("RYGT_MIRROR_HALF")) {
+        wanted = env[0] == '1';
+    }
+    if (!wanted) {
+        return;
+    }
+    constexpr u64 kSite = 0x111011a; // RVA of "cmp byte ptr [r13+0x5a8], 0"
+    static const u8 kOriginal[] = {0x41, 0x80, 0xbd, 0xa8, 0x05, 0x00, 0x00, 0x00};
+    u8* site = base + kSite;
+    if (std::memcmp(site, kOriginal, sizeof(kOriginal)) != 0) {
+        std::fprintf(stderr, "[patch] GTS-008: original bytes differ, not applied\n");
+        return;
+    }
+    u8* stub = AllocNear(base);
+    if (!stub) {
+        std::fprintf(stderr, "[patch] GTS-008: no memory near the game's code\n");
+        return;
+    }
+    // cmp byte [r13+0x5a8],0 ; jne skip ; xor byte [rip+toggle],1 ; ret ; skip: ret ; toggle: 0
+    const u8 code[] = {0x41, 0x80, 0xbd, 0xa8, 0x05, 0x00, 0x00, 0x00, // +0  cmp
+                       0x75, 0x08,                                     // +8  jne +18
+                       0x80, 0x35, 0x02, 0x00, 0x00, 0x00, 0x01,       // +10 xor [rip+2],1
+                       0xc3,                                           // +17 ret (ZF from xor)
+                       0xc3,                                           // +18 ret (ZF=0: skip)
+                       0x00};                                          // +19 toggle
+    std::memcpy(stub, code, sizeof(code));
+    u8 call[8] = {0xe8, 0, 0, 0, 0, 0x90, 0x90, 0x90};
+    const s32 rel = static_cast<s32>(reinterpret_cast<s64>(stub) - reinterpret_cast<s64>(site + 5));
+    std::memcpy(call + 1, &rel, 4);
+    Apply(base, Patch{kSite, {std::begin(kOriginal), std::end(kOriginal)},
+                      {std::begin(call), std::end(call)}, "GTS-008 rear-view mirror at half rate"});
+}
+
 void RytyApplyGamePatches() {
+    InstallMirrorHalfRate(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     if (!WetReflectionsWanted()) {
         // jne (reflect when wet) -> two nops
         Apply(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)),
