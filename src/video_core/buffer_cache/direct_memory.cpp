@@ -361,6 +361,15 @@ void DirectMemory::OnUnmap(VAddr address, u64 size) {
         }
         UnmapPages(view.begin, view.end);
         imported_bytes -= view.end - view.begin;
+        // DIAG-132: views dropped while GPU work may still read them.
+        static std::atomic<u32> dropped{};
+        if (const u32 n = ++dropped; n <= 40 || n % 100 == 0) {
+            LOG_WARNING(Render_Vulkan,
+                        "DIAG-132: view {:#x}+{:#x} dropped (unmap {:#x}+{:#x}, tick {}, GPU at "
+                        "{}, {} dropped)",
+                        view.begin, view.end - view.begin, address, size, tick,
+                        scheduler.CurrentTick(), n);
+        }
         {
             std::scoped_lock pending_lk{g_pending_mutex};
             g_pending.push_back({tick, view.alias, view.memory, std::move(view.wrapper)});

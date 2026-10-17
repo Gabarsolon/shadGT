@@ -26,6 +26,7 @@
 #include "video_core/texture_cache/image.h"
 
 #include <algorithm>
+#include <deque>
 #include <array>
 #include <atomic>
 #include <cctype>
@@ -425,8 +426,129 @@ static bool WritePng(const std::filesystem::path& path, const std::span<const u8
     return stbi_write_png_to_func(callback, &file, width, height, 4, rgba.data(), 0);
 }
 
+#ifdef _WIN32
+extern "C" __declspec(dllimport) short __stdcall GetAsyncKeyState(int key);
+#endif
+
+// DIAG-125 (SHADGT_FLASH_WATCH=1): every game frame is read back; a frame much brighter than the
+// one before it (GT Sport's one white frame after a car is picked) is saved with its neighbour.
+// SHADGT_FLASH_WATCH=2 watches only what reaches the screen (no read-back of the game's frames,
+// which changes the timing on the draw queue).
+static int FlashWatchMode() {
+    static const int mode = [] {
+        const char* env = std::getenv("SHADGT_FLASH_WATCH");
+        return env ? std::atoi(env) : 0;
+    }();
+    return mode;
+}
+static bool FlashWatchEnabled() {
+    return FlashWatchMode() == 1;
+}
+static bool FlashWatchScreen() {
+    return FlashWatchMode() != 0;
+}
+
+static void CheckFlashFrame(const ScreenshotReadback& readback) {
+    // Separate history for the game's frames and for what reaches the screen.
+    const size_t k = readback.kind == ScreenshotKind::WithOverlays ? 1 : 0;
+    static std::vector<u8> previous_frames[2];
+    static double previous_means[2] = {-1.0, -1.0};
+    static u32 saved = 0;
+    auto& previous = previous_frames[k];
+    auto& previous_mean = previous_means[k];
+    std::vector<u8> rgba;
+    if (!ConvertReadbackToRgba8(readback, rgba)) {
+        return;
+    }
+#ifdef _WIN32
+    // DIAG-127 flight recorder (SHADGT_FLASH_WATCH=3): the last 240 frames that reached the
+    // screen, at a quarter of their size, are kept; F10 saves them all to
+    // user\screenshots\recorder_<time>\ (numbered, oldest first).
+    if (k == 1 && (FlashWatchMode() == 3 || FlashWatchMode() == 4)) {
+        struct Small {
+            u32 w, h;
+            std::vector<u8> px;
+        };
+        static std::deque<Small> ring;
+        Small small{readback.width / 4, readback.height / 4, {}};
+        small.px.resize(size_t(small.w) * small.h * 4);
+        for (u32 y = 0; y < small.h; ++y) {
+            const u8* src = rgba.data() + (size_t(y) * 4 * readback.width) * 4;
+            u8* dst = small.px.data() + size_t(y) * small.w * 4;
+            for (u32 x = 0; x < small.w; ++x) {
+                std::memcpy(dst + x * 4, src + size_t(x) * 4 * 4, 4);
+                dst[x * 4 + 3] = 255;
+            }
+        }
+        // SHADGT_FLASH_WATCH=4: every frame is written as it comes, to recorder_all_<time>\, for
+        // scripted runs.
+        static const bool write_all = [] {
+            const char* env = std::getenv("SHADGT_FLASH_WATCH");
+            return env && std::atoi(env) == 4;
+        }();
+        if (write_all) {
+            static const auto all_dir = [] {
+                const auto stamp = std::chrono::duration_cast<std::chrono::seconds>(
+                                       std::chrono::system_clock::now().time_since_epoch())
+                                       .count();
+                auto dir = Common::FS::GetUserPath(Common::FS::PathType::ScreenshotsDir) /
+                           fmt::format("recorder_all_{}", stamp);
+                std::filesystem::create_directories(dir);
+                return dir;
+            }();
+            static u32 frame = 0;
+            WritePng(all_dir / fmt::format("{:05}.png", frame++), small.px, small.w, small.h);
+            return;
+        }
+        ring.push_back(std::move(small));
+        if (ring.size() > 240) {
+            ring.pop_front();
+        }
+        if (GetAsyncKeyState(0x79 /* F10 */) & 1) {
+            const auto stamp = std::chrono::duration_cast<std::chrono::seconds>(
+                                   std::chrono::system_clock::now().time_since_epoch())
+                                   .count();
+            const auto dir = Common::FS::GetUserPath(Common::FS::PathType::ScreenshotsDir) /
+                             fmt::format("recorder_{}", stamp);
+            std::filesystem::create_directories(dir);
+            u32 n = 0;
+            for (const auto& f : ring) {
+                WritePng(dir / fmt::format("{:03}.png", n++), f.px, f.w, f.h);
+            }
+            LOG_WARNING(Render_Vulkan, "DIAG-127: saved the last {} frames to {}", n,
+                        dir.string());
+        }
+        return;
+    }
+#endif
+    u64 sum = 0, count = 0;
+    for (size_t i = 0; i + 3 < rgba.size(); i += 4 * 37) {
+        sum += rgba[i] + rgba[i + 1] + rgba[i + 2];
+        count += 3;
+    }
+    const double mean = count ? double(sum) / double(count) : 0.0;
+    if (previous_mean >= 0.0 && mean > previous_mean + 50.0 && mean > 150.0 && saved < 20) {
+        ++saved;
+        const auto dir = Common::FS::GetUserPath(Common::FS::PathType::ScreenshotsDir);
+        std::filesystem::create_directories(dir);
+        const auto stamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                               .count();
+        const char* where = k ? "screen" : "game";
+        WritePng(dir / fmt::format("flash_{}_{}_{}_before.png", saved, where, stamp), previous,
+                 readback.width, readback.height);
+        WritePng(dir / fmt::format("flash_{}_{}_{}_white.png", saved, where, stamp), rgba,
+                 readback.width, readback.height);
+        LOG_WARNING(Render_Vulkan, "DIAG-125: flash {} on the {}: brightness {:.0f} after {:.0f}",
+                    saved, where, mean, previous_mean);
+    }
+    previous_mean = mean;
+    previous = std::move(rgba);
+}
+
 static void SavePendingScreenshot(const ScreenshotReadback& readback) {
     if (readback.paths.empty()) {
+        CheckFlashFrame(readback); // DIAG-125
         return;
     }
 
@@ -758,7 +880,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     std::optional<ScreenshotReadback> pending_screenshot;
 
     // Capture the guest output before any host-side scaling (FSR/PP) is applied.
-    if (capture_game_only_count > 0) {
+    if (capture_game_only_count > 0 || FlashWatchEnabled()) {
         const bool hdr_encoded =
             attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Bt2020Pq;
         auto& readback = pending_screenshot.emplace(
@@ -783,6 +905,17 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
 
     // Continue with host-side passes that draw the displayed (scaled) frame.
 
+    // FIX-121: the flip picture always goes through a layout change before it is read, so the
+    // barrier waits for every write to it. When its tracked state already said "read by
+    // shaders" no barrier was made, and a picture still being written was shown: one white
+    // frame after a car was picked for a race. (Reading every frame back, which made such a
+    // barrier, hid it.) -DisablePerf 143 trusts the tracked state.
+    static const bool flip_barrier = Common::PerfFeatureEnabled(143);
+    if (flip_barrier && capture_game_only_count == 0 && !FlashWatchEnabled()) {
+        draw_scheduler.EndRendering();
+        runtime.Transit(&image, vk::ImageLayout::eTransferSrcOptimal,
+                        vk::PipelineStageFlagBits2::eCopy, vk::AccessFlagBits2::eTransferRead);
+    }
     runtime.Transit(&image, vk::ImageLayout::eShaderReadOnlyOptimal,
                     vk::PipelineStageFlagBits2::eFragmentShader, vk::AccessFlagBits2::eShaderRead);
     runtime.FlushBarriers();
@@ -1086,7 +1219,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         }
         ImGui::Core::Render(cmdbuf, swapchain_image_view, swapchain.GetExtent());
 
-        if (capture_with_overlays_count > 0) {
+        if (capture_with_overlays_count > 0 || FlashWatchScreen()) {
             auto& readback = pending_screenshot.emplace(
                 instance, ScreenshotKind::WithOverlays,
                 BuildScreenshotPaths(ScreenshotKind::WithOverlays, capture_with_overlays_count),

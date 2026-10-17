@@ -194,6 +194,10 @@ public:
     /// Returns true when host-memory shortcuts would bypass rendered image contents.
     [[nodiscard]] bool HasGpuImageAlias(VAddr addr, size_t size);
 
+    /// FIX-122 (direct reads): HasGpuImageAlias with a per-thread memo of 64 KB blocks that
+    /// hold no images, for ranges the GPU would read in place from guest memory.
+    [[nodiscard]] bool DirectReadHitsImage(VAddr addr, size_t size);
+
     /// GPU writes read back to guest memory once the GPU has executed them, so later CPU
     /// accesses do not have to drain the GPU: GDS-to-memory copies (PERF-009) and GPU-written
     /// pages the CPU has faulted on before (PERF-010). Recorded on the GPU thread.

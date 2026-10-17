@@ -186,8 +186,20 @@ static void NoteSkippedDraw() {
                          std::memory_order_relaxed);
 }
 
+#ifdef RYTY_GPU
+bool RytyGtsInRace(); // FIX-110, ryty_game_patch.cpp
+#endif
+
 bool CompileSlowMotion() {
     const s64 last = g_last_skip_ns.load(std::memory_order_relaxed);
+#ifdef RYTY_GPU
+    // FIX-113: a race keeps going at full speed while its new pipelines build (objects show a
+    // moment later instead of the race slowing down). -DisablePerf 136 slows races down too.
+    static const bool race_keeps_going = Common::PerfFeatureEnabled(136);
+    if (race_keeps_going && RytyGtsInRace()) {
+        return false;
+    }
+#endif
     return CompileMode() == 1 && last != 0 &&
            std::chrono::steady_clock::now().time_since_epoch().count() - last < 50'000'000;
 }
@@ -694,6 +706,14 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     if (CompileMode() == 1 && AsyncPipelines()) {
         static std::jthread slow_motion{SlowMotionThread}; // PERF-103
     }
+    // PB-1 (SHADGT_REPLAY_TEST=<folder of <hash>.bin programs>): translates every stored shader
+    // again from its program and its stored record, and counts how many match the stored SPIR-V.
+    if (const char* codes = std::getenv("SHADGT_REPLAY_TEST"); codes && *codes) {
+        static std::jthread replay_test{[this, dir = std::string{codes}] { ReplayTest(dir); }};
+    }
+    if (const char* dir = std::getenv("SHADGT_TEMPLATE_TEST"); dir && *dir) {
+        static std::jthread template_test{[this, d = std::string{dir}] { TemplateTest(d); }};
+    }
     // FIX-078: a quarter of the hardware threads (at least 2) translate read-ahead shaders.
     if (Common::PerfFeatureEnabled(102)) {
         const u32 count = std::max(2u, std::thread::hardware_concurrency() / 4);
@@ -923,9 +943,483 @@ std::shared_ptr<PipelineCache::PipelineBuild> PipelineCache::StartPipelineBuild(
     return build;
 }
 
+// PB-1: one stored shader translated again outside the game, from its program's bytes and the
+// shader record. False when it could not be translated.
+bool ReplayTranslate(const Shader::Profile& profile, Shader::Pools& pools,
+                     const std::vector<u8>& program, const Shader::Info& stored,
+                     const Shader::StageSpecialization& spec, std::vector<u32>& spv) {
+    if (program.size() < 64 || stored.flattened_ud_buf.size() < 16) {
+        return false;
+    }
+    const u8* footer = program.data() + program.size() - 32;
+    u32 bits;
+    std::memcpy(&bits, footer + 8, 4);
+    const u32 length = bits >> 8;
+    if (length == 0 || length > program.size() - 32) {
+        return false;
+    }
+    std::vector<u32> code((program.size() + 3) / 4);
+    std::memcpy(code.data(), program.data(), program.size());
+    std::array<u32, Shader::ShaderParams::NumShaderUserData> user_data{};
+    std::copy_n(stored.flattened_ud_buf.begin(), user_data.size(), user_data.begin());
+    const Shader::ShaderParams params{
+        .user_data = std::span<const u32, Shader::ShaderParams::NumShaderUserData>{user_data},
+        .code = std::span<const u32>{code.data(), length / sizeof(u32)},
+        .hash = stored.pgm_hash,
+    };
+    Shader::Info info(stored.hw_stage, stored.sw_stage, params);
+    // The vertex attribute V#s, from what the record kept of them (number class, swizzle).
+    std::vector<std::array<u32, 4>> sharps;
+    for (const auto& attrib : spec.vs_attribs) {
+        AmdGpu::Buffer buffer{};
+        buffer.base_address = 0x1000;
+        buffer.num_records = 1;
+        buffer.data_format = 14; // 32_32_32_32
+        buffer.num_format = attrib.num_class == AmdGpu::NumberClass::Sint   ? 5
+                            : attrib.num_class == AmdGpu::NumberClass::Uint ? 4
+                                                                            : 7;
+        buffer.dst_sel_x = u32(attrib.dst_select.r);
+        buffer.dst_sel_y = u32(attrib.dst_select.g);
+        buffer.dst_sel_z = u32(attrib.dst_select.b);
+        buffer.dst_sel_w = u32(attrib.dst_select.a);
+        auto& out = sharps.emplace_back();
+        std::memcpy(out.data(), &buffer, sizeof(buffer));
+    }
+    // Tessellation constants: the parts translation uses are in the stored runtime info.
+    Shader::TessellationDataConstantBuffer tess{};
+    if (stored.sw_stage == Shader::SwStage::TessellationControl) {
+        tess.ls_stride = spec.runtime_info.sw.tcs.ls_stride;
+        tess.hs_cp_stride = spec.runtime_info.sw.tcs.hs_output_cp_stride;
+        tess.hs_output_base = spec.runtime_info.sw.tcs.hs_output_base;
+    } else if (stored.sw_stage == Shader::SwStage::TessellationEval) {
+        tess.hs_cp_stride = spec.runtime_info.sw.tes.hs_output_cp_stride;
+    }
+    const Shader::ReplayInputs replay{
+        .flat = &stored.flattened_ud_buf,
+        .fetch = spec.fetch_shader_data.Empty() ? nullptr : &spec.fetch_shader_data,
+        .attrib_sharps = &sharps,
+        .tess_constants = &tess,
+    };
+    Shader::t_replay = &replay;
+    struct Reset {
+        ~Reset() {
+            Shader::t_replay = nullptr;
+        }
+    } reset;
+    auto runtime_info = spec.runtime_info;
+    auto binding = spec.start;
+    try {
+        Common::RecoverableScope recoverable;
+        const auto ir = Shader::TranslateProgram(params.code, pools, info, runtime_info, profile);
+        spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir, binding);
+    } catch (...) {
+        return false;
+    }
+    return true;
+}
+
+// PB-1: shader records without their SPIR-V (put in the store by RyGT's Set up, with the
+// programs they were made from in <cache>\<serial>-programs) are translated here, on this PC,
+// before the stored pipelines are built.
+void PipelineCache::RebuildFromPrograms() {
+    const auto& serial = Common::ElfInfo::Instance().GameSerial();
+    const auto dir = Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
+                     (std::string{serial} + "-programs");
+    std::error_code ec;
+    if (!std::filesystem::is_directory(dir, ec)) {
+        return;
+    }
+    auto& store = Storage::DataBase::Instance();
+    const auto start = std::chrono::steady_clock::now();
+    Shader::Pools pools;
+    u64 rebuilt = 0, failed = 0, no_program = 0;
+    for (const auto& [name, time] : store.ListBlobs(Storage::BlobType::ShaderMeta)) {
+        std::vector<u8> blob;
+        store.Load(Storage::BlobType::ShaderMeta, name, blob);
+        Shader::Info info{};
+        Shader::StageSpecialization spec{};
+        spec.info = &info;
+        size_t perm_idx{};
+        Serialization::Archive ar{std::move(blob)};
+        try {
+            Common::RecoverableScope recoverable;
+            if (ar.SizeBytes() < 24 || !LoadShaderMeta(ar, info, spec, perm_idx)) {
+                continue;
+            }
+        } catch (...) {
+            continue;
+        }
+        const auto spv_name = fmt::format("{:#018x}_{}", info.pgm_hash, perm_idx);
+        if (store.Exists(Storage::BlobType::ShaderBinary, spv_name)) {
+            continue;
+        }
+        std::vector<u8> program;
+        if (Common::FS::IOFile file{dir / fmt::format("{:016x}.bin", info.pgm_hash),
+                                    Common::FS::FileAccessMode::Read};
+            file.IsOpen()) {
+            program.resize(file.GetSize());
+            file.ReadSpan(std::span{program});
+        }
+        if (program.empty()) {
+            ++no_program;
+            continue;
+        }
+        std::vector<u32> spv;
+        if (!ReplayTranslate(profile, pools, program, info, spec, spv)) {
+            ++failed;
+            continue;
+        }
+        RegisterShaderBinary(std::move(spv), info.pgm_hash, perm_idx);
+        ++rebuilt;
+    }
+    if (rebuilt + failed + no_program != 0) {
+        LOG_WARNING(Render_Vulkan,
+                    "PB-1: {} shaders translated from this PC's game files in {:.1f} s ({} failed, "
+                    "{} without their program)",
+                    rebuilt,
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(),
+                    failed, no_program);
+    }
+}
+
+// PB-2 (SHADGT_TEMPLATE_TEST=<folder>): for the programs in <folder>\unseen.txt, how many of
+// their stored records have the same specialization as a record of another program (a
+// "template" an unseen program could borrow), and for pipelines of two unseen programs, how far
+// apart the vertex and fragment programs sit in their file (<folder>\slots.tsv: hash, path,
+// slot). Results in the log.
+void PipelineCache::TemplateTest(const std::string& dir) {
+    Common::SetCurrentThreadName("shadGT:TemplateTest");
+    std::unordered_set<u64> unseen;
+    {
+        std::ifstream in{std::filesystem::path{dir} / "unseen.txt"};
+        std::string line;
+        while (std::getline(in, line)) {
+            if (!line.empty()) unseen.insert(std::stoull(line, nullptr, 16));
+        }
+    }
+    std::unordered_map<u64, std::pair<std::string, int>> slots;
+    {
+        std::ifstream in{std::filesystem::path{dir} / "slots.tsv"};
+        std::string h, path, slot;
+        while (std::getline(in, h, '\t') && std::getline(in, path, '\t') && std::getline(in, slot)) {
+            slots[std::stoull(h, nullptr, 16)] = {path, std::stoi(slot)};
+        }
+    }
+    struct Record {
+        u64 pgm;
+        std::unique_ptr<Shader::Info> info;
+        Shader::StageSpecialization spec;
+    };
+    std::vector<Record> records;
+    std::unordered_map<u64, u64> perm_to_pgm;
+    auto& store = Storage::DataBase::Instance();
+    for (const auto& [name, time] : store.ListBlobs(Storage::BlobType::ShaderMeta)) {
+        std::vector<u8> blob;
+        store.Load(Storage::BlobType::ShaderMeta, name, blob);
+        Record r;
+        r.info = std::make_unique<Shader::Info>();
+        r.spec.info = r.info.get();
+        size_t perm_idx{};
+        Serialization::Archive ar{std::move(blob)};
+        try {
+            Common::RecoverableScope recoverable;
+            if (ar.SizeBytes() < 24 || !LoadShaderMeta(ar, *r.info, r.spec, perm_idx)) continue;
+        } catch (...) {
+            continue;
+        }
+        r.spec.info = r.info.get();
+        r.pgm = r.info->pgm_hash;
+        perm_to_pgm[std::stoull(name, nullptr, 16)] = r.pgm;
+        records.push_back(std::move(r));
+    }
+    u64 tried = 0, matched = 0, by_stage_tried[8]{}, by_stage_matched[8]{};
+    std::map<std::string, u64> reasons;
+    for (const auto& p : records) {
+        if (!unseen.contains(p.pgm)) continue;
+        ++tried;
+        const u32 stage = std::min<u32>(u32(p.info->sw_stage), 7);
+        ++by_stage_tried[stage];
+        bool found = false;
+        const char* best_reason = "no record of that stage";
+        for (const auto& t : records) {
+            if (unseen.contains(t.pgm) || t.info->sw_stage != p.info->sw_stage) continue;
+            if (t.spec == p.spec) {
+                found = true;
+                break;
+            }
+            u32 index{};
+            if (const char* why = t.spec.FirstDifference(p.spec, index)) best_reason = why;
+        }
+        if (found) {
+            ++matched;
+            ++by_stage_matched[stage];
+        } else {
+            ++reasons[best_reason];
+        }
+    }
+    std::string why_text;
+    for (const auto& [why, n] : reasons) why_text += fmt::format(" {}={}", why, n);
+    LOG_WARNING(Render_Vulkan,
+                "PB-2 templates: {} records of unseen programs, {} have the specialization of a "
+                "record of another program; by stage (same/all) fs {}/{} vs {}/{} cs {}/{}; last "
+                "difference of the others:{}",
+                tried, matched, by_stage_matched[0], by_stage_tried[0], by_stage_matched[3],
+                by_stage_tried[3], by_stage_matched[5], by_stage_tried[5], why_text);
+    // Vertex/fragment pairs of unseen programs: their distance in the file.
+    std::map<int, u64> distance;
+    u64 pairs = 0, other_file = 0, no_slot = 0, fs_unseen_pipelines = 0, fs_unseen_vs_known = 0;
+    std::unordered_map<u64, u64> known_vs;
+    for (const auto& [name, time] : store.ListBlobs(Storage::BlobType::PipelineKey)) {
+        if (!name.starts_with("g_")) continue;
+        std::vector<u8> blob;
+        store.Load(Storage::BlobType::PipelineKey, name, blob);
+        GraphicsPipelineKey key{};
+        GraphicsPipeline::SerializationSupport sdata{};
+        try {
+            Common::RecoverableScope recoverable;
+            if (!LoadStoredGraphicsPipeline(std::move(blob), key, sdata)) continue;
+        } catch (...) {
+            continue;
+        }
+        const auto vs = perm_to_pgm.find(key.stage_hashes[u32(Shader::SwStage::Vertex)]);
+        const auto fs = perm_to_pgm.find(key.stage_hashes[u32(Shader::SwStage::Fragment)]);
+        if (vs != perm_to_pgm.end() && fs != perm_to_pgm.end() && unseen.contains(fs->second)) {
+            ++fs_unseen_pipelines;
+            if (!unseen.contains(vs->second)) {
+                ++fs_unseen_vs_known;
+                known_vs[vs->second]++;
+            }
+        }
+        if (vs == perm_to_pgm.end() || fs == perm_to_pgm.end() || !unseen.contains(vs->second) ||
+            !unseen.contains(fs->second)) {
+            continue;
+        }
+        ++pairs;
+        const auto a = slots.find(vs->second);
+        const auto b = slots.find(fs->second);
+        if (a == slots.end() || b == slots.end()) {
+            ++no_slot;
+        } else if (a->second.first != b->second.first) {
+            ++other_file;
+        } else {
+            ++distance[std::clamp(b->second.second - a->second.second, -9, 9)];
+        }
+    }
+    std::string dist_text;
+    for (const auto& [d, n] : distance) dist_text += fmt::format(" {}:{}", d, n);
+    LOG_WARNING(Render_Vulkan,
+                "PB-2 pairs: {} pipelines of two unseen programs; {} in different files, {} "
+                "without a slot; fragment slot minus vertex slot (count):{}",
+                pairs, other_file, no_slot, dist_text);
+    // Simulation of the loading-screen rule: a pipeline of an unseen fragment program P and a
+    // known vertex permutation V is predicted when a known pipeline with the same V and the same
+    // state (everything but the fragment stage) has a fragment record whose specialization is
+    // P's. Counts how many of the real pipelines would have been predicted, and how many
+    // candidates the rule makes.
+    {
+        std::unordered_map<u64, const Record*> rec_by_perm;
+        for (const auto& [perm, pgm] : perm_to_pgm) {
+            (void)pgm;
+        }
+        // perm hash -> record (records are in ListBlobs order; rebuild a map from names)
+        std::unordered_map<u64, size_t> perm_index;
+        {
+            size_t i = 0;
+            for (const auto& [name, time] : store.ListBlobs(Storage::BlobType::ShaderMeta)) {
+                (void)time;
+                if (i < records.size()) {
+                    perm_index[std::stoull(name, nullptr, 16)] = i;
+                }
+                ++i;
+            }
+        }
+        struct Known {
+            GraphicsPipelineKey key;
+        };
+        std::unordered_map<u64, std::vector<GraphicsPipelineKey>> known_by_vs;
+        std::vector<GraphicsPipelineKey> wanted;
+        const u32 vs_i = u32(Shader::SwStage::Vertex), fs_i = u32(Shader::SwStage::Fragment);
+        for (const auto& [name, time] : store.ListBlobs(Storage::BlobType::PipelineKey)) {
+            if (!name.starts_with("g_")) continue;
+            std::vector<u8> blob;
+            store.Load(Storage::BlobType::PipelineKey, name, blob);
+            GraphicsPipelineKey key{};
+            GraphicsPipeline::SerializationSupport sdata{};
+            try {
+                Common::RecoverableScope recoverable;
+                if (!LoadStoredGraphicsPipeline(std::move(blob), key, sdata)) continue;
+            } catch (...) {
+                continue;
+            }
+            const auto vs = perm_to_pgm.find(key.stage_hashes[vs_i]);
+            const auto fs = perm_to_pgm.find(key.stage_hashes[fs_i]);
+            if (vs == perm_to_pgm.end() || fs == perm_to_pgm.end() || unseen.contains(vs->second)) {
+                continue;
+            }
+            if (unseen.contains(fs->second)) {
+                wanted.push_back(key);
+            } else {
+                known_by_vs[key.stage_hashes[vs_i]].push_back(key);
+            }
+        }
+        u64 predicted = 0, candidates = 0;
+        for (const auto& want : wanted) {
+            const auto it = known_by_vs.find(want.stage_hashes[vs_i]);
+            if (it == known_by_vs.end()) continue;
+            const auto pi = perm_index.find(want.stage_hashes[fs_i]);
+            if (pi == perm_index.end() || pi->second >= records.size()) continue;
+            const auto& p_spec = records[pi->second].spec;
+            bool hit = false;
+            for (const auto& known : it->second) {
+                GraphicsPipelineKey a = want, b = known;
+                a.stage_hashes[fs_i] = 0;
+                b.stage_hashes[fs_i] = 0;
+                if (!(a == b)) continue;
+                ++candidates;
+                const auto ti = perm_index.find(known.stage_hashes[fs_i]);
+                if (ti != perm_index.end() && ti->second < records.size() &&
+                    records[ti->second].spec == p_spec) {
+                    hit = true;
+                }
+            }
+            predicted += hit ? 1 : 0;
+        }
+        LOG_WARNING(Render_Vulkan,
+                    "PB-2 prediction: {} pipelines of unseen fragment and known vertex programs; "
+                    "{} predicted by a known pipeline with the same vertex permutation and state "
+                    "and an equal fragment specialization ({} same-state candidates in all)",
+                    wanted.size(), predicted, candidates);
+    }
+    std::vector<std::pair<u64, u64>> top(known_vs.begin(), known_vs.end());
+    std::ranges::sort(top, [](const auto& a, const auto& b) { return a.second > b.second; });
+    std::string top_text;
+    for (size_t i = 0; i < std::min<size_t>(top.size(), 8); ++i) {
+        const auto s = slots.find(top[i].first);
+        top_text += fmt::format(" {:#x}x{} ({})", top[i].first, top[i].second,
+                                s != slots.end() ? s->second.first : "not in the files");
+    }
+    LOG_WARNING(Render_Vulkan,
+                "PB-2 unseen fragment shaders: {} pipelines, {} with a vertex shader seen before "
+                "({} different ones); most used:{}",
+                fs_unseen_pipelines, fs_unseen_vs_known, known_vs.size(), top_text);
+}
+
+void PipelineCache::ReplayTest(const std::string& dir) {
+    Common::SetCurrentThreadName("shadGT:ReplayTest");
+    auto& store = Storage::DataBase::Instance();
+    const auto metas = store.ListBlobs(Storage::BlobType::ShaderMeta);
+    Shader::Pools pools;
+    u64 tested = 0, same = 0, differ = 0, failed = 0, no_program = 0, by_stage_same[8]{}, by_stage_all[8]{};
+    std::vector<std::string> identical, not_identical;
+    for (const auto& [name, time] : metas) {
+        std::vector<u8> blob;
+        store.Load(Storage::BlobType::ShaderMeta, name, blob);
+        Shader::Info info{};
+        Shader::StageSpecialization spec{};
+        spec.info = &info;
+        size_t perm_idx{};
+        Serialization::Archive ar{std::move(blob)};
+        try {
+            Common::RecoverableScope recoverable;
+            if (ar.SizeBytes() < 24 || !LoadShaderMeta(ar, info, spec, perm_idx)) {
+                continue;
+            }
+        } catch (...) {
+            continue;
+        }
+        const auto path = std::filesystem::path{dir} / fmt::format("{:016x}.bin", info.pgm_hash);
+        std::vector<u8> program;
+        if (Common::FS::IOFile file{path, Common::FS::FileAccessMode::Read}; file.IsOpen()) {
+            program.resize(file.GetSize());
+            file.ReadSpan(std::span{program});
+        }
+        if (program.empty()) {
+            ++no_program;
+            not_identical.push_back(fmt::format("{}\t{:016x}", name, info.pgm_hash));
+            continue;
+        }
+        std::vector<u32> stored_spv;
+        store.Load(Storage::BlobType::ShaderBinary, fmt::format("{:#018x}_{}", info.pgm_hash, perm_idx),
+                   stored_spv);
+        std::vector<u32> spv;
+        ++tested;
+        const u32 stage = std::min<u32>(u32(info.sw_stage), 7);
+        ++by_stage_all[stage];
+        if (!ReplayTranslate(profile, pools, program, info, spec, spv)) {
+            ++failed;
+            not_identical.push_back(fmt::format("{}\t{:016x}", name, info.pgm_hash));
+        } else if (spv == stored_spv) {
+            ++same;
+            ++by_stage_same[stage];
+            identical.push_back(fmt::format("{}\t{:016x}", name, info.pgm_hash));
+        } else {
+            ++differ;
+            not_identical.push_back(fmt::format("{}\t{:016x}", name, info.pgm_hash));
+            if (differ <= 10) {
+                LOG_WARNING(Render_Vulkan, "PB-1: {} differs (stage {}, {} vs {} words)", name,
+                            stage, spv.size(), stored_spv.size());
+            }
+        }
+    }
+    LOG_WARNING(Render_Vulkan,
+                "PB-1 replay test: {} shaders tested, {} identical, {} different, {} failed, {} "
+                "without a program file; identical by stage (sw stage: same/all): {}/{} {}/{} {}/{} "
+                "{}/{} {}/{} {}/{}",
+                tested, same, differ, failed, no_program, by_stage_same[0], by_stage_all[0],
+                by_stage_same[1], by_stage_all[1], by_stage_same[2], by_stage_all[2],
+                by_stage_same[3], by_stage_all[3], by_stage_same[4], by_stage_all[4],
+                by_stage_same[5], by_stage_all[5]);
+    // The records that translate back exactly, for RyGT's shader pack.
+    std::ofstream list{Common::FS::GetUserPath(Common::FS::PathType::LogDir) / "replay_identical.txt"};
+    for (const auto& name : identical) {
+        list << name << '\n';
+    }
+    // The others: a program is shipped only with all of its permutations (their indices are
+    // the store's, and a gap made the renderer build one pipeline again and again).
+    std::ofstream other{Common::FS::GetUserPath(Common::FS::PathType::LogDir) / "replay_other.txt"};
+    for (const auto& name : not_identical) {
+        other << name << '\n';
+    }
+}
+
+bool PipelineCache::LegacyWaits() const {
+    // FIX-119: a pipeline of the old renderer's translations (D10) is built at once, as the
+    // driver usually has it already. Not in a race: there one the driver did not have stopped
+    // the game for up to seconds (19.7 s of such waits in one test race); it builds in the
+    // background like the rest. -DisablePerf 141 waits for them in races too.
+    if (!key_uses_legacy) {
+        return false;
+    }
 #ifdef RYTY_GPU
-bool RytyGtsInRace(); // FIX-110, ryty_game_patch.cpp
+    static const bool skip_in_races = Common::PerfFeatureEnabled(141);
+    if (skip_in_races && RytyGtsInRace()) {
+        return false;
+    }
 #endif
+    return true;
+}
+
+std::chrono::microseconds PipelineCache::QuickWait() {
+    // FIX-114: a draw whose new pipeline is building waits for it a little, so the pipelines
+    // that build quickly (the driver had them, or small ones) are drawn at once and only the
+    // slow ones pop in a moment later. At most 4 ms of waiting in any 16 ms, 2 ms per draw.
+    // -DisablePerf 137 skips without waiting.
+    static const bool enabled = Common::PerfFeatureEnabled(137);
+    if (!enabled) {
+        return std::chrono::microseconds{0};
+    }
+    using namespace std::chrono;
+    static thread_local steady_clock::time_point window{};
+    static thread_local microseconds used{};
+    const auto now = steady_clock::now();
+    if (now - window > milliseconds{16}) {
+        window = now;
+        used = microseconds{0};
+    }
+    const auto wait = std::clamp(microseconds{4000} - used, microseconds{0}, microseconds{2000});
+    used += wait; // charged up front: simple, and errs on the side of fewer waits
+    return wait;
+}
 
 bool PipelineCache::MenusWait() {
     // FIX-110: in GT Sport's menus a draw waits for its new pipeline (the guest clocks are held
@@ -1392,7 +1886,8 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
         if (pending != pending_builds.end() &&
             (pending->second->preloading || pending->second->async)) {
             auto stored = pending->second;
-            if (stored->done.wait_for(std::chrono::seconds{0}) == std::future_status::ready) {
+            if (stored->done.wait_for(stored->async ? QuickWait() : std::chrono::microseconds{0}) ==
+                std::future_status::ready) {
                 // PERF-038: built in the background before the draw needed it; no miss.
                 pending_builds.erase(pending);
                 stored->pipeline->SetStageInfos(infos);
@@ -1405,7 +1900,7 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
                 }
                 return it->second.get();
             }
-            if (stored->async && !key_uses_legacy && !WritesMemory(infos) && !NeverSkipped(infos) &&
+            if (stored->async && !LegacyWaits() && !WritesMemory(infos) && !NeverSkipped(infos) &&
                 !MenusWait()) {
                 // PERF-076: still building; this draw is skipped, the next ones look again.
                 graphics_pipelines.erase(it);
@@ -1461,9 +1956,9 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
         // and the game goes on in slow motion until it is built.
         // D10: a pipeline of old translations is built right away (the driver usually has it
         // from the old renderer's sessions, so it takes milliseconds).
-        if (build && AsyncPipelines() && !key_uses_legacy && !WritesMemory(infos) &&
+        if (build && AsyncPipelines() && !LegacyWaits() && !WritesMemory(infos) &&
             !NeverSkipped(infos) && !MenusWait() &&
-            build->done.wait_for(std::chrono::seconds{0}) != std::future_status::ready) {
+            build->done.wait_for(QuickWait()) != std::future_status::ready) {
             build->async = true;
             pending_builds[graphics_key] = build;
             graphics_pipelines.erase(it);
@@ -1489,12 +1984,20 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
             Common::GetWorkCounters().pipeline_wait_us += u64(
                 std::chrono::duration_cast<std::chrono::microseconds>(now - wait_start).count());
             RyDiag::RecordElapsed(RyDiag::Zone::PipelineWait, now - wait_start, pipeline_hash);
+            // DIAG-124: why this draw waited instead of being skipped.
+            std::string why;
+            if (!AsyncPipelines()) why += " no-async";
+            if (key_uses_legacy) why += " legacy";
+            if (WritesMemory(infos)) why += " writes-memory";
+            if (NeverSkipped(infos)) why += " tessellation";
+            if (MenusWait()) why += " menus";
             LOG_WARNING(Render_Vulkan,
                         "Pipeline {:#x} {}: built {:.1f} ms after it was queued, draw waited "
-                        "{:.1f} ms",
+                        "{:.1f} ms (DIAG-124:{})",
                         pipeline_hash, predicted ? "read ahead" : "on demand",
                         std::chrono::duration<double, std::milli>(now - build->queued).count(),
-                        std::chrono::duration<double, std::milli>(now - wait_start).count());
+                        std::chrono::duration<double, std::milli>(now - wait_start).count(),
+                        why.empty() ? " ready within the quick wait" : why);
             build->pipeline->SetStageInfos(infos);
             sdata = build->sdata;
             it.value() = std::move(build->pipeline);
@@ -2136,6 +2639,7 @@ void PipelineCache::PrewarmRead(std::stop_token stop) {
     }
 #endif
     auto& store = Storage::DataBase::Instance();
+    RebuildFromPrograms(); // PB-1
     // The profile file is written only when missing (by the removed precompile), so it can be
     // older than most entries: GT Sport's is from October 6, the store's entries from October 6
     // to 9. A draw's first use loads the same stored SPIR-V without checking it (PERF-032), so
@@ -2383,7 +2887,16 @@ bool PipelineCache::NeverSkipped(const std::array<const Shader::Info*, MaxShader
     // FIX-064: tessellated draws wait for their pipeline. On GT Sport's race summary they are
     // the driver figure; skipped while each of its pipelines built, parts of it blinked out
     // frame after frame. -DisablePerf 88 skips them like other draws.
+    // FIX-115: not during a race, though: there a tessellated car or road part that builds for
+    // 0.3-2 s stopped the race that long. It shows a moment later instead (the quick wait still
+    // draws the ones that build fast). -DisablePerf 138 waits in races too.
     static const bool wait_for_tessellation = Common::PerfFeatureEnabled(88);
+    static const bool skip_in_races = Common::PerfFeatureEnabled(138);
+#ifdef RYTY_GPU
+    if (skip_in_races && RytyGtsInRace()) {
+        return false;
+    }
+#endif
     return wait_for_tessellation && infos[u32(Shader::SwStage::TessellationControl)] != nullptr;
 }
 

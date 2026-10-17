@@ -2261,6 +2261,56 @@ bool BufferCache::HasGpuImageAlias(VAddr addr, size_t size) {
     return found;
 }
 
+bool BufferCache::DirectReadHitsImage(VAddr addr, size_t size) {
+    // FIX-122: a range the GPU reads in place must not hold a picture the GPU drew into: its
+    // pixels are in the image, not in guest memory, until they are exported (the usual path
+    // exports them first). GT Sport reads such ranges on its car screens; read in place, about
+    // one frame in ten had the car view blown out to white and the dashboard panel white or
+    // magenta, and the frame after picking a car flashed white. Most ranges are constant and
+    // vertex rings in blocks that hold no images, so those are remembered per thread until an
+    // image is registered or unregistered. -DisablePerf 144 reads in place as before.
+    static const bool enabled = Common::PerfFeatureEnabled(144);
+    if (!enabled || size == 0) {
+        return false;
+    }
+    constexpr u32 BlockBits = 16;
+    struct Block {
+        VAddr block;
+        u64 generation;
+    };
+    thread_local std::vector<Block> free_blocks(4096, Block{~VAddr{0}, 0});
+    const u64 generation = texture_cache.RegistryGeneration();
+    const VAddr first = addr >> BlockBits;
+    const VAddr last = (addr + size - 1) >> BlockBits;
+    if (last - first < 64) {
+        bool all_free = true;
+        for (VAddr block = first; all_free && block <= last; ++block) {
+            auto& entry = free_blocks[block % free_blocks.size()];
+            if (entry.block == block && entry.generation == generation) {
+                continue;
+            }
+            bool any = false;
+            {
+                std::scoped_lock buffer_lock{mutex};
+                texture_cache.ForEachImageInRegion(block << BlockBits, VAddr{1} << BlockBits,
+                                                   [&](ImageId, Image&) {
+                                                       any = true;
+                                                       return true;
+                                                   });
+            }
+            if (any) {
+                all_free = false;
+            } else {
+                entry = {block, generation};
+            }
+        }
+        if (all_free) {
+            return false;
+        }
+    }
+    return HasGpuImageAlias(addr, size);
+}
+
 void BufferCache::SynchronizeDmaBuffers() {
     std::scoped_lock buffer_lock{mutex}; // PERF-067
     RecordPendingAheadUploads(0, ~u64{0} >> 1);

@@ -3170,6 +3170,25 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 RecordLabelWrite(
                     write_data->Address<VAddr>(), std::move(label),
                     [this, address = write_data->Address<VAddr>(), data = std::move(data)] {
+                        // DIAG-130 (SHADGT_DIRECT_HOLD_COMPUTE=1): with the direct renderer the
+                        // label waits for the GPU like graphics labels do.
+                        static const bool hold = [] {
+                            const char* env = std::getenv("SHADGT_DIRECT_HOLD_COMPUTE");
+                            return env && env[0] == '1';
+                        }();
+                        if (hold && rasterizer &&
+                            rasterizer->GetBufferCache().GetDirectMemory() != nullptr) {
+                            const std::vector<u8> value = data;
+                            if (rasterizer->DeferFenceSignal(
+                                    address,
+                                    [address, data] {
+                                        WriteDeferredFence(reinterpret_cast<void*>(address),
+                                                           data.data(), u32(data.size()));
+                                    },
+                                    true, value, true)) {
+                                return;
+                            }
+                        }
                         if (rasterizer) {
                             rasterizer->OnFence(Vulkan::Rasterizer::DrainSource::AscWriteData);
                         }

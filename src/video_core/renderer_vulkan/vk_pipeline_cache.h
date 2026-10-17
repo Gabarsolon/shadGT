@@ -153,6 +153,16 @@ private:
     static bool CancelBuild(PipelineBuild& build);
     /// FIX-110: in the menus draws wait for new pipelines instead of being skipped.
     static bool MenusWait();
+    /// FIX-114: how long a draw may wait for its building pipeline before it is skipped.
+    static std::chrono::microseconds QuickWait();
+    /// FIX-119: whether this draw's old-renderer (D10) pipeline is waited for.
+    bool LegacyWaits() const;
+    /// PB-1: SHADGT_REPLAY_TEST, see the constructor.
+    void ReplayTest(const std::string& dir);
+    /// PB-2: SHADGT_TEMPLATE_TEST, see the constructor.
+    void TemplateTest(const std::string& dir);
+    /// PB-1: translates stored shader records that have no SPIR-V yet from this PC's programs.
+    void RebuildFromPrograms();
     /// PERF-038: queues a stored pipeline's build behind all other builds.
     void QueueBackgroundBuild(const std::shared_ptr<PipelineBuild>& build);
     /// PERF-038: on this thread, between draws: takes stored pipelines the reader thread

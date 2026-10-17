@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <filesystem>
+#include <array>
 #include <map>
+#include <mutex>
 #include <deque>
 #include <fstream>
 #include <optional>
@@ -16,6 +18,7 @@
 #include "common/perf_monitor.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
+#include "core/guest_hash.h"
 #include "core/memory.h"
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -2339,15 +2342,161 @@ extern std::atomic<u64> g_defer_address;
 extern std::atomic<u64> g_defer_order;
 extern std::atomic<u64> g_defer_unflushed; // D5
 
+// DIAG-129 (SHADGT_DIAG_DIRECT_HAZARD=1): ranges recently bound as written, checked against the
+// ranges the GPU reads in place. An overlap means an in-place read can see bytes a shader wrote
+// into a cached copy that guest memory does not have yet.
+static bool DirectHazardDiag() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("SHADGT_DIAG_DIRECT_HAZARD");
+        return env && env[0] == '1';
+    }();
+    return enabled;
+}
+struct WrittenRange {
+    VAddr address;
+    u64 size;
+    u64 hash;
+};
+static std::mutex g_written_mutex;
+static std::array<WrittenRange, 4096> g_written_ranges{};
+static u32 g_written_next = 0;
+static void NoteWrittenRange(VAddr address, u64 size, u64 hash) {
+    std::scoped_lock lk{g_written_mutex};
+    g_written_ranges[g_written_next++ % g_written_ranges.size()] = {address, size, hash};
+}
+static void CheckInPlaceHazard(const char* what, VAddr address, u64 size, u64 reader) {
+    std::scoped_lock lk{g_written_mutex};
+    static std::unordered_set<u64> seen;
+    for (const auto& w : g_written_ranges) {
+        if (w.size == 0 || w.address >= address + size || address >= w.address + w.size) {
+            continue;
+        }
+        const u64 key = reader * 31 + w.hash;
+        if (seen.size() < 400 && seen.insert(key).second) {
+            LOG_WARNING(Render_Vulkan,
+                        "DIAG-129: {} read in place {:#x}+{:#x} by {:#x} overlaps written "
+                        "{:#x}+{:#x} by {:#x}",
+                        what, address, size, reader, w.address, w.size, w.hash);
+        }
+        return;
+    }
+}
+
+// FIX-123: ranges a shader wrote recently are not read in place. The written bytes live in the
+// buffer cache's copy until they are read back, and the GPU-written mark of a range can be gone
+// before guest memory has them: GT Sport's compute shader 0xa82d2fe writes 64-byte records that
+// dozens of later shaders read, and read in place they saw stale bytes (car screens: the car
+// view blown out to white, the dashboard panel white or magenta, the white frame after picking a
+// car). Writes are remembered for 250 ms by 1 KB block (reads up to 64 KB) and by 1 MB block
+// (larger reads), in direct-mapped tables. -DisablePerf 145 reads them in place as before.
+namespace {
+constexpr u32 FineBits = 10;
+constexpr u32 CoarseBits = 20;
+constexpr u64 RecentWriteMs = 250;
+std::array<std::atomic<u64>, 1u << 20> g_fine_writes{};
+std::array<std::atomic<u64>, 1u << 14> g_coarse_writes{};
+u32 NowMs() {
+    return u32(std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch())
+                   .count());
+}
+bool RecentWritesEnabled() {
+    static const bool enabled = Common::PerfFeatureEnabled(145);
+    return enabled;
+}
+template <size_t N>
+void MarkBlocks(std::array<std::atomic<u64>, N>& table, u32 bits, VAddr address, u64 size,
+                u32 now) {
+    const u64 first = address >> bits;
+    const u64 last = (address + size - 1) >> bits;
+    for (u64 block = first; block <= last; ++block) {
+        table[block % N].store((block << 32) | now, std::memory_order_relaxed);
+    }
+}
+template <size_t N>
+bool AnyRecent(const std::array<std::atomic<u64>, N>& table, u32 bits, VAddr address, u64 size,
+               u32 now) {
+    const u64 first = address >> bits;
+    const u64 last = (address + size - 1) >> bits;
+    for (u64 block = first; block <= last; ++block) {
+        const u64 entry = table[block % N].load(std::memory_order_relaxed);
+        if ((entry >> 32) == block && u32(now - u32(entry)) < RecentWriteMs) {
+            return true;
+        }
+    }
+    return false;
+}
+} // namespace
+
+bool RytyGtsInRace(); // FIX-110, ryty_game_patch.cpp
+
+// FIX-124: outside races buffers are not read in place. GT Sport's car screens still showed a
+// blown-out car or a white dashboard panel every few seconds with FIX-122/123 (no cause found
+// yet; it needs small and large ranges read in place together). The menus run at 60 fps either
+// way; races keep the direct reads. -DisablePerf 146 reads in place everywhere.
+static bool DirectReadsHere() {
+    static const bool menus_off = Common::PerfFeatureEnabled(146);
+    return !menus_off || RytyGtsInRace();
+}
+
+// FIX-125: graphics fences wait for the GPU only while buffers are read in place (and for 2 s
+// after the last such read). The wait is what makes in-place reads safe, but it changes the
+// game's frame pacing: GT Sport's frosted-glass bars (top bar, car list) lost their blur about
+// every third frame in the menus, where FIX-124 reads nothing in place anyway.
+// -DisablePerf 147 holds them always.
+static std::atomic<u32> g_last_direct_read_ms{0};
+static void NoteDirectRead() {
+    g_last_direct_read_ms.store(NowMs() | 1, std::memory_order_relaxed);
+}
+static bool DirectReadsRecently() {
+    static const bool enabled = Common::PerfFeatureEnabled(147);
+    if (!enabled) {
+        return true;
+    }
+    const u32 last = g_last_direct_read_ms.load(std::memory_order_relaxed);
+    return last != 0 && u32(NowMs() - last) < 2000;
+}
+
+static void NoteShaderWrite(VAddr address, u64 size) {
+    if (!RecentWritesEnabled() || size == 0) {
+        return;
+    }
+    const u32 now = NowMs();
+    if (size <= (u64{16} << 20)) {
+        MarkBlocks(g_fine_writes, FineBits, address, size, now);
+    }
+    MarkBlocks(g_coarse_writes, CoarseBits, address, size, now);
+}
+
+static bool WrittenRecently(VAddr address, u64 size) {
+    if (!RecentWritesEnabled() || size == 0) {
+        return false;
+    }
+    const u32 now = NowMs();
+    if (size <= (u64{64} << 10)) {
+        return AnyRecent(g_fine_writes, FineBits, address, size, now);
+    }
+    return AnyRecent(g_coarse_writes, CoarseBits, address, size, now);
+}
+
 std::optional<std::pair<const VideoCore::Buffer*, u64>> Rasterizer::DirectReadBuffer(VAddr address,
                                                                                     u64 size) {
     // D6: a range only the CPU writes, read by the GPU in place (vertex and index buffers).
     auto* direct = buffer_cache.GetDirectMemory();
     if (!direct || size == 0 || direct->IsVolatile(address, size) ||
-        !direct->EnsureImported(address, size) || buffer_cache.IsRegionGpuModified(address, size)) {
+        !direct->EnsureImported(address, size) || buffer_cache.IsRegionGpuModified(address, size) ||
+        WrittenRecently(address, size) || !DirectReadsHere() || // FIX-123, FIX-124
+        buffer_cache.DirectReadHitsImage(address, size)) { // FIX-122
         return std::nullopt;
     }
-    return direct->FindBuffer(address, size);
+    if (DirectHazardDiag()) {
+        CheckInPlaceHazard("vertex/index", address, size, 0);
+    }
+    auto found = direct->FindBuffer(address, size);
+    if (found) {
+        NoteDirectRead(); // FIX-125
+    }
+    return found;
 }
 
 void Rasterizer::FlushDeferredFences() {
@@ -2423,8 +2572,14 @@ bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& 
     const bool no_hold =
         no_hold_after != ~u64{0} &&
         std::chrono::steady_clock::now() - hold_start > std::chrono::seconds(no_hold_after);
-    const bool direct_hold =
-        !no_hold && !compute_queue && buffer_cache.GetDirectMemory() != nullptr;
+    // DIAG-130 (SHADGT_DIRECT_HOLD_COMPUTE=1): compute-queue fences wait for the GPU too.
+    static const bool hold_compute = [] {
+        const char* env = std::getenv("SHADGT_DIRECT_HOLD_COMPUTE");
+        return env && env[0] == '1';
+    }();
+    const bool direct_hold = !no_hold && (!compute_queue || hold_compute) &&
+                             buffer_cache.GetDirectMemory() != nullptr &&
+                             DirectReadsRecently(); // FIX-125
     if (!readbacks_pending && !address_pending && !earlier_deferred && !direct_hold) {
         return false;
     }
@@ -3358,6 +3513,18 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 const auto* bda_buffer = buffer_cache.GetBdaPageTableBuffer();
                 ctx->buffer_infos.emplace_back(bda_buffer->Handle(), 0, bda_buffer->SizeBytes());
             } else if (desc.buffer_type == Shader::BufferType::DirectTable) {
+                // DIAG-133 (SHADGT_DIAG_SLOW_US=<us>): busy-waits that long per direct table, to
+                // tell timing races from wrong reads.
+                static const s64 slow_us = [] {
+                    const char* env = std::getenv("SHADGT_DIAG_SLOW_US");
+                    return env && *env ? std::atoll(env) : s64{0};
+                }();
+                if (slow_us > 0) {
+                    const auto until =
+                        std::chrono::steady_clock::now() + std::chrono::microseconds(slow_us);
+                    while (std::chrono::steady_clock::now() < until) {
+                    }
+                }
                 // D3: page table L1, zero page, then the entries.
                 std::vector<u32> table(4 + stage.buffers.size() * 4, 0u);
                 if (direct) {
@@ -3469,16 +3636,68 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     return !env || env[0] != '0';
                 }();
                 const bool read_in_place = [&] {
+                    // DIAG-128 bisect: SHADGT_DIRECT_READS_STAGES=<hex mask of SwStage bits>,
+                    // SHADGT_DIRECT_READS_MAX=<bytes> (larger ranges take the usual path),
+                    // SHADGT_DIRECT_READS_MIN=<bytes> (smaller ranges take the usual path).
+                    static const u32 stage_mask = [] {
+                        const char* env = std::getenv("SHADGT_DIRECT_READS_STAGES");
+                        return env && *env ? u32(std::strtoul(env, nullptr, 16)) : ~0u;
+                    }();
+                    static const u64 max_size = [] {
+                        const char* env = std::getenv("SHADGT_DIRECT_READS_MAX");
+                        return env && *env ? std::strtoull(env, nullptr, 10) : ~u64{0};
+                    }();
+                    static const u64 min_size = [] {
+                        const char* env = std::getenv("SHADGT_DIRECT_READS_MIN");
+                        return env && *env ? std::strtoull(env, nullptr, 10) : u64{0};
+                    }();
                     if (!direct || !direct_reads || !desc.IsDirectEligible() ||
-                        size >= (u64{1} << 32)) {
+                        size >= (u64{1} << 32) || size > max_size || size < min_size ||
+                        !((stage_mask >> u32(stage.sw_stage)) & 1)) {
                         return false;
                     }
                     Common::PhaseTimer direct_timer{Common::Phase::BufDirect}; // DIAG-119
                     return !direct->IsVolatile(vsharp.base_address, size) &&
                            direct->EnsureImported(vsharp.base_address, size) &&
-                           !buffer_cache.IsRegionGpuModified(vsharp.base_address, size);
+                           !buffer_cache.IsRegionGpuModified(vsharp.base_address, size) &&
+                           !WrittenRecently(vsharp.base_address, size) && // FIX-123
+                           DirectReadsHere() && // FIX-124
+                           !buffer_cache.DirectReadHitsImage(vsharp.base_address, size); // FIX-122
                 }();
                 if (read_in_place) {
+                    NoteDirectRead(); // FIX-125
+                    if (DirectHazardDiag()) {
+                        CheckInPlaceHazard("buffer", vsharp.base_address, size, stage.pgm_hash);
+                    }
+                    // DIAG-131 (SHADGT_DIAG_DIRECT_CHANGE=1): bytes read in place that the CPU
+                    // changed between recording (what a copy would have used) and the GPU's
+                    // completion.
+                    static const bool change_diag = [] {
+                        const char* env = std::getenv("SHADGT_DIAG_DIRECT_CHANGE");
+                        return env && env[0] == '1';
+                    }();
+                    if (change_diag && size <= 64_KB) {
+                        const VAddr address = vsharp.base_address;
+                        const u64 before = Core::HashGuestBytes(address, size);
+                        const u64 reader = stage.pgm_hash;
+                        scheduler.DeferPriorityOperation([address, size, before, reader] {
+                            static std::mutex mutex;
+                            static std::unordered_map<u64, u64> counts;
+                            static u64 total = 0;
+                            if (Core::HashGuestBytes(address, size) == before) {
+                                return;
+                            }
+                            std::scoped_lock lk{mutex};
+                            const u64 n = ++counts[reader];
+                            ++total;
+                            if (n <= 3 || n == 100 || n == 1000 || n == 10000) {
+                                LOG_WARNING(Render_Vulkan,
+                                            "DIAG-131: {:#x}+{:#x} read in place by {:#x} changed "
+                                            "before the GPU finished ({} times for it, {} total)",
+                                            address, size, reader, n, total);
+                            }
+                        });
+                    }
                     direct_entries[buffer_index - 1] = {u32(vsharp.base_address),
                                                         u32(u64(vsharp.base_address) >> 32),
                                                         u32(size), 1u};
@@ -3616,6 +3835,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 ctx->bound_buffers.emplace_back(buffer, offset, size, desc.is_written,
                                            vsharp.base_address);
                 if (desc.is_written) {
+                    NoteShaderWrite(vsharp.base_address, size); // FIX-123
+                    if (DirectHazardDiag()) {
+                        NoteWrittenRange(vsharp.base_address, size, stage.pgm_hash); // DIAG-129
+                    }
                     // Raw storage-buffer writes can also make an aliased cached image stale.
                     texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size);
                 }

@@ -431,9 +431,15 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             if (timer.GetTotalWait().count() < 0) {
                 // Before the game's first frame a blank frame, which shows the splash screen
                 // and the precompile bar; after it the last frame (skipped while it is taken).
+                // DIAG-126 (SHADGT_NO_LAST_FRAME=1): compile pauses after the first frame keep
+                // what is on screen instead of showing the last frame again.
+                static const bool no_last_frame = [] {
+                    const char* env = std::getenv("SHADGT_NO_LAST_FRAME");
+                    return env && env[0] == '1';
+                }();
                 if (!main_port.is_open || !presenter->HasLastFrame()) {
                     DrawBlankFrame();
-                } else {
+                } else if (!no_last_frame) {
                     DrawLastFrame();
                 }
             }
