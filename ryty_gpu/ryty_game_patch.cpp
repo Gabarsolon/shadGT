@@ -573,7 +573,7 @@ void LoadScriptReplacements() {
     FindClose(find);
 }
 
-// FIX-110: whether a race (any race_* project) or the menus (gtmode, arcade and the other menu
+// FIX-110: whether a race (a race_* project) or the menus (gtmode, arcade and the other menu
 // projects) run, from the project script the game loads when it switches. Overlays a race loads
 // (dialogs, the meter, the pause menu) don't change it. The renderer skips draws for new
 // pipelines only in races; in the menus some scenes draw once into a texture they keep showing.
@@ -595,7 +595,9 @@ void NoteProjectScript(const u8* data, s64 read) {
         "gtmode", "arcade", "campaign", "garage", "brand_central", "gallery", "livery2",
         "photo", "play_photo", "option", "ps_store", "car_select", "course_select",
         "event_setting", "preview", "car_preview", "online", "boot", "demo"};
-    const bool race = name.starts_with("race");
+    // "race" itself is the races' shared script, which the game also loads at boot (before the
+    // gift car's thumbnail is drawn); a race runs one of the race_* projects.
+    const bool race = name.starts_with("race_");
     if (!race && std::find(std::begin(menus), std::end(menus), name) == std::end(menus)) {
         return;
     }
