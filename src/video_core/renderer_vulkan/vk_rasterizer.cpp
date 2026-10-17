@@ -613,13 +613,22 @@ void Rasterizer::OrderBuffersAhead(const SelectedPipeline& selected, BufferPlan&
     PrepareBuffersAhead(selected, plan, 0, 0, true);
 }
 
+// FIX-111: set while PrepareBuffersAhead only asks IsComputeImageCopy/MetaClear/ImageClear.
+static thread_local bool t_special_dry_run = false;
+
 bool Rasterizer::PrepareBuffersAhead(const SelectedPipeline& selected, BufferPlan& plan,
                                      VAddr index_address, u32 index_bytes, bool order_only) {
     const Pipeline* pipeline = selected.is_compute
                                    ? static_cast<const Pipeline*>(selected.compute)
                                    : static_cast<const Pipeline*>(selected.pipeline);
-    if (!pipeline || IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
-        IsComputeImageClear(pipeline)) {
+    // FIX-111: only asks whether the dispatch is a copy or clear the renderer does itself; doing
+    // it here, ahead of the draws before it, copied a picture before it was drawn (GT Sport's top
+    // bar blur came out black on some frames, or on all of them).
+    t_special_dry_run = true;
+    const bool special = pipeline && (IsComputeImageCopy(pipeline) ||
+                                      IsComputeMetaClear(pipeline) || IsComputeImageClear(pipeline));
+    t_special_dry_run = false;
+    if (!pipeline || special) {
         return true; // Nothing to obtain, or BindResources is not reached.
     }
     // MT-007: reads over a range an earlier planned job writes are left to the recorder.
@@ -2605,9 +2614,29 @@ void Rasterizer::FlushForDeferredFences() {
 }
 
 bool Rasterizer::BindResources(const Pipeline* pipeline) {
-    if (IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
-        IsComputeImageClear(pipeline)) {
-        return false;
+    {
+        const int special = IsComputeImageCopy(pipeline)    ? 1
+                            : IsComputeMetaClear(pipeline)  ? 2
+                            : IsComputeImageClear(pipeline) ? 3
+                                                            : 0;
+        if (special != 0) {
+            // DIAG-122 (SHADGT_DIAG_SPECIAL=1): which dispatches the renderer replaces.
+            static const bool diag = std::getenv("SHADGT_DIAG_SPECIAL") != nullptr;
+            static std::atomic<u32> logged{};
+            if (diag && logged++ < 400) {
+                const auto& info = pipeline->GetStage(Shader::SwStage::Compute);
+                std::string bufs;
+                for (const auto& desc : info.buffers) {
+                    const auto sharp = desc.GetSharp(info);
+                    bufs += fmt::format(" {:#x}+{:#x}{}", sharp.base_address, sharp.GetSize(),
+                                        desc.is_written ? "w" : "");
+                }
+                LOG_WARNING(Render_Vulkan, "DIAG-122: cs {:#x} {}{}", info.pgm_hash,
+                            special == 1 ? "image copy" : special == 2 ? "meta clear" : "image clear",
+                            bufs);
+            }
+            return false;
+        }
     }
 
     ctx->set_write_index = 0;
@@ -3065,7 +3094,9 @@ bool Rasterizer::IsComputeMetaClear(const Pipeline* pipeline) {
         // Assume if a shader writes metadata without address calculation, it is a clear shader.
         for (const auto& desc : info.buffers) {
             const VAddr address = desc.GetSharp(info).base_address;
-            if (!desc.IsSpecial() && desc.is_written && texture_cache.ClearMeta(address)) {
+            if (!desc.IsSpecial() && desc.is_written &&
+                (t_special_dry_run ? texture_cache.IsMeta(address).has_value()
+                                   : texture_cache.ClearMeta(address))) {
                 // FIX-103: GT Sport reuses memory between frames' passes, so a CMASK address of
                 // one pass can be a color picture's memory in another. When the written range
                 // holds a picture, the dispatch is the game clearing that picture: run it.
@@ -3073,6 +3104,9 @@ bool Rasterizer::IsComputeMetaClear(const Pipeline* pipeline) {
                 // invalid numbers became the pink and black rectangles of dust, smoke and rain.
                 const auto sharp = desc.GetSharp(info);
                 if (buffer_cache.HasGpuImageAlias(address, std::max<u64>(sharp.GetSize(), 4))) {
+                    if (t_special_dry_run) {
+                        return false;
+                    }
                     if (DiagHistoryEnabled()) {
                         static std::atomic<u32> logged{};
                         if (logged++ < 3000) {
@@ -3088,6 +3122,15 @@ bool Rasterizer::IsComputeMetaClear(const Pipeline* pipeline) {
                     if (logged++ < 3000) {
                         LOG_WARNING(Render_Vulkan, "DIAG-105: compute meta clear {:#x}", address);
                     }
+                }
+                // FIX-112: the metadata is marked cleared, and the dispatch still runs. GT Sport
+                // fills a 20 KB block (0x10057f8000) with this shader every frame, and that
+                // memory was a CMASK of another pass; skipped, the block kept old values and the
+                // top bar's frosted-glass blur came out black (always, or now and then).
+                // -DisablePerf 135 skips the dispatch as before.
+                static const bool run_clears = Common::PerfFeatureEnabled(135);
+                if (run_clears) {
+                    return false;
                 }
                 // Assume all slices were updates
                 LOG_TRACE(Render_Vulkan, "Metadata update skipped");
@@ -3144,6 +3187,9 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline) {
         return false;
     }
 
+    if (t_special_dry_run) {
+        return true; // FIX-111
+    }
     // Perform image copy
     VideoCore::Image& src_image = desc0.is_written ? image1 : image0;
     VideoCore::Image& dst_image = desc0.is_written ? image0 : image1;
@@ -3192,6 +3238,9 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
         return false;
     }
 
+    if (t_special_dry_run) {
+        return true; // FIX-111
+    }
     // Perform image clear
     const float* values = reinterpret_cast<float*>(buf0.base_address);
     const vk::ClearValue clear = {
