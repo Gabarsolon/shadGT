@@ -117,7 +117,8 @@ ffxReturnCode_t DispatchGeneration(ffxDispatchDescFrameGeneration* params, void*
 std::atomic<u64> g_shown_frames{};
 
 bool Requested() {
-    return EmulatorSettings.IsFrameGenEnabled();
+    // NVIDIA DLSS frame generation (ryty_dlssg.h) replaces the AMD one when both are on.
+    return EmulatorSettings.IsFrameGenEnabled() && !EmulatorSettings.IsDlssgEnabled();
 }
 
 u64 ShownFrames() {

@@ -152,8 +152,24 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controller
         error = true;
     }
     if (!error) {
+        // ryGT: "Fullscreen" (exclusive) uses the window size as the display resolution and
+        // GPU.fullscreen_refresh_rate (0: the desktop's) as its refresh rate, when the display
+        // has such a mode; otherwise the desktop's mode.
+        SDL_DisplayMode chosen{};
+        const SDL_DisplayMode* exclusive = displayMode;
+        const u32 refresh = EmulatorSettings.GetFullscreenRefreshRate();
+        if (SDL_GetClosestFullscreenDisplayMode(
+                displayIndex, static_cast<int>(EmulatorSettings.GetWindowWidth()),
+                static_cast<int>(EmulatorSettings.GetWindowHeight()),
+                refresh ? static_cast<float>(refresh) : displayMode->refresh_rate, true, &chosen)) {
+            exclusive = &chosen;
+        }
+        if (EmulatorSettings.GetFullScreenMode() == "Fullscreen") {
+            LOG_INFO(Frontend, "Exclusive fullscreen: {}x{} at {:.2f} Hz", exclusive->w,
+                     exclusive->h, exclusive->refresh_rate);
+        }
         SDL_SetWindowFullscreenMode(
-            window, EmulatorSettings.GetFullScreenMode() == "Fullscreen" ? displayMode : NULL);
+            window, EmulatorSettings.GetFullScreenMode() == "Fullscreen" ? exclusive : NULL);
     }
     SDL_SetWindowFullscreen(window, EmulatorSettings.IsFullScreen());
     SDL_SyncWindow(window);

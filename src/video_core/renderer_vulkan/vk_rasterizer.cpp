@@ -1531,6 +1531,8 @@ void Rasterizer::TraceImageDependencies(VideoCore::ImageId source_id) {
     LOG_WARNING(Render_Vulkan, "DIAG-044: dumped {} of those images to {}", dumped, dir.string());
 }
 
+extern std::atomic<u64> g_prepared_frames; // DIAG-137, vk_presenter.cpp
+
 namespace {
 // DIAG-080 (SHADGT_LOG_DRAW_SET=1): every second, the vertex/pixel shader pairs drawn, with how
 // many of their draws were recorded and how many were dropped (no pipeline yet, or resources not
@@ -1551,10 +1553,18 @@ std::map<std::pair<u64, u64>, DrawSetEntry> g_draw_set;
 std::chrono::steady_clock::time_point g_draw_set_start{};
 FILE* g_draw_set_file{};
 
+bool DrawSetPerFrame() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("SHADGT_LOG_DRAW_SET");
+        return env && env[0] == '2';
+    }();
+    return enabled;
+}
+
 bool DrawSetEnabled() {
     static const bool enabled = [] {
         const char* env = std::getenv("SHADGT_LOG_DRAW_SET");
-        return env && env[0] == '1';
+        return env && (env[0] == '1' || env[0] == '2');
     }();
     return enabled;
 }
@@ -1584,6 +1594,26 @@ void NoteDrawKey(std::pair<u64, u64> key, int outcome) {
         g_draw_set_file = std::fopen("user/log/draw_set.txt", "w");
     }
     static auto window = now;
+    // DIAG-137 (SHADGT_LOG_DRAW_SET=2): one line per game frame instead: its number and the
+    // pairs drawn in it.
+    if (DrawSetPerFrame()) {
+        static u64 frame = 0;
+        const u64 current = g_prepared_frames.load(std::memory_order_relaxed);
+        if (current != frame && g_draw_set_file) {
+            std::fprintf(g_draw_set_file, "F %llu", static_cast<unsigned long long>(frame));
+            for (const auto& [pair, e] : g_draw_set) {
+                std::fprintf(g_draw_set_file, " %08llx:%08llx:%u",
+                             static_cast<unsigned long long>(pair.first & 0xffffffff),
+                             static_cast<unsigned long long>(pair.second & 0xffffffff), e.drawn);
+            }
+            std::fputc('\n', g_draw_set_file);
+            g_draw_set.clear();
+            frame = current;
+        }
+        auto& e = g_draw_set[key];
+        if (outcome == 0) ++e.drawn;
+        return;
+    }
     if (now - window >= std::chrono::seconds{1} && g_draw_set_file) {
         const double t = std::chrono::duration<double>(now - g_draw_set_start).count();
         for (const auto& [pair, e] : g_draw_set) {
@@ -1614,6 +1644,9 @@ void NoteDrawKey(std::pair<u64, u64> key, int outcome) {
     else ++e.no_resources;
 }
 } // namespace
+
+static void NoteMenuBarDraw(u64 vs, u64 ps); // FIX-127
+static thread_local bool t_frosted_rt = false; // DIAG-139: the draw renders the bar's blur
 
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     RENDERER_TRACE;
@@ -1734,6 +1767,35 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
             !quad_list);
         if (!pipeline) {
             if (DrawSetEnabled()) NoteDrawSet(pipeline_cache.SelectedInfos(), 1);
+            return;
+        }
+    }
+    // DIAG-138 (SHADGT_SKIP_PS=<hex,hex,...>): draws with these pixel shaders are skipped, to
+    // find which draws make an effect.
+    static const std::vector<u64> skip_ps = [] {
+        std::vector<u64> list;
+        if (const char* env = std::getenv("SHADGT_SKIP_PS")) {
+            std::string text{env};
+            size_t position = 0;
+            while (position < text.size()) {
+                const size_t end = std::min(text.find(',', position), text.size());
+                list.push_back(std::strtoull(text.substr(position, end - position).c_str(), nullptr, 16));
+                position = end + 1;
+            }
+        }
+        return list;
+    }();
+    {
+        const auto& infos = pipeline_cache.SelectedInfos();
+        const auto* vs = infos[static_cast<u32>(Shader::SwStage::Vertex)];
+        const auto* ps = infos[static_cast<u32>(Shader::SwStage::Fragment)];
+        if (ps) {
+            NoteMenuBarDraw(vs ? vs->pgm_hash : 0, ps->pgm_hash); // FIX-127
+        }
+    }
+    if (!skip_ps.empty()) {
+        const auto* ps = pipeline_cache.SelectedInfos()[static_cast<u32>(Shader::SwStage::Fragment)];
+        if (ps && std::ranges::find(skip_ps, ps->pgm_hash & 0xffffffff) != skip_ps.end()) {
             return;
         }
     }
@@ -2434,12 +2496,29 @@ bool RytyGtsInRace(); // FIX-110, ryty_game_patch.cpp
 // blown-out car or a white dashboard panel every few seconds with FIX-122/123 (no cause found
 // yet; it needs small and large ranges read in place together). The menus run at 60 fps either
 // way; races keep the direct reads. -DisablePerf 146 reads in place everywhere.
-static bool DirectReadsHere() {
-    static const bool menus_off = Common::PerfFeatureEnabled(146);
-    return !menus_off || RytyGtsInRace();
+// FIX-127: GT Sport's menu top bar (ps 0x90b5dcdd, its frosted glass: drawn in every menu, the race
+// preview and the pause menu, never while driving) also turns in-place reads off, and with them
+// the fence waits (FIX-125): on the race preview, a race already, the bar's frosted glass came out
+// dark every other frame on Lance's PC (exclusive fullscreen at 240 Hz) even with FIX-126.
+// -DisablePerf 149 leaves the race preview to FIX-126 alone.
+static std::atomic<u32> g_menu_bar_ms{0};
+static void NoteMenuBarDraw(u64 vs, u64 ps) {
+    if ((ps & 0xffffffff) == 0x90b5dcdd) {
+        g_menu_bar_ms.store(NowMs() | 1, std::memory_order_relaxed);
+    }
+}
+static bool MenuBarShown() {
+    static const bool enabled = Common::PerfFeatureEnabled(149);
+    const u32 last = g_menu_bar_ms.load(std::memory_order_relaxed);
+    return enabled && last != 0 && u32(NowMs() - last) < 500;
 }
 
-// FIX-125: graphics fences wait for the GPU only while buffers are read in place (and for 2 s
+static bool DirectReadsHere() {
+    static const bool menus_off = Common::PerfFeatureEnabled(146);
+    return !menus_off || (RytyGtsInRace() && !MenuBarShown());
+}
+
+// FIX-125: graphics fences wait for the GPU only while buffers are read in place (and for 0.5 s
 // after the last such read). The wait is what makes in-place reads safe, but it changes the
 // game's frame pacing: GT Sport's frosted-glass bars (top bar, car list) lost their blur about
 // every third frame in the menus, where FIX-124 reads nothing in place anyway.
@@ -2447,6 +2526,17 @@ static bool DirectReadsHere() {
 static std::atomic<u32> g_last_direct_read_ms{0};
 static void NoteDirectRead() {
     g_last_direct_read_ms.store(NowMs() | 1, std::memory_order_relaxed);
+    // DIAG-141 (SHADGT_DIAG_FROSTED=1): in-place reads while the menu bar is on screen.
+    static const bool diag = [] {
+        const char* env = std::getenv("SHADGT_DIAG_FROSTED");
+        return env && env[0] == '1';
+    }();
+    if (diag && MenuBarShown()) {
+        static std::atomic<u32> n{};
+        if (const u32 c = ++n; c <= 20 || c % 1000 == 0) {
+            LOG_WARNING(Render_Vulkan, "DIAG-141: in-place read {} while the menu bar shows", c);
+        }
+    }
 }
 static bool DirectReadsRecently() {
     static const bool enabled = Common::PerfFeatureEnabled(147);
@@ -2454,7 +2544,7 @@ static bool DirectReadsRecently() {
         return true;
     }
     const u32 last = g_last_direct_read_ms.load(std::memory_order_relaxed);
-    return last != 0 && u32(NowMs() - last) < 2000;
+    return last != 0 && u32(NowMs() - last) < 500;
 }
 
 static void NoteShaderWrite(VAddr address, u64 size) {
@@ -2577,9 +2667,37 @@ bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& 
         const char* env = std::getenv("SHADGT_DIRECT_HOLD_COMPUTE");
         return env && env[0] == '1';
     }();
-    const bool direct_hold = !no_hold && (!compute_queue || hold_compute) &&
+    // FIX-126: only the labels written between draws (EOS, WRITE_DATA) wait for the GPU; the
+    // end-of-pipe fences (EOP, which pass flush) are signaled as before. Held EOPs made GT Sport's
+    // frosted-glass top bar lose its blur on about one frame in five on the pre-race screen
+    // (a race, so FIX-125 still holds there); races render the same without them.
+    // -DisablePerf 148 holds both. DIAG-136 (SHADGT_DIRECT_HOLD_KIND=eop|labels|all) picks.
+    static const int hold_kind = [] {
+        const char* env = std::getenv("SHADGT_DIRECT_HOLD_KIND");
+        if (env && *env) {
+            return env[0] == 'e' ? 1 : env[0] == 'l' ? 2 : 0;
+        }
+        return Common::PerfFeatureEnabled(148) ? 2 : 0;
+    }();
+    const bool kind_held = hold_kind == 0 || (hold_kind == 1) == flush;
+    // FIX-127: no waits while the menu bar is on screen, even when a few in-place reads slipped
+    // through (planned ahead before the bar was drawn): they kept the waits on all along.
+    const bool direct_hold = !no_hold && (!compute_queue || hold_compute) && kind_held &&
                              buffer_cache.GetDirectMemory() != nullptr &&
-                             DirectReadsRecently(); // FIX-125
+                             DirectReadsRecently() && !MenuBarShown(); // FIX-125, FIX-127
+    if (direct_hold && MenuBarShown()) {
+        // DIAG-141: fences held while the menu bar is on screen.
+        static const bool diag = [] {
+            const char* env = std::getenv("SHADGT_DIAG_FROSTED");
+            return env && env[0] == '1';
+        }();
+        static std::atomic<u32> n{};
+        if (diag) {
+            if (const u32 c = ++n; c <= 20 || c % 1000 == 0) {
+                LOG_WARNING(Render_Vulkan, "DIAG-141: fence {} held while the menu bar shows", c);
+            }
+        }
+    }
     if (!readbacks_pending && !address_pending && !earlier_deferred && !direct_hold) {
         return false;
     }
@@ -2634,7 +2752,13 @@ bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& 
     // D5: in direct mode most fences are held only to keep order (labels written by WRITE_DATA
     // between draws). Those ride the next submit, the next EOP's or the one the recorder makes
     // when it runs out of work (a game waiting for one stops sending work).
-    if (flush || readbacks_pending || address_pending || !direct_hold) {
+    // DIAG-134 (SHADGT_DIRECT_HOLD_FLUSH=1): held fences submit at once instead of riding the
+    // next submit (D5).
+    static const bool hold_flush = [] {
+        const char* env = std::getenv("SHADGT_DIRECT_HOLD_FLUSH");
+        return env && env[0] == '1';
+    }();
+    if (flush || hold_flush || readbacks_pending || address_pending || !direct_hold) {
         scheduler.Flush();
         deferred_unflushed.store(false, std::memory_order_relaxed);
     } else {
@@ -4242,6 +4366,34 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 image->binding.force_general |= image_desc.is_written;
             }
             image->binding.is_bound = 1u;
+            // DIAG-139 (SHADGT_DIAG_FROSTED=1): the pictures GT Sport's frosted glass
+            // (ps 0x90b5dcdd) reads, a few times a second.
+            static const bool diag_frosted = [] {
+                const char* env = std::getenv("SHADGT_DIAG_FROSTED");
+                return env && env[0] == '1';
+            }();
+            if (diag_frosted && ((stage.pgm_hash & 0xffffffff) == 0x90b5dcdd || t_frosted_rt ||
+                                 (image->info.guest_address == 0x1009bc0000 && RytyGtsInRace()))) {
+                static auto last = std::chrono::steady_clock::now();
+                static u32 in_window = 0;
+                const auto now = std::chrono::steady_clock::now();
+                if (now - last > std::chrono::milliseconds(250)) {
+                    last = now;
+                    in_window = 0;
+                }
+                if (RytyGtsInRace() || in_window++ < 4) {
+                    LOG_WARNING(Render_Vulkan,
+                                "DIAG-139: frame {} ps {:#x} reads image {} at {:#x} {}x{} fmt {} "
+                                "tile {} flags {:#x} contents {} race {}{}",
+                                g_prepared_frames.load(std::memory_order_relaxed),
+                                stage.pgm_hash & 0xffffffff, image_id.index,
+                                image->info.guest_address, image->info.size.width,
+                                image->info.size.height, u32(image->info.pixel_format),
+                                u32(image->info.tile_mode), u32(image->flags),
+                                image->contents_version, RytyGtsInRace(),
+                                t_frosted_rt ? " (into the bar's blur)" : "");
+                }
+            }
         }
 
         image_descriptor_array_sizes.push_back(num_bindings);
@@ -4315,6 +4467,30 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                     runtime.Transit(&image, layout, vk::PipelineStageFlagBits2::eAllGraphics,
                                     vk::AccessFlagBits2::eShaderRead, desc.view_info.range);
             } else if ((binding.force_general || binding.is_target) && !image.info.props.is_depth) {
+                // FIX-130: a draw that samples the color target it renders into (a feedback loop)
+                // must see what earlier draws wrote to it. Consecutive draws in one rendering pass
+                // have no dependency, so their reads raced the earlier writes. GT Sport blurs each
+                // frosted-glass panel in two passes into one picture, the second reading what the
+                // first wrote; on the race preview the top bar's blur came out dark now and then
+                // (on Lance's PC most frames). -DisablePerf 152 leaves it as before.
+                static const bool feedback_barrier = Common::PerfFeatureEnabled(152);
+                if (feedback_barrier && image.binding.is_target) {
+                    scheduler.EndRendering();
+                    runtime.FlushBarriers();
+                    const vk::MemoryBarrier2 written{
+                        .srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                        .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+                        .dstStageMask = vk::PipelineStageFlagBits2::eFragmentShader |
+                                        vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                        .dstAccessMask = vk::AccessFlagBits2::eShaderRead |
+                                         vk::AccessFlagBits2::eColorAttachmentRead |
+                                         vk::AccessFlagBits2::eColorAttachmentWrite,
+                    };
+                    scheduler.CommandBuffer().pipelineBarrier2(vk::DependencyInfo{
+                        .memoryBarrierCount = 1,
+                        .pMemoryBarriers = &written,
+                    });
+                }
                 if (instance.IsAttachmentFeedbackLoopLayoutSupported() && image.binding.is_target) {
                     ctx->needs_barrier |= runtime.Transit(
                         &image, vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT,
@@ -4564,6 +4740,35 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         const auto slice = image_view.info.range.base.layer;
         const auto mip = image_view.info.range.base.level;
 
+        {
+            // DIAG-139: render targets in GT Sport's frosted-glass scratch memory.
+            static const bool diag_frosted = [] {
+                const char* env = std::getenv("SHADGT_DIAG_FROSTED");
+                return env && env[0] == '1';
+            }();
+            if (cb == 0) {
+                t_frosted_rt = diag_frosted && image->info.guest_address == 0x1009bc0000 &&
+                               image->info.size.width == 960 && image->info.size.height == 200;
+            }
+            if (diag_frosted && image->info.guest_address == 0x1009bc0000 &&
+                image->info.size.width == 960) {
+                static auto last = std::chrono::steady_clock::now();
+                static u32 in_window = 0;
+                const auto now = std::chrono::steady_clock::now();
+                if (now - last > std::chrono::milliseconds(250)) {
+                    last = now;
+                    in_window = 0;
+                }
+                if (RytyGtsInRace() || in_window++ < 4) {
+                    LOG_WARNING(Render_Vulkan,
+                                "DIAG-139: frame {} render target image {} at {:#x} {}x{} fmt {} "
+                                "contents {} race {}",
+                                g_prepared_frames.load(std::memory_order_relaxed), image_id.index, image->info.guest_address, image->info.size.width,
+                                image->info.size.height, u32(image->info.pixel_format),
+                                image->contents_version, RytyGtsInRace());
+                }
+            }
+        }
         const auto& col_buf = regs.color_buffers[cb];
         const bool is_clear = texture_cache.IsMetaCleared(col_buf.CmaskAddress(), slice);
         texture_cache.TouchMeta(col_buf.CmaskAddress(), slice, false);

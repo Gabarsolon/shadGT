@@ -978,6 +978,40 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt, FindMemo* memo)
             image_id = overlap_image_id;
         }
     } else {
+        // DIAG-140 (SHADGT_DIAG_FROSTED=1): the other images at the address of GT Sport's
+        // frosted-glass picture when it is looked up.
+        static const bool diag_frosted = [] {
+            const char* env = std::getenv("SHADGT_DIAG_FROSTED");
+            return env && env[0] == '1';
+        }();
+        if (diag_frosted && info.guest_address == 0x1009bc0000 && info.size.width == 960 &&
+            info.size.height == 100) {
+            static auto window = std::chrono::steady_clock::now();
+            static u32 in_window = 0;
+            const auto now = std::chrono::steady_clock::now();
+            if (now - window > std::chrono::milliseconds(250)) {
+                window = now;
+                in_window = 0;
+            }
+            if (in_window++ < 3) {
+                const auto& mine = slot_images[image_id].info;
+                for (const auto& cache_id : same_address) {
+                    if (cache_id == image_id) continue;
+                    const auto& other = slot_images[cache_id];
+                    LOG_WARNING(Render_Vulkan,
+                                "DIAG-140: 960x100 image {} (v {}) vs image {} {}x{} fmt {} pitch {}/{} "
+                                "tile {}/{} swz {}/{} alt {}/{} mp {}/{} subrect {} v {} flags {:#x}",
+                                image_id.index, slot_images[image_id].contents_version,
+                                cache_id.index, other.info.size.width, other.info.size.height,
+                                u32(other.info.pixel_format), mine.pitch, other.info.pitch,
+                                u32(mine.tile_mode), u32(other.info.tile_mode), mine.bank_swizzle,
+                                other.info.bank_swizzle, mine.alt_tile, other.info.alt_tile,
+                                mine.mips_layout[0].pitch, other.info.mips_layout[0].pitch,
+                                mine.IsSubrectOf(other.info), other.contents_version,
+                                u32(other.flags));
+                }
+            }
+        }
         for (const auto& cache_id : same_address) {
             if (cache_id != image_id &&
                 slot_images[image_id].info.IsSubrectOf(slot_images[cache_id].info)) {
@@ -1045,6 +1079,31 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt, FindMemo* memo)
     static const bool reuse_collected = Common::PerfFeatureEnabled(53);
     if (registry_changed || !reuse_collected) {
         collect_same_address(same_address);
+    }
+    // FIX-129: a cropped image is refreshed from the newest full image it is a crop of, whichever
+    // way it was found. GT Sport's frosted glass renders each panel's blur into a scratch area
+    // (960x200 for the top bar) and reads its top half (960x100); on the race preview other
+    // passes reuse that memory every frame, so the crop was often found through overlap
+    // resolution, which kept its old pixels (or the ones a buffer write left): the top bar came
+    // out dark with frosted frames flashing in. -DisablePerf 151 refreshes as before.
+    static const bool refresh_crops = Common::PerfFeatureEnabled(151);
+    if (refresh_crops) {
+        ImageId newest{};
+        for (const auto& cache_id : same_address) {
+            if (cache_id == image_id ||
+                !slot_images[image_id].info.IsSubrectOf(slot_images[cache_id].info)) {
+                continue;
+            }
+            const Image& full = slot_images[cache_id];
+            if (full.contents_version > slot_images[image_id].contents_version &&
+                full.SafeToDownload() &&
+                (!newest || full.contents_version > slot_images[newest].contents_version)) {
+                newest = cache_id;
+            }
+        }
+        if (newest) {
+            runtime.CopySubrect(&slot_images[newest], &slot_images[image_id]);
+        }
     }
     SmallVector<ImageId, 4> newer_subrects;
     for (const auto& cache_id : same_address) {

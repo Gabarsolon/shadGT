@@ -24,6 +24,7 @@
 #include "video_core/renderer_vulkan/vk_platform.h"
 #ifdef RYTY_GPU
 #include "ryty_gpu/ryty_dlss.h"
+#include "ryty_gpu/ryty_dlssg.h"
 #endif
 
 #ifdef __APPLE__
@@ -278,6 +279,12 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
 #endif
 
     static vk::detail::DynamicLoader dl;
+#ifdef RYTY_GPU
+    // ryGT: with DLSS frame generation on, Streamline's interposer stands in for vulkan-1.dll.
+    if (const auto streamline = RytyDlssG::LoadInterposer()) {
+        VULKAN_HPP_DEFAULT_DISPATCHER.init(streamline);
+    } else
+#endif
     VULKAN_HPP_DEFAULT_DISPATCHER.init(
         dl.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr"));
 

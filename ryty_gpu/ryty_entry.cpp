@@ -370,6 +370,7 @@ void Ryty::RytyLibraryInitialize() {
     // shadGT's main() loads the player list (user/users.json, created with defaults when
     // missing); a gamepad is only assigned to a player that exists ("User 1 not found").
     UserSettings.Load();
+    InstallControllerPorts(); // before the window thread opens the controllers
     if (std::getenv("RYTY_SELFTEST_GUARD") != nullptr) {
         // A guarded read of an inaccessible page must come back false, not end the process.
         void* page = VirtualAlloc(nullptr, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_NOACCESS);

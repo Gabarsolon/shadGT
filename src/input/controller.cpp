@@ -1,6 +1,7 @@
 ﻿// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <map>
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -318,6 +319,8 @@ bool GameController::SetVibration(u8 smallMotor, u8 largeMotor) {
 
 static bool is_first_check = true;
 
+int (*g_preferred_controller_slot)(u16 vendor, u16 product, int nth) = nullptr;
+
 void GameControllers::TryOpenSDLControllers() {
     using namespace Libraries::UserService;
     int controller_count;
@@ -349,7 +352,29 @@ void GameControllers::TryOpenSDLControllers() {
         }
     }
 
-    for (int j = 0; j < controller_count; j++) {
+    // ryGT: a controller can be given a player port (the launcher's Controller ports window),
+    // matched by USB vendor/product id and its place among connected controllers of that id.
+    // Those take their port first; the others fill the free ports in order.
+    std::vector<int> preferred(controller_count, -1);
+    if (g_preferred_controller_slot) {
+        std::map<u32, int> seen;
+        for (int j = 0; j < controller_count; j++) {
+            const u16 vendor = SDL_GetGamepadVendorForID(new_joysticks[j]);
+            const u16 product = SDL_GetGamepadProductForID(new_joysticks[j]);
+            const int nth = seen[(u32{vendor} << 16) | product]++;
+            preferred[j] = g_preferred_controller_slot(vendor, product, nth);
+        }
+    }
+    std::vector<int> order;
+    for (int pass = 0; pass < 2; pass++) {
+        for (int j = 0; j < controller_count; j++) {
+            if ((preferred[j] >= 0) == (pass == 0)) {
+                order.push_back(j);
+            }
+        }
+    }
+
+    for (const int j : order) {
         SDL_JoystickID id = new_joysticks[j];
         if (assigned_ids.contains(id))
             continue;
@@ -359,7 +384,9 @@ void GameControllers::TryOpenSDLControllers() {
             continue;
         }
 
-        for (int i = 0; i < 4; i++) {
+        const int first = preferred[j] >= 0 && preferred[j] < 4 ? preferred[j] : 0;
+        for (int k = 0; k < 5; k++) {
+            const int i = k == 0 ? first : k - 1;
             if (!slot_taken[i]) {
                 auto u = UserManagement.GetUserByPlayerIndex(i + 1);
                 if (!u) {

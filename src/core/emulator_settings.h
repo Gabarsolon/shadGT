@@ -412,6 +412,8 @@ struct GPUSettings {
     Setting<u32> vblank_frequency{60};
     Setting<bool> full_screen{false};
     Setting<std::string> full_screen_mode{"Windowed"};
+    // ryGT: refresh rate (Hz) of the "Fullscreen" (exclusive) display mode; 0 = the desktop's.
+    Setting<u32> fullscreen_refresh_rate{0};
     Setting<std::string> present_mode{"Mailbox"};
     Setting<bool> hdr_allowed{false};
     Setting<bool> fsr_enabled{false};
@@ -424,6 +426,8 @@ struct GPUSettings {
     // ryGT: AMD FSR 3.1 frame generation (amd_fidelityfx_vk.dll) adds a generated frame between
     // each pair of game frames.
     Setting<bool> framegen_enabled{false};
+    // ryGT: NVIDIA DLSS frame generation through Streamline (dlss\sl.*.dll); replaces the AMD one.
+    Setting<bool> dlssg_enabled{false};
     // ryGT: builds every stored shader pipeline while the splash screen shows (PERF-098).
     Setting<bool> precompile_shaders{true};
     // ryGT: pauses the game while a new shader pipeline compiles, instead of drawing on without
@@ -449,6 +453,8 @@ struct GPUSettings {
             make_override<GPUSettings>("copy_gpu_buffers", &GPUSettings::copy_gpu_buffers),
             make_override<GPUSettings>("full_screen", &GPUSettings::full_screen),
             make_override<GPUSettings>("full_screen_mode", &GPUSettings::full_screen_mode),
+            make_override<GPUSettings>("fullscreen_refresh_rate",
+                                       &GPUSettings::fullscreen_refresh_rate),
             make_override<GPUSettings>("present_mode", &GPUSettings::present_mode),
             make_override<GPUSettings>("window_height", &GPUSettings::window_height),
             make_override<GPUSettings>("window_width", &GPUSettings::window_width),
@@ -459,6 +465,7 @@ struct GPUSettings {
             make_override<GPUSettings>("dlss_enabled", &GPUSettings::dlss_enabled),
             make_override<GPUSettings>("fsr3_enabled", &GPUSettings::fsr3_enabled),
             make_override<GPUSettings>("framegen_enabled", &GPUSettings::framegen_enabled),
+            make_override<GPUSettings>("dlssg_enabled", &GPUSettings::dlssg_enabled),
             make_override<GPUSettings>("precompile_shaders", &GPUSettings::precompile_shaders),
             make_override<GPUSettings>("compile_freeze", &GPUSettings::compile_freeze),
             make_override<GPUSettings>("compile_batch_ms", &GPUSettings::compile_batch_ms),
@@ -481,9 +488,11 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GPUSettings, window_width, window_height, int
                                    internal_screen_height, null_gpu, copy_gpu_buffers,
                                    readbacks_mode, readback_linear_images_enabled,
                                    direct_memory_access_enabled, dump_shaders, patch_shaders,
-                                   vblank_frequency, full_screen, full_screen_mode, present_mode,
+                                   vblank_frequency, full_screen, full_screen_mode,
+                                   fullscreen_refresh_rate, present_mode,
                                    hdr_allowed, fsr_enabled, rcas_enabled, rcas_attenuation,
-                                   dlss_enabled, fsr3_enabled, framegen_enabled, precompile_shaders,
+                                   dlss_enabled, fsr3_enabled, framegen_enabled, dlssg_enabled,
+                                   precompile_shaders,
                                    compile_freeze, compile_batch_ms, compile_mode,
                                    particle_effects,
                                    userfaultfd, inline_fetch_shader)
@@ -741,6 +750,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, CopyGpuBuffers, copy_gpu_buffers)
     SETTING_FORWARD_BOOL(m_gpu, FullScreen, full_screen)
     SETTING_FORWARD(m_gpu, FullScreenMode, full_screen_mode)
+    SETTING_FORWARD(m_gpu, FullscreenRefreshRate, fullscreen_refresh_rate)
     SETTING_FORWARD(m_gpu, PresentMode, present_mode)
     SETTING_FORWARD(m_gpu, WindowHeight, window_height)
     SETTING_FORWARD(m_gpu, WindowWidth, window_width)
@@ -753,6 +763,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, DlssEnabled, dlss_enabled)
     SETTING_FORWARD_BOOL(m_gpu, Fsr3Enabled, fsr3_enabled)
     SETTING_FORWARD_BOOL(m_gpu, FrameGenEnabled, framegen_enabled)
+    SETTING_FORWARD_BOOL(m_gpu, DlssgEnabled, dlssg_enabled)
     SETTING_FORWARD_BOOL(m_gpu, PrecompileShaders, precompile_shaders)
     SETTING_FORWARD_BOOL(m_gpu, CompileFreeze, compile_freeze)
     SETTING_FORWARD(m_gpu, CompileBatchMs, compile_batch_ms)

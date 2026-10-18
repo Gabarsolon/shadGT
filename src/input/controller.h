@@ -140,6 +140,10 @@ private:
     RingBufferQueue<State> m_states_queue;
 };
 
+// ryGT: the player port (0-3) a controller should take, by USB vendor/product id and its place
+// among connected controllers with that id; -1 for any. Set by the Ryty input bridge.
+extern int (*g_preferred_controller_slot)(u16 vendor, u16 product, int nth);
+
 class GameControllers {
     std::array<GameController*, 5> controllers;
 

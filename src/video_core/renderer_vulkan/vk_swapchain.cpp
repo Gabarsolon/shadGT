@@ -32,6 +32,9 @@ Swapchain::Swapchain(const Instance& instance_, const Frontend::WindowSDL& windo
 
 Swapchain::~Swapchain() {
     Destroy();
+#ifdef RYTY_GPU
+    RytyDlssG::Shutdown();
+#endif
     instance.GetInstance().destroySurfaceKHR(surface);
 }
 
@@ -167,8 +170,10 @@ bool Swapchain::Present() {
     };
 
 #ifdef RYTY_GPU
+    RytyDlssG::PresentStart();
     auto result = framegen.Active() ? framegen.Present(instance.GetPresentQueue(), present_info)
                                     : instance.GetPresentQueue().presentKHR(present_info);
+    RytyDlssG::PresentEnd();
 #else
     auto result = instance.GetPresentQueue().presentKHR(present_info);
 #endif

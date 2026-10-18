@@ -8,6 +8,7 @@
 #include "common/types.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 #ifdef RYTY_GPU
+#include "ryty_gpu/ryty_dlssg.h"
 #include "ryty_gpu/ryty_framegen.h"
 #endif
 
@@ -104,6 +105,7 @@ public:
     void PrepareFrameGeneration(vk::CommandBuffer cmdbuf) {
 #ifdef RYTY_GPU
         framegen.Prepare(cmdbuf, swapchain, extent, needs_hdr);
+        RytyDlssG::Prepare(instance.GetDevice(), instance.GetAllocator(), cmdbuf, extent);
 #endif
     }
 

@@ -434,6 +434,10 @@ extern "C" __declspec(dllimport) short __stdcall GetAsyncKeyState(int key);
 // one before it (GT Sport's one white frame after a car is picked) is saved with its neighbour.
 // SHADGT_FLASH_WATCH=2 watches only what reaches the screen (no read-back of the game's frames,
 // which changes the timing on the draw queue).
+// DIAG-137: game frames prepared for the screen, in recording order (frame boundaries for the
+// per-frame draw sets, SHADGT_LOG_DRAW_SET=2).
+std::atomic<u64> g_prepared_frames{0};
+
 static int FlashWatchMode() {
     static const int mode = [] {
         const char* env = std::getenv("SHADGT_FLASH_WATCH");
@@ -834,6 +838,7 @@ static vk::Format GetFrameViewFormat(const Libraries::VideoOut::PixelFormat form
 
 Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& attribute,
                                VAddr cpu_address) {
+    g_prepared_frames.fetch_add(1, std::memory_order_relaxed); // DIAG-137
     auto desc = VideoCore::TextureCache::ImageDesc{attribute, cpu_address};
     const auto image_id = texture_cache.FindImage(desc);
     texture_cache.UpdateImage(image_id);

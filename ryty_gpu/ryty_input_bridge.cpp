@@ -12,6 +12,7 @@
 #include <utility>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <thread>
 
@@ -135,6 +136,51 @@ void RunTestScript(std::string script) {
 using PublishFn = void (*)(const RytyPadInputState&);
 // libScePad.prx: PadFetchOutput (Microsoft ABI, exported by NID); true when the output changed.
 using FetchOutputFn = bool (*)(std::uint32_t*, RytyPadOutputState*);
+// Per player (slot 0-3) versions: PadPublishInputSlot, PadFetchOutputSlot, and PadSetConnectedSlots
+// (bit N: player N+1 has a controller). libSceUserService.prx: UserServiceSetPlayers logs players
+// 2-4 in and out with the same mask.
+using PublishSlotFn = void (*)(int, const RytyPadInputState&);
+using FetchOutputSlotFn = bool (*)(int, std::uint32_t*, RytyPadOutputState*);
+using SetMaskFn = void (*)(std::uint32_t);
+
+constexpr int MaxPlayers = 4;
+
+// The GT Sport config next to GTSport.exe (user/custom_configs/CUSA03220.json) as text.
+std::string ReadGameConfig() {
+    char path[MAX_PATH];
+    const DWORD length = GetModuleFileNameA(nullptr, path, MAX_PATH);
+    if (length == 0 || length >= MAX_PATH) {
+        return {};
+    }
+    std::string config{path, length};
+    config = config.substr(0, config.find_last_of("/\\") + 1) + "user/custom_configs/CUSA03220.json";
+    std::FILE* file = std::fopen(config.c_str(), "rb");
+    if (!file) {
+        return {};
+    }
+    std::string text;
+    char chunk[4096];
+    while (const size_t n = std::fread(chunk, 1, sizeof(chunk), file)) {
+        text.append(chunk, n);
+    }
+    std::fclose(file);
+    return text;
+}
+
+// Input.keyboard_player in the GT Sport config (the launcher's Controls window): the player the
+// keyboard controls (its bindings name that player); that player is logged in without a gamepad.
+int KeyboardPlayer() {
+    const std::string text = ReadGameConfig();
+    const size_t key = text.find("\"keyboard_player\"");
+    if (key == std::string::npos) {
+        return 1;
+    }
+    const size_t value = text.find_first_not_of(" \t\r\n:", key + 17);
+    if (value == std::string::npos || text[value] < '1' || text[value] > '4') {
+        return 1;
+    }
+    return text[value] - '0';
+}
 
 std::uint8_t ClampAxis(s32 value) {
     return static_cast<std::uint8_t>(value < 0 ? 0 : (value > 255 ? 255 : value));
@@ -149,64 +195,168 @@ void ForwardInput() {
     }
     const auto fetch_output =
         reinterpret_cast<FetchOutputFn>(GetProcAddress(pad, "FDjxaWJZf9Y"));
+    const auto publish_slot = reinterpret_cast<PublishSlotFn>(GetProcAddress(pad, "bzBgHlPTQcw"));
+    const auto fetch_output_slot =
+        reinterpret_cast<FetchOutputSlotFn>(GetProcAddress(pad, "oEbP2t18XtY"));
+    const auto set_pad_mask = reinterpret_cast<SetMaskFn>(GetProcAddress(pad, "WeP2kdNeVQs"));
+    HMODULE user_service = GetModuleHandleA("libSceUserService.prx");
+    const auto set_players =
+        user_service ? reinterpret_cast<SetMaskFn>(GetProcAddress(user_service, "pupOOOgZWjs"))
+                     : nullptr;
+    // Players 2-4 need the per-player exports; without them only player 1 is forwarded.
+    const int players = publish_slot && fetch_output_slot && set_pad_mask ? MaxPlayers : 1;
+    LOG_INFO(Input, "Ryty: forwarding {} player(s){}", players,
+             set_players ? "" : " (no player logins: libSceUserService.prx is older)");
     auto* controllers = Common::Singleton<Input::GameControllers>::Instance();
-    RytyPadInputState last{};
-    bool first = true;
-    std::uint32_t output_seen = 0;
-    RytyPadOutputState last_output{};
+    std::array<RytyPadInputState, MaxPlayers> last{};
+    std::array<bool, MaxPlayers> first{true, true, true, true};
+    std::array<std::uint32_t, MaxPlayers> output_seen{};
+    std::array<RytyPadOutputState, MaxPlayers> last_output{};
+    std::uint32_t last_mask = ~0u;
+    const int keyboard_player = players > 1 ? KeyboardPlayer() : 1;
+    if (keyboard_player > 1) {
+        LOG_INFO(Input, "Ryty: the keyboard controls player {}", keyboard_player);
+    }
     while (true) {
-        // Rumble and light bar requests go to the first controller, as shadGT's pad library
-        // would send them (SetVibration takes the small motor first).
-        if (RytyPadOutputState output; fetch_output && fetch_output(&output_seen, &output)) {
-            auto& controller = *(*controllers)[0];
-            if (output.vibrationLarge != last_output.vibrationLarge ||
-                output.vibrationSmall != last_output.vibrationSmall) {
-                const bool sent =
-                    controller.SetVibration(output.vibrationSmall, output.vibrationLarge);
-                static int logged = 0;
-                if (logged++ < 10) {
-                    LOG_INFO(Input, "Ryty: game rumble large {} small {} -> controller ({})",
-                             output.vibrationLarge, output.vibrationSmall,
-                             controller.m_sdl_gamepad ? (sent ? "sent" : "refused")
-                                                      : "no gamepad");
+        // Player 1 always plays (keyboard and first gamepad); players 2-4 while shadGT has a
+        // gamepad in their slot (the user folder's users.json lists who players 2-4 are).
+        std::uint32_t mask = 1u | (1u << (keyboard_player - 1));
+        for (int slot = 1; slot < players; ++slot) {
+            if ((*controllers)[slot]->m_sdl_gamepad != nullptr) {
+                mask |= 1u << slot;
+            }
+        }
+        if (mask != last_mask) {
+            if (set_pad_mask) set_pad_mask(mask);
+            if (set_players) set_players(mask);
+            if (last_mask != ~0u) {
+                LOG_INFO(Input, "Ryty: players with a controller: {:#x}", mask);
+            }
+            last_mask = mask;
+        }
+        for (int slot = 0; slot < players; ++slot) {
+            if (slot > 0 && (mask >> slot & 1u) == 0) {
+                continue;
+            }
+            auto& controller = *(*controllers)[slot];
+            // Rumble and light bar requests go to that player's controller, as shadGT's pad
+            // library would send them (SetVibration takes the small motor first).
+            RytyPadOutputState output;
+            const bool changed = players > 1
+                                     ? fetch_output_slot(slot, &output_seen[slot], &output)
+                                     : fetch_output && fetch_output(&output_seen[slot], &output);
+            if (changed) {
+                auto& previous = last_output[slot];
+                if (output.vibrationLarge != previous.vibrationLarge ||
+                    output.vibrationSmall != previous.vibrationSmall) {
+                    const bool sent =
+                        controller.SetVibration(output.vibrationSmall, output.vibrationLarge);
+                    static int logged = 0;
+                    if (logged++ < 10) {
+                        LOG_INFO(Input, "Ryty: player {} rumble large {} small {} -> controller ({})",
+                                 slot + 1, output.vibrationLarge, output.vibrationSmall,
+                                 controller.m_sdl_gamepad ? (sent ? "sent" : "refused")
+                                                          : "no gamepad");
+                    }
+                }
+                if (output.lightBarValid &&
+                    std::memcmp(output.lightBar, previous.lightBar, sizeof(output.lightBar)) != 0) {
+                    controller.SetLightBarRGB(output.lightBar[0], output.lightBar[1],
+                                              output.lightBar[2]);
+                }
+                previous = output;
+            }
+            const auto state = controller.ReadState();
+            RytyPadInputState input{};
+            input.buttons = static_cast<std::uint32_t>(state.buttonsState);
+            input.sticks = {ClampAxis(state.axes[0]), ClampAxis(state.axes[1]),
+                            ClampAxis(state.axes[2]), ClampAxis(state.axes[3])};
+            input.analogButtonsL2 = ClampAxis(state.axes[4]);
+            input.analogButtonsR2 = ClampAxis(state.axes[5]);
+            if (slot == 0) {
+                input.buttons |= g_scripted_buttons.load();
+                if (const int lx = g_scripted_lx.load(); lx >= 0) {
+                    input.sticks[0] = static_cast<std::uint8_t>(lx);
+                }
+                if (g_scripted_r2) {
+                    input.buttons |=
+                        static_cast<std::uint32_t>(Libraries::Pad::OrbisPadButtonDataOffset::R2);
+                    input.analogButtonsR2 = 255;
                 }
             }
-            if (output.lightBarValid &&
-                std::memcmp(output.lightBar, last_output.lightBar, sizeof(output.lightBar)) != 0) {
-                controller.SetLightBarRGB(output.lightBar[0], output.lightBar[1],
-                                          output.lightBar[2]);
+            auto& previous = last[slot];
+            if (first[slot] || input.buttons != previous.buttons ||
+                input.sticks != previous.sticks ||
+                input.analogButtonsL2 != previous.analogButtonsL2 ||
+                input.analogButtonsR2 != previous.analogButtonsR2) {
+                if (players > 1) {
+                    publish_slot(slot, input);
+                } else {
+                    publish(input);
+                }
+                previous = input;
+                first[slot] = false;
             }
-            last_output = output;
-        }
-        // The first controller carries the keyboard bindings and the first gamepad.
-        const auto state = (*controllers)[0]->ReadState();
-        RytyPadInputState input{};
-        input.buttons = static_cast<std::uint32_t>(state.buttonsState) | g_scripted_buttons.load();
-        input.sticks = {ClampAxis(state.axes[0]), ClampAxis(state.axes[1]), ClampAxis(state.axes[2]),
-                        ClampAxis(state.axes[3])};
-        input.analogButtonsL2 = ClampAxis(state.axes[4]);
-        input.analogButtonsR2 = ClampAxis(state.axes[5]);
-        if (const int lx = g_scripted_lx.load(); lx >= 0) {
-            input.sticks[0] = static_cast<std::uint8_t>(lx);
-        }
-        if (g_scripted_r2) {
-            input.buttons |= static_cast<std::uint32_t>(Libraries::Pad::OrbisPadButtonDataOffset::R2);
-            input.analogButtonsR2 = 255;
-        }
-        if (first || std::memcmp(&input.buttons, &last.buttons, sizeof(input.buttons)) != 0 ||
-            input.sticks != last.sticks || input.analogButtonsL2 != last.analogButtonsL2 ||
-            input.analogButtonsR2 != last.analogButtonsR2) {
-            publish(input);
-            last = input;
-            first = false;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(4));
     }
 }
 
+// Input.controller_ports (the launcher's Controller ports window): "vvvv:pppp#n" per player,
+// comma separated, empty for any: the n-th connected controller with USB vendor id vvvv and
+// product id pppp (hex) plays as that player.
+struct PortChoice {
+    int vendor = -1;
+    int product = -1;
+    int nth = 0;
+};
+std::array<PortChoice, MaxPlayers> g_ports{};
+
+int PreferredSlot(u16 vendor, u16 product, int nth) {
+    for (int slot = 0; slot < MaxPlayers; ++slot) {
+        const auto& port = g_ports[slot];
+        if (port.vendor == vendor && port.product == product && port.nth == nth) {
+            return slot;
+        }
+    }
+    return -1;
+}
+
 } // namespace
 
 namespace Ryty {
+
+void InstallControllerPorts() {
+    const std::string text = ReadGameConfig();
+    const size_t key = text.find("\"controller_ports\"");
+    if (key == std::string::npos) {
+        return;
+    }
+    const size_t open = text.find('"', text.find(':', key) + 1);
+    const size_t close = open == std::string::npos ? open : text.find('"', open + 1);
+    if (close == std::string::npos) {
+        return;
+    }
+    const std::string list = text.substr(open + 1, close - open - 1);
+    size_t position = 0;
+    bool any = false;
+    for (int slot = 0; slot < MaxPlayers && position <= list.size(); ++slot) {
+        const size_t end = std::min(list.find(',', position), list.size());
+        const std::string entry = list.substr(position, end - position);
+        position = end + 1;
+        unsigned vendor = 0, product = 0;
+        int nth = 0;
+        if (std::sscanf(entry.c_str(), "%x:%x#%d", &vendor, &product, &nth) >= 2) {
+            g_ports[slot] = {static_cast<int>(vendor), static_cast<int>(product), nth};
+            LOG_INFO(Input, "Ryty: player {} is controller {:04x}:{:04x} #{}", slot + 1, vendor,
+                     product, nth);
+            any = true;
+        }
+    }
+    if (any) {
+        Input::g_preferred_controller_slot = PreferredSlot;
+    }
+}
 
 void StartInputBridge() {
     std::thread(ForwardInput).detach();

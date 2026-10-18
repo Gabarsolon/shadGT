@@ -591,6 +591,15 @@ void NoteProjectScript(const u8* data, s64 read) {
         return;
     }
     std::string_view name = head.substr(at + 15);
+    if (std::getenv("RYGT_LOG_PROJECTS")) {
+        // DIAG-135: every project script the game loads, with the time.
+        SYSTEMTIME now;
+        GetLocalTime(&now);
+        const std::string_view path = name.substr(0, name.find_first_of(".\0", 0));
+        std::fprintf(stderr, "[projects] %02d:%02d:%02d.%03d %.*s\n", now.wHour, now.wMinute,
+                     now.wSecond, now.wMilliseconds, static_cast<int>(std::min<size_t>(path.size(), 80)),
+                     path.data());
+    }
     name = name.substr(0, name.find('/'));
     static constexpr std::string_view menus[] = {
         "gtmode", "arcade", "campaign", "garage", "brand_central", "gallery", "livery2",
